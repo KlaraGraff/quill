@@ -334,6 +334,60 @@ impl Snapshot {
             .map_err(|e| AppError::Other(format!("snapshot parse: {e}")))
     }
 
+    /// Like `read_from` but skips iCloud-evicted files and applies a
+    /// timeout. Returns `None` when the file is evicted or the read
+    /// exceeds `timeout`.
+    ///
+    /// `on_stall` / `on_success` callbacks let the caller track stalled
+    /// paths and skip them on subsequent ticks. `on_thread_done` runs
+    /// inside the spawned thread when `fs::read` completes — used for
+    /// in-flight tracking.
+    pub fn read_from_with_timeout(
+        path: &Path,
+        timeout: std::time::Duration,
+        on_stall: impl FnOnce(&Path),
+        on_success: impl FnOnce(&Path),
+        on_thread_done: impl FnOnce() + Send + 'static,
+    ) -> AppResult<Option<Self>> {
+        use crate::icloud;
+        if !path.exists() {
+            if icloud::has_icloud_placeholder(path) {
+                log::info!(
+                    "sync: peer snapshot {} is iCloud-evicted — triggering download, skipping",
+                    path.display(),
+                );
+                icloud::trigger_download_file(path);
+            }
+            return Ok(None);
+        }
+        let path_buf = path.to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = fs::read(&path_buf);
+            on_thread_done();
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(bytes)) => {
+                on_success(path);
+                let snap: Self = serde_json::from_slice(&bytes)
+                    .map_err(|e| AppError::Other(format!("snapshot parse: {e}")))?;
+                Ok(Some(snap))
+            }
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Ok(Err(e)) => Err(AppError::Io(e)),
+            Err(_) => {
+                log::warn!(
+                    "sync: timed out reading peer snapshot {} after {}s — backing off",
+                    path.display(),
+                    timeout.as_secs(),
+                );
+                on_stall(path);
+                Ok(None)
+            }
+        }
+    }
+
     /// Apply this snapshot into local SQLite. Idempotent under repeated
     /// application; tombstones in `state.tombstones` are written first so
     /// the entity rows that follow can short-circuit on the local-tombstone

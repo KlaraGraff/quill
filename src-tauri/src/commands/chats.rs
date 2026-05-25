@@ -4,7 +4,7 @@ use tauri::State;
 use uuid::Uuid;
 
 use crate::db::Db;
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::sync::events::{ChatMessagePayload, EventBody};
 use crate::sync::writer::SyncWriter;
 
@@ -129,7 +129,7 @@ pub fn create_chat(
 }
 
 pub(crate) fn query_chats(db: &Db, book_id: &str) -> AppResult<Vec<Chat>> {
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
     let mut stmt = conn.prepare(
         "SELECT id, book_id, title, model, pinned, metadata, created_at, updated_at
          FROM chats WHERE book_id = ?1
@@ -148,7 +148,7 @@ pub fn list_chats(book_id: String, db: State<'_, Db>) -> AppResult<Vec<Chat>> {
 
 #[tauri::command]
 pub fn list_all_chats(db: State<'_, Db>) -> AppResult<Vec<Chat>> {
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
     let mut stmt = conn.prepare(
         "SELECT c.id, c.book_id, c.title, c.model, c.pinned, c.metadata, c.created_at, c.updated_at,
                 b.title,
@@ -165,7 +165,7 @@ pub fn list_all_chats(db: State<'_, Db>) -> AppResult<Vec<Chat>> {
 
 #[tauri::command]
 pub fn get_chat(chat_id: String, db: State<'_, Db>) -> AppResult<Chat> {
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
     let chat = conn.query_row(
         "SELECT id, book_id, title, model, pinned, metadata, created_at, updated_at
          FROM chats WHERE id = ?1",
@@ -218,7 +218,7 @@ pub fn rename_chat(
 }
 
 pub(crate) fn query_chat_messages(db: &Db, chat_id: &str) -> AppResult<Vec<ChatMsg>> {
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
     let mut stmt = conn.prepare(
         "SELECT id, chat_id, role, content, context, metadata, created_at, updated_at
          FROM chat_messages WHERE chat_id = ?1

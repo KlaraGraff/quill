@@ -105,7 +105,15 @@ impl EventLog {
     /// generation and the file write happen under it. See the module
     /// docstring for why that's required.
     pub fn append_batch(&self, bodies: Vec<EventBody>, ts: i64) -> AppResult<Vec<Event>> {
-        if bodies.is_empty() {
+        let entries: Vec<(EventBody, i64)> = bodies.into_iter().map(|b| (b, ts)).collect();
+        self.append_batch_varied(entries)
+    }
+
+    /// Like `append_batch` but each event carries its own timestamp.
+    /// Used by the outbox flush where pending events may span multiple
+    /// commands with different `ts` values.
+    pub fn append_batch_varied(&self, entries: Vec<(EventBody, i64)>) -> AppResult<Vec<Event>> {
+        if entries.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -118,8 +126,8 @@ impl EventLog {
         // monotonicity across process restarts; `ts` on the event is the
         // caller-supplied value (usually a few milliseconds earlier).
         let now = SystemTime::now();
-        let mut events = Vec::with_capacity(bodies.len());
-        for body in bodies {
+        let mut events = Vec::with_capacity(entries.len());
+        for (body, ts) in entries {
             let ulid = inner
                 .gen
                 .generate_from_datetime(now)
@@ -173,6 +181,72 @@ pub fn read_log_file(path: &Path) -> AppResult<Vec<Event>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(AppError::Io(e)),
     };
+    parse_log_bytes(&bytes, path)
+}
+
+/// Like `read_log_file` but skips iCloud-evicted files and applies a
+/// timeout to the read. Returns an empty vec when the file is evicted
+/// or the read exceeds `timeout`, so the tick skips the peer and
+/// retries next time.
+///
+/// **Thread safety**: before spawning a read thread, checks for the
+/// `.foo.icloud` placeholder. If the file is evicted, triggers a
+/// background download and returns immediately — no thread spawned.
+///
+/// Callers pass `on_stall` / `on_success` callbacks so the replay
+/// engine can track which paths have stalled and skip them on
+/// subsequent ticks (preventing blocked-thread accumulation).
+///
+/// `on_thread_done` runs inside the spawned thread when `fs::read`
+/// completes (success or error). Used by the replay engine to clear
+/// the path's in-flight flag so a subsequent tick knows no reader
+/// thread is still blocked on this path.
+pub fn read_log_file_with_timeout(
+    path: &Path,
+    timeout: std::time::Duration,
+    on_stall: impl FnOnce(&Path),
+    on_success: impl FnOnce(&Path),
+    on_thread_done: impl FnOnce() + Send + 'static,
+) -> AppResult<Vec<Event>> {
+    use crate::icloud;
+    if !path.exists() {
+        if icloud::has_icloud_placeholder(path) {
+            log::info!(
+                "sync: peer log {} is iCloud-evicted — triggering download, skipping this tick",
+                path.display(),
+            );
+            icloud::trigger_download_file(path);
+            return Ok(Vec::new());
+        }
+        return Ok(Vec::new());
+    }
+    let path_buf = path.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = fs::read(&path_buf);
+        on_thread_done();
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(bytes)) => {
+            on_success(path);
+            parse_log_bytes(&bytes, path)
+        }
+        Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Ok(Err(e)) => Err(AppError::Io(e)),
+        Err(_) => {
+            log::warn!(
+                "sync: timed out reading peer log {} after {}s — backing off",
+                path.display(),
+                timeout.as_secs(),
+            );
+            on_stall(path);
+            Ok(Vec::new())
+        }
+    }
+}
+
+fn parse_log_bytes(bytes: &[u8], path: &Path) -> AppResult<Vec<Event>> {
     let mut out = Vec::new();
     for (idx, line) in bytes.split(|&b| b == b'\n').enumerate() {
         if line.is_empty() {

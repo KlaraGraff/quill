@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::db::Db;
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::sync::events::{BookmarkPayload, EventBody, HighlightPayload};
 use crate::sync::writer::SyncWriter;
 
@@ -84,7 +84,7 @@ pub fn remove_bookmark(
 /// command and the MCP `get_bookmarks` tool call this so the column
 /// list lives in exactly one place.
 pub(crate) fn query_bookmarks(db: &Db, book_id: &str) -> AppResult<Vec<Bookmark>> {
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
     let mut stmt = conn.prepare(
         "SELECT id, book_id, cfi, label, created_at, updated_at FROM bookmarks WHERE book_id = ?1 ORDER BY created_at DESC",
     )?;
@@ -173,7 +173,7 @@ pub fn remove_highlight(
 /// Shared query helper. Mirror of `list_highlights` for the MCP
 /// `get_highlights` tool — keeps the column list canonical.
 pub(crate) fn query_highlights(db: &Db, book_id: &str) -> AppResult<Vec<Highlight>> {
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
     let mut stmt = conn.prepare(
         "SELECT id, book_id, cfi_range, color, note, text_content, created_at, updated_at FROM highlights WHERE book_id = ?1 ORDER BY created_at DESC",
     )?;

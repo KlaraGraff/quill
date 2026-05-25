@@ -322,7 +322,7 @@ pub(crate) fn query_books(
     filter: Option<&str>,
     search: Option<&str>,
 ) -> AppResult<Vec<Book>> {
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
 
     let mut sql = "SELECT id, title, author, description, cover_path, file_path, format, genre, pages, status, progress, current_cfi, created_at, updated_at FROM books".to_string();
     let mut conditions: Vec<String> = Vec::new();
@@ -388,7 +388,7 @@ pub(crate) fn query_books(
 /// Shared query helper for the single-book lookup. Same relative-path
 /// guarantee as `query_books`.
 pub(crate) fn query_book(db: &Db, id: &str) -> AppResult<Book> {
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
     let book = conn.query_row(
         "SELECT id, title, author, description, cover_path, file_path, format, genre, pages, status, progress, current_cfi, created_at, updated_at FROM books WHERE id = ?1",
         params![id],
@@ -438,7 +438,7 @@ pub fn get_book(id: String, db: State<'_, Db>) -> AppResult<Book> {
 /// Check if a book's file is locally available and trigger iCloud download if not.
 #[tauri::command]
 pub fn check_book_available(id: String, db: State<'_, Db>) -> AppResult<bool> {
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
     let file_path: String = conn.query_row(
         "SELECT file_path FROM books WHERE id = ?1",
         params![id],
