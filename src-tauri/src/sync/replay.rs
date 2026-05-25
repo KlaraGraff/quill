@@ -26,10 +26,11 @@
 //! scheduler decides which one runs first, but both produce the same end
 //! state because every operation is idempotent.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use rusqlite::{params, Connection};
 
@@ -57,6 +58,37 @@ static TICK_MUTEX: Mutex<()> = Mutex::new(());
 /// and even idempotent ones balloon the log. The mutex is entirely
 /// outside `db.conn`, so a flush in flight does not block UI writes.
 static FLUSH_OUTBOX_MUTEX: Mutex<()> = Mutex::new(());
+
+/// Paths where a timed read stalled (timeout or in-flight). Keyed by
+/// canonical path, value is the `Instant` the backoff expires. A path
+/// in this set is skipped (no thread spawned) until the backoff
+/// elapses. Prevents blocked-thread accumulation when `fs::read`
+/// passes the `path.exists()` check but stalls inside the kernel
+/// (e.g. iCloud file materialization in progress).
+static STALLED_PATHS: Mutex<Option<HashMap<PathBuf, Instant>>> = Mutex::new(None);
+
+const STALL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn is_stalled(path: &Path) -> bool {
+    let guard = STALLED_PATHS.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.as_ref() {
+        Some(map) => map.get(path).is_some_and(|exp| Instant::now() < *exp),
+        None => false,
+    }
+}
+
+fn mark_stalled(path: &Path) {
+    let mut guard = STALLED_PATHS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.insert(path.to_path_buf(), Instant::now() + STALL_BACKOFF);
+}
+
+fn clear_stalled(path: &Path) {
+    let mut guard = STALLED_PATHS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_mut() {
+        map.remove(path);
+    }
+}
 
 /// What `tick()` did, surfaced for the "Sync now" UI and for tests.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -211,13 +243,21 @@ impl ReplayEngine {
         peers: &BTreeMap<String, PeerFiles>,
     ) -> AppResult<(usize, usize)> {
         // -- Phase A — read everything from disk. No SQL lock held. --
+        // Paths that previously timed out are skipped for STALL_BACKOFF
+        // (2 min) to avoid spawning another blocked reader thread.
         let read_timeout = std::time::Duration::from_secs(30);
         let mut snapshots: Vec<(String, Snapshot)> = Vec::new();
         for (device, files) in peers {
             let Some(snap_path) = &files.snap_path else {
                 continue;
             };
-            match Snapshot::read_from_with_timeout(snap_path, read_timeout) {
+            if is_stalled(snap_path) {
+                ::log::debug!("sync: skipping stalled snapshot {}", snap_path.display());
+                continue;
+            }
+            match Snapshot::read_from_with_timeout(
+                snap_path, read_timeout, mark_stalled, clear_stalled,
+            ) {
                 Ok(Some(s)) => snapshots.push((device.clone(), s)),
                 Ok(None) => {} // evicted or timed out — skip
                 Err(e) => {
@@ -233,7 +273,13 @@ impl ReplayEngine {
             let Some(log_path) = &files.log_path else {
                 continue;
             };
-            let events = log::read_log_file_with_timeout(log_path, read_timeout)?;
+            if is_stalled(log_path) {
+                ::log::debug!("sync: skipping stalled log {}", log_path.display());
+                continue;
+            }
+            let events = log::read_log_file_with_timeout(
+                log_path, read_timeout, mark_stalled, clear_stalled,
+            )?;
             peer_logs.push((device.clone(), events));
         }
 
@@ -393,6 +439,11 @@ struct PeerFiles {
 
 /// Walk `<shared>/logs/` and bucket files by device UUID. Returns a sorted
 /// map (BTreeMap) so iteration order is deterministic for tests.
+///
+/// Recognizes iCloud placeholders (`.foo.icloud`) alongside real files.
+/// When only a placeholder exists, the peer entry carries the *real*
+/// (non-placeholder) path so downstream readers can detect the eviction
+/// and trigger a download.
 fn discover_peers(shared_dir: &Path) -> AppResult<BTreeMap<String, PeerFiles>> {
     let logs_dir = shared_dir.join("logs");
     let mut peers: BTreeMap<String, PeerFiles> = BTreeMap::new();
@@ -410,8 +461,17 @@ fn discover_peers(shared_dir: &Path) -> AppResult<BTreeMap<String, PeerFiles>> {
             peers.entry(device.to_string()).or_default().snap_path = Some(path);
         } else if let Some(device) = name.strip_suffix(".jsonl") {
             peers.entry(device.to_string()).or_default().log_path = Some(path);
+        } else if let Some(inner) = name.strip_prefix('.').and_then(|s| s.strip_suffix(".icloud")) {
+            // iCloud placeholder: `.dev-uuid.jsonl.icloud` → real path `dev-uuid.jsonl`
+            let real_path = logs_dir.join(inner);
+            if let Some(device) = inner.strip_suffix(".snapshot.json") {
+                peers.entry(device.to_string()).or_default().snap_path
+                    .get_or_insert(real_path);
+            } else if let Some(device) = inner.strip_suffix(".jsonl") {
+                peers.entry(device.to_string()).or_default().log_path
+                    .get_or_insert(real_path);
+            }
         }
-        // Anything else (e.g. `*.tmp` from in-progress writes) is skipped.
     }
     Ok(peers)
 }

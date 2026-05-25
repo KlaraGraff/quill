@@ -337,9 +337,14 @@ impl Snapshot {
     /// Like `read_from` but skips iCloud-evicted files and applies a
     /// timeout. Returns `None` when the file is evicted or the read
     /// exceeds `timeout`.
+    ///
+    /// `on_stall` / `on_success` callbacks let the caller track stalled
+    /// paths and skip them on subsequent ticks.
     pub fn read_from_with_timeout(
         path: &Path,
         timeout: std::time::Duration,
+        on_stall: impl FnOnce(&Path),
+        on_success: impl FnOnce(&Path),
     ) -> AppResult<Option<Self>> {
         use crate::icloud;
         if !path.exists() {
@@ -359,6 +364,7 @@ impl Snapshot {
         });
         match rx.recv_timeout(timeout) {
             Ok(Ok(bytes)) => {
+                on_success(path);
                 let snap: Self = serde_json::from_slice(&bytes)
                     .map_err(|e| AppError::Other(format!("snapshot parse: {e}")))?;
                 Ok(Some(snap))
@@ -367,10 +373,11 @@ impl Snapshot {
             Ok(Err(e)) => Err(AppError::Io(e)),
             Err(_) => {
                 log::warn!(
-                    "sync: timed out reading peer snapshot {} after {}s — skipping",
+                    "sync: timed out reading peer snapshot {} after {}s — backing off",
                     path.display(),
                     timeout.as_secs(),
                 );
+                on_stall(path);
                 Ok(None)
             }
         }

@@ -191,11 +191,16 @@ pub fn read_log_file(path: &Path) -> AppResult<Vec<Event>> {
 ///
 /// **Thread safety**: before spawning a read thread, checks for the
 /// `.foo.icloud` placeholder. If the file is evicted, triggers a
-/// background download and returns immediately — no thread spawned,
-/// no accumulation of blocked OS threads across repeated ticks.
+/// background download and returns immediately — no thread spawned.
+///
+/// Callers pass `on_stall` / `on_success` callbacks so the replay
+/// engine can track which paths have stalled and skip them on
+/// subsequent ticks (preventing blocked-thread accumulation).
 pub fn read_log_file_with_timeout(
     path: &Path,
     timeout: std::time::Duration,
+    on_stall: impl FnOnce(&Path),
+    on_success: impl FnOnce(&Path),
 ) -> AppResult<Vec<Event>> {
     use crate::icloud;
     if !path.exists() {
@@ -215,15 +220,19 @@ pub fn read_log_file_with_timeout(
         let _ = tx.send(fs::read(&path_buf));
     });
     match rx.recv_timeout(timeout) {
-        Ok(Ok(bytes)) => parse_log_bytes(&bytes, path),
+        Ok(Ok(bytes)) => {
+            on_success(path);
+            parse_log_bytes(&bytes, path)
+        }
         Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
         Ok(Err(e)) => Err(AppError::Io(e)),
         Err(_) => {
             log::warn!(
-                "sync: timed out reading peer log {} after {}s — skipping this tick",
+                "sync: timed out reading peer log {} after {}s — backing off",
                 path.display(),
                 timeout.as_secs(),
             );
+            on_stall(path);
             Ok(Vec::new())
         }
     }
