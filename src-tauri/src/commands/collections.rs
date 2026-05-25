@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::db::Db;
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::sync::events::EventBody;
 use crate::sync::writer::SyncWriter;
 
@@ -18,7 +18,7 @@ pub struct Collection {
 }
 
 pub(crate) fn query_collections(db: &Db) -> AppResult<Vec<Collection>> {
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
     let mut stmt = conn.prepare(
         "SELECT c.id, c.name, c.created_at, c.updated_at, c.sort_order, COUNT(cb.book_id) as book_count
          FROM collections c
@@ -238,7 +238,7 @@ pub fn list_books_in_collection(
     collection_id: String,
     db: State<'_, Db>,
 ) -> AppResult<Vec<String>> {
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
     let mut stmt = conn.prepare(
         "SELECT book_id FROM collection_books WHERE collection_id = ?1",
     )?;

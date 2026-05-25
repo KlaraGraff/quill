@@ -233,7 +233,7 @@ pub fn mcp_integration_status(db: State<'_, Db>) -> AppResult<McpIntegrationStat
         .and_then(|p| codex_is_enabled_at(&p))
         .unwrap_or(false);
     let write_enabled = {
-        let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+        let conn = db.reader();
         conn.query_row(
             "SELECT value FROM settings WHERE key = 'mcp_write_enabled'",
             [],

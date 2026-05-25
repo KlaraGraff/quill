@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::db::Db;
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::sync::events::{EventBody, VocabPayload};
 use crate::sync::writer::SyncWriter;
 
@@ -166,7 +166,7 @@ pub fn remove_vocab_word(
 }
 
 pub(crate) fn query_vocab_words(db: &Db, book_id: &str) -> AppResult<Vec<VocabWord>> {
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
     let mut stmt = conn.prepare(&format!(
         "SELECT {} FROM vocab_words WHERE book_id = ?1 ORDER BY created_at DESC",
         SELECT_COLS
@@ -188,7 +188,7 @@ pub fn check_vocab_exists(
     word: String,
     db: State<'_, Db>,
 ) -> AppResult<Option<String>> {
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
     let mut stmt = conn.prepare(
         "SELECT id FROM vocab_words WHERE book_id = ?1 AND word = ?2 COLLATE NOCASE LIMIT 1",
     )?;
@@ -201,7 +201,7 @@ pub fn check_vocab_exists(
 
 #[tauri::command]
 pub fn list_all_vocab_words(db: State<'_, Db>) -> AppResult<Vec<VocabWord>> {
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
     let mut stmt = conn.prepare(
         "SELECT v.id, v.book_id, v.word, v.definition, v.context_sentence, v.cfi, v.mastery, v.review_count, v.next_review_at, v.created_at, v.updated_at, v.context_explanation, b.title FROM vocab_words v LEFT JOIN books b ON v.book_id = b.id ORDER BY v.created_at DESC"
     )?;
@@ -247,7 +247,7 @@ pub fn update_vocab_mastery(
 }
 
 pub(crate) fn query_vocab_due(db: &Db) -> AppResult<Vec<VocabWord>> {
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
     let now_ms = chrono::Utc::now().timestamp_millis();
     let mut stmt = conn.prepare(&format!(
         "SELECT {} FROM vocab_words WHERE next_review_at IS NOT NULL AND next_review_at <= ?1 ORDER BY next_review_at ASC",
@@ -265,7 +265,7 @@ pub fn list_vocab_due_for_review(db: State<'_, Db>) -> AppResult<Vec<VocabWord>>
 }
 
 pub(crate) fn query_vocab_stats(db: &Db) -> AppResult<VocabStats> {
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
     let now_ms = chrono::Utc::now().timestamp_millis();
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM vocab_words", [], |r| r.get(0))?;
     let new_count: i64 = conn.query_row(

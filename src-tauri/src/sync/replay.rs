@@ -2,26 +2,29 @@
 //!
 //! Five phases per call:
 //! 0. **Drain `_pending_publish`.** Any events the local `SyncWriter`
-//!    committed to SQL but failed to append to the device log get appended
-//!    here. Until they're in the log, peers don't see them — so this is the
-//!    publish-retry path that bounds Step 3's commit-then-flush failure
-//!    asymmetry. (See [`docs/impls/sync/31-sync-known-problems.md`] §1.)
+//!    committed to SQL but failed to append to the device log get
+//!    appended here — as a single batched write (one `NSFileCoordinator`
+//!    call) instead of per-event. Until they're in the log, peers don't
+//!    see them — so this is the publish-retry path that bounds Step 3's
+//!    commit-then-flush failure asymmetry.
 //! 1. **Discover peers.** Walk `<shared>/logs/*.{jsonl,snapshot.json}` and
 //!    bucket by device UUID. The local device is included — its snapshot
 //!    is what pulls conflict-copy rows back into local SQL during migration
 //!    apply-back, and re-applying its own log events is idempotent.
 //! 2. **Read.** For each peer: read snapshot if `_replay_state` says it's
-//!    new; read log events with id > `last_event_id` watermark.
+//!    new; read log events with id > `last_event_id` watermark. Peer log
+//!    reads have a 30s timeout so iCloud-evicted files don't block
+//!    indefinitely — timed-out peers are skipped and retried next tick.
 //! 3. **Sort + apply.** Snapshots applied per-peer first (each updates its
 //!    own watermarks). Events from every peer merged into one global vec
-//!    sorted by `(ts, device)`, then `merge::apply_event` runs them in one
-//!    SQL transaction.
+//!    sorted by `(ts, device)`, then applied one per transaction via the
+//!    write connection. The separate read connection (`Db::reader()`)
+//!    ensures frontend queries are never blocked by the replay engine.
 //! 4. **Commit + advance event watermarks** to the max id seen per peer.
 //!
-//! Foreign keys are toggled OFF before BEGIN and ON after COMMIT — see the
-//! `merge` module's docstring for why. Concurrent ticks are serialized by a
-//! process-wide mutex; the OS scheduler decides which one runs first, but
-//! both produce the same end state because every operation is idempotent.
+//! Concurrent ticks are serialized by a process-wide mutex; the OS
+//! scheduler decides which one runs first, but both produce the same end
+//! state because every operation is idempotent.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -224,11 +227,12 @@ impl ReplayEngine {
             }
         }
         let mut peer_logs: Vec<(String, Vec<Event>)> = Vec::new();
+        let read_timeout = std::time::Duration::from_secs(30);
         for (device, files) in peers {
             let Some(log_path) = &files.log_path else {
                 continue;
             };
-            let events = log::read_log_file_after(log_path, None)?;
+            let events = log::read_log_file_with_timeout(log_path, read_timeout)?;
             peer_logs.push((device.clone(), events));
         }
 
@@ -309,28 +313,19 @@ impl ReplayEngine {
 
 }
 
-/// Drain `_pending_publish` into `log`. Each row is re-serialized into an
-/// `EventBody`, appended (which mints a fresh ULID), and on success deleted
-/// from the outbox. If the append fails, the row stays put for the next
-/// caller to retry.
+/// Drain `_pending_publish` into `log` as a single batched write. All
+/// pending rows are deserialized, appended atomically via
+/// `append_batch_varied` (one `NSFileCoordinator` call, one fsync), then
+/// bulk-deleted from the outbox. If the batch write fails, no rows are
+/// deleted and the entire batch retries on the next call.
 ///
 /// Shared between `ReplayEngine::tick` (Phase 0) and `SyncWriter::with_tx`
-/// (post-commit step) so the publish-retry guarantee holds end-to-end:
-/// every committed-but-not-yet-published event lands in the device log on
-/// the next successful flush from either path.
-///
-/// **Locking discipline.** Takes `&Db` (not `&mut Connection`) so we can
-/// release the SQLite mutex around `log.append`. On macOS that append
-/// goes through `NSFileCoordinator` and synchronously waits for Apple's
-/// `bird` daemon — often several seconds. Holding `db.conn` across that
-/// wait would serialize every UI write behind the watcher's tick, which
-/// is exactly the "import spinner hangs" symptom users hit. Per-row
-/// lock/unlock is cheap relative to the iCloud I/O.
+/// (post-commit step) so the publish-retry guarantee holds end-to-end.
 ///
 /// **Single-flight via `FLUSH_OUTBOX_MUTEX`.** Concurrent callers (the
 /// `SyncWriter` background worker + a watcher-driven `tick`) would
-/// otherwise both read the same pending row, both append, and both
-/// delete — duplicating the event in the device log. The mutex sits
+/// otherwise both read the same pending rows, both append, and both
+/// delete — duplicating events in the device log. The mutex sits
 /// outside `db.conn` so a flush in flight does not block UI writes.
 pub fn flush_outbox(db: &Db, log: &EventLog) -> AppResult<usize> {
     let _guard = FLUSH_OUTBOX_MUTEX
@@ -347,31 +342,42 @@ pub fn flush_outbox(db: &Db, log: &EventLog) -> AppResult<usize> {
         return Ok(0);
     }
 
-    let mut flushed = 0usize;
+    // Deserialize all bodies up front so a malformed row fails before
+    // any I/O. Per-event timestamps are preserved from the outbox row.
+    let entries: Vec<(EventBody, i64)> = pending
+        .iter()
+        .map(|row| {
+            let body: EventBody = serde_json::from_str(&row.body_json).map_err(|e| {
+                AppError::Other(format!(
+                    "outbox row {}: malformed body_json: {e}",
+                    row.id
+                ))
+            })?;
+            Ok((body, row.ts))
+        })
+        .collect::<AppResult<_>>()?;
+
+    // Single coordinated write for all events — one NSFileCoordinator
+    // call instead of N. This is the big win: 500 pending events go
+    // from 500 × bird-latency to 1 × bird-latency.
+    log.append_batch_varied(entries)?;
+
+    // Bulk delete from outbox. The batch append already succeeded so
+    // all rows are published; deleting them prevents re-publish on
+    // the next flush.
+    let conn = db
+        .conn
+        .lock()
+        .map_err(|e| AppError::Other(format!("db conn mutex: {e}")))?;
     for row in &pending {
-        let body: EventBody = serde_json::from_str(&row.body_json).map_err(|e| {
-            AppError::Other(format!(
-                "outbox row {}: malformed body_json: {e}",
-                row.id
-            ))
-        })?;
-        // Slow part — runs WITHOUT holding db.conn so concurrent UI
-        // writes (import_book, highlight.add, etc.) are not blocked.
-        log.append(body, row.ts)?;
-        // Per-row delete: if a later append in this batch fails, the
-        // earlier rows are already published and can be removed cleanly.
-        let conn = db
-            .conn
-            .lock()
-            .map_err(|e| AppError::Other(format!("db conn mutex: {e}")))?;
         conn.execute(
             "DELETE FROM _pending_publish WHERE id = ?1",
             params![row.id],
         )?;
-        drop(conn);
-        flushed += 1;
     }
-    Ok(flushed)
+    drop(conn);
+
+    Ok(pending.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -512,8 +518,10 @@ mod tests {
 
         let conn = Connection::open_in_memory().unwrap();
         Db::run_migrations_on(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
         let db = Db {
-            conn: Arc::new(Mutex::new(conn)),
+            read_conn: conn.clone(),
+            conn,
             data_dir: Arc::new(Mutex::new(dir.path().to_path_buf())),
         };
 

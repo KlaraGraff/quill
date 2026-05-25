@@ -55,7 +55,7 @@ pub async fn ai_translate_passage(
 ) -> AppResult<()> {
     // Read target language setting
     let (target_lang, provider, model, base_url, keep_alive, auth_mode) = {
-        let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+        let conn = db.reader();
         let get = |key: &str| -> Option<String> {
             conn.query_row(
                 "SELECT value FROM settings WHERE key = ?1",
@@ -213,7 +213,7 @@ pub(crate) fn query_translations(
     db: &Db,
     book_id: Option<&str>,
 ) -> AppResult<Vec<Translation>> {
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
 
     let mut sql = "SELECT t.id, t.book_id, t.source_text, t.translated_text, t.target_language, t.cfi, t.created_at, t.updated_at, b.title FROM translations t LEFT JOIN books b ON t.book_id = b.id".to_string();
     let mut sql_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();

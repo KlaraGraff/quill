@@ -32,7 +32,7 @@ pub async fn ai_lookup(
 ) -> AppResult<()> {
     // Read provider settings
     let (provider, model, base_url, keep_alive, auth_mode, language, native_language, show_translation) = {
-        let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+        let conn = db.reader();
         let get = |key: &str| -> Option<String> {
             conn.query_row(
                 "SELECT value FROM settings WHERE key = ?1",
@@ -179,7 +179,7 @@ pub async fn ai_generate_title(
     secrets: State<'_, Secrets>,
 ) -> AppResult<()> {
     let (provider, model, base_url, keep_alive, auth_mode, language) = {
-        let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+        let conn = db.reader();
         let get = |key: &str| -> Option<String> {
             conn.query_row(
                 "SELECT value FROM settings WHERE key = ?1",
@@ -268,7 +268,7 @@ pub async fn ai_chat(
 ) -> AppResult<()> {
     // Read provider settings
     let (provider, model, base_url, temperature, keep_alive, auth_mode, language) = {
-        let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+        let conn = db.reader();
         let get = |key: &str| -> Option<String> {
             conn.query_row(
                 "SELECT value FROM settings WHERE key = ?1",

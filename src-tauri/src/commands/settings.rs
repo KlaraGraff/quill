@@ -8,7 +8,7 @@ use crate::secrets::Secrets;
 
 #[tauri::command]
 pub fn get_all_settings(db: State<'_, Db>, secrets: State<'_, Secrets>) -> AppResult<HashMap<String, String>> {
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
     let mut stmt = conn.prepare("SELECT key, value FROM settings")?;
     let mut settings = stmt
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
@@ -28,7 +28,7 @@ pub fn get_setting(key: String, db: State<'_, Db>, secrets: State<'_, Secrets>) 
         return Ok(secrets.get(&key));
     }
 
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
     let result = conn.query_row(
         "SELECT value FROM settings WHERE key = ?1",
         params![key],
@@ -73,7 +73,7 @@ pub fn set_settings_bulk(settings: HashMap<String, String>, db: State<'_, Db>, s
 
 #[tauri::command]
 pub fn get_book_settings(book_id: String, db: State<'_, Db>) -> AppResult<HashMap<String, String>> {
-    let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
+    let conn = db.reader();
     let mut stmt = conn.prepare("SELECT key, value FROM book_settings WHERE book_id = ?1")?;
     let settings = stmt
         .query_map(params![book_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?

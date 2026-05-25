@@ -22,15 +22,21 @@ const MIGRATIONS: &[(i64, &str)] = &[
 
 /// SQLite handle for the local materialized view.
 ///
-/// `conn` and `data_dir` live behind `Arc<Mutex<…>>` so `Db` is cheaply
-/// `Clone`-able. Cloning shares the underlying mutex; the sync watcher
-/// holds one clone in its dedicated thread while Tauri's command
-/// dispatcher holds another in app state. Without the `Arc` we would
-/// either force every command signature to switch to `State<Arc<Db>>`
-/// or push `app_handle.state::<Db>()` indirection into the watcher
-/// loop — both worse than this two-line shape change.
+/// Two connections: `conn` (write) and `read_conn` (read). SQLite WAL
+/// mode allows concurrent readers alongside a single writer, but
+/// `rusqlite::Connection` isn't `Sync` so each needs its own mutex.
+/// Separating them means the sync engine's 500-event replay never
+/// blocks a frontend `list_books` — the two mutexes are independent.
+///
+/// Both fields live behind `Arc<Mutex<…>>` so `Db` is cheaply
+/// `Clone`-able. Cloning shares the underlying mutexes; the sync
+/// watcher holds one clone in its dedicated thread while Tauri's
+/// command dispatcher holds another in app state.
 pub struct Db {
+    /// Write connection — used by sync engine, import, delete, etc.
     pub conn: Arc<Mutex<Connection>>,
+    /// Read-only connection — used by frontend query commands.
+    pub read_conn: Arc<Mutex<Connection>>,
     pub data_dir: Arc<Mutex<PathBuf>>,
 }
 
@@ -38,12 +44,20 @@ impl Clone for Db {
     fn clone(&self) -> Self {
         Self {
             conn: Arc::clone(&self.conn),
+            read_conn: Arc::clone(&self.read_conn),
             data_dir: Arc::clone(&self.data_dir),
         }
     }
 }
 
 impl Db {
+    /// Lock the read-only connection. Frontend query commands should
+    /// call this instead of `conn.lock()` so they never contend with
+    /// sync engine writes.
+    pub fn reader(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.read_conn.lock().expect("read_conn mutex")
+    }
+
     /// Override the data_dir after construction. Used by `mcp_stdio_main`
     /// to point at the iCloud ubiquity container when the user has
     /// migrated, so blob paths (books/, covers/) resolve correctly.
@@ -80,8 +94,10 @@ impl Db {
             .parent()
             .unwrap_or_else(|| Path::new(""))
             .to_path_buf();
+        let conn = Arc::new(Mutex::new(conn));
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            read_conn: conn.clone(),
+            conn,
             data_dir: Arc::new(Mutex::new(dummy_data_dir)),
         })
     }
@@ -103,8 +119,10 @@ impl Db {
             .parent()
             .unwrap_or_else(|| Path::new(""))
             .to_path_buf();
+        let conn = Arc::new(Mutex::new(conn));
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            read_conn: conn.clone(),
+            conn,
             data_dir: Arc::new(Mutex::new(data_dir)),
         })
     }
@@ -142,8 +160,20 @@ impl Db {
         // One-time migration: convert absolute paths to relative
         Self::migrate_to_relative_paths(&conn, data_dir)?;
 
+        // Separate read connection so frontend queries never contend
+        // with sync engine writes. WAL mode allows concurrent readers
+        // alongside one writer at the SQLite level; the two Rust
+        // mutexes are independent.
+        let read_conn = Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            read_conn: Arc::new(Mutex::new(read_conn)),
             data_dir: Arc::new(Mutex::new(data_dir.to_path_buf())),
         })
     }
@@ -188,7 +218,7 @@ impl Db {
     /// migrations ran) or the read fails. Used by the startup banner so a
     /// triaged log file leads with the actual on-disk version.
     pub fn schema_version(&self) -> i64 {
-        let conn = match self.conn.lock() {
+        let conn = match self.read_conn.lock() {
             Ok(c) => c,
             Err(_) => return 0,
         };
