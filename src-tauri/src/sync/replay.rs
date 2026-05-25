@@ -49,6 +49,12 @@ use super::snapshot::{self, Snapshot};
 /// because every operation is idempotent — but they'd duplicate I/O work.
 static TICK_MUTEX: Mutex<()> = Mutex::new(());
 
+/// Acquire and immediately release TICK_MUTEX. Used by `sync_disable`
+/// to wait for a cancelled tick to finish before starting copy-back.
+pub fn tick_mutex_wait() {
+    let _guard = TICK_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+}
+
 /// Process-wide lock that serializes `flush_outbox` callers so the
 /// outbox drain stays exactly-once. Without it, `SyncWriter::with_tx`'s
 /// background flush worker and a concurrent watcher tick could both
@@ -142,6 +148,10 @@ pub struct ReplayEngine {
     /// Own log handle, shared with `SyncWriter`. `tick()` writes here when
     /// flushing the outbox.
     pub own_log: Arc<EventLog>,
+    /// Set to `true` by `cancel()` to abort an in-flight tick early.
+    /// Checked between events in Phase C so a `sync_disable` doesn't
+    /// have to wait for a long replay to finish.
+    cancelled: std::sync::atomic::AtomicBool,
 }
 
 impl ReplayEngine {
@@ -150,7 +160,17 @@ impl ReplayEngine {
             shared_dir,
             self_device,
             own_log,
+            cancelled: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Signal any in-flight tick to stop after the current event.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Run a single replay pass.
@@ -177,6 +197,7 @@ impl ReplayEngine {
             .lock()
             .map_err(|e| AppError::Other(format!("replay tick mutex poisoned: {e}")))?;
 
+        self.cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
         let started = std::time::Instant::now();
 
         if let Some(handle) = app_handle {
@@ -371,16 +392,25 @@ impl ReplayEngine {
                 .lock()
                 .map_err(|e| AppError::Other(format!("db conn mutex: {e}")))?;
             let tx = conn.transaction()?;
-            let outcome = snap.apply_peer(&tx, device)?;
-            tx.commit()?;
-            drop(conn);
-            if matches!(
-                outcome,
-                super::snapshot::ApplyOutcome::Applied
-                    | super::snapshot::ApplyOutcome::HeaderOnly
-            ) {
-                snapshots_applied += 1;
+            match snap.apply_peer(&tx, device) {
+                Ok(outcome) => {
+                    tx.commit()?;
+                    if matches!(
+                        outcome,
+                        super::snapshot::ApplyOutcome::Applied
+                            | super::snapshot::ApplyOutcome::HeaderOnly
+                    ) {
+                        snapshots_applied += 1;
+                    }
+                }
+                Err(e) => {
+                    ::log::warn!(
+                        "sync: skipping snapshot for peer {device} (will retry next tick): {e}"
+                    );
+                    let _ = tx.rollback();
+                }
             }
+            drop(conn);
         }
 
         // Read watermarks through the reader — no write lock needed.
@@ -419,6 +449,10 @@ impl ReplayEngine {
         // lands.
         let mut events_applied = 0usize;
         for ev in &all_events {
+            if self.is_cancelled() {
+                ::log::info!("sync: tick cancelled after {events_applied}/{total_events} events");
+                break;
+            }
             let mut conn = db
                 .conn
                 .lock()

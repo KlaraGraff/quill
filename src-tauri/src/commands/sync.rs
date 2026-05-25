@@ -32,7 +32,7 @@ use crate::icloud;
 use crate::sync::device::DeviceIdentity;
 use crate::sync::log::EventLog;
 use crate::sync::peers;
-use crate::sync::replay::{ReplayEngine, ReplayReport};
+use crate::sync::replay::{self as replay, ReplayEngine, ReplayReport};
 use crate::sync::snapshot::{self, CompactReport, Snapshot};
 // `Snapshot` is referenced from the `publish_bootstrap_snapshot` helper.
 use crate::sync::watcher::{self, WatcherHandle};
@@ -166,7 +166,8 @@ pub fn sync_status(
     let migration_complete = sync::migration::is_migration_complete(&local.0);
     let shared_dir = sync::migration::recorded_data_dir(&local.0)
         .or_else(icloud::icloud_data_dir_deterministic);
-    let available = icloud::icloud_data_dir().is_some();
+    let available = icloud::icloud_data_dir_fast().is_some()
+        || icloud::is_icloud_available();
     let enabled = sync_state.engine_snapshot()?.is_some();
 
     // Peer list + per-peer pending events. Both are cheap reads off
@@ -219,6 +220,7 @@ pub fn sync_status(
 
 #[tauri::command]
 pub fn sync_enable(
+    app: tauri::AppHandle,
     local: State<'_, LocalDir>,
     db: State<'_, Db>,
     device: State<'_, DeviceIdentity>,
@@ -352,13 +354,21 @@ pub fn sync_enable(
         *g = Some(watcher_handle);
     }
 
-    // Fire an initial tick now that the engine is fully wired. Failure
-    // is non-fatal — the watcher will retry on the next event, and a
-    // fresh-enable session doesn't have leftover outbox rows or peer
-    // tails that would get stuck pending.
-    if let Err(e) = engine.tick(&db) {
-        log::warn!("sync_enable: initial tick failed: {e}");
-    }
+    // Fire the initial tick on a background thread so sync_enable
+    // returns immediately — the UI stays responsive while the tick
+    // applies peer snapshots and events. Same pattern as boot_sync_engine.
+    let bg_db = db.inner().clone();
+    let bg_handle = app.clone();
+    std::thread::Builder::new()
+        .name("sync-enable-tick".into())
+        .spawn(move || {
+            let result = engine.tick_with_progress(&bg_db, Some(&bg_handle));
+            let _ = tauri::Emitter::emit(&bg_handle, "sync-initial-tick-done", ());
+            if let Err(e) = result {
+                log::warn!("sync_enable: initial tick failed: {e}");
+            }
+        })
+        .ok();
 
     Ok(())
 }
@@ -371,7 +381,28 @@ pub fn sync_disable(
     sync_writer: State<'_, SyncWriter>,
     sync_state: State<'_, SyncState>,
 ) -> AppResult<()> {
-    // ---- Phase 1: fallible binary copy-back with no state change ----
+    let engine = sync_state.engine_snapshot()?;
+
+    // Stop new watcher ticks first, then cancel any tick already in
+    // flight before joining the watcher thread.
+    let old_watcher = {
+        let mut g = sync_state
+            .watcher
+            .lock()
+            .map_err(|e| AppError::Other(format!("watcher mutex: {e}")))?;
+        if let Some(watcher) = g.as_ref() {
+            watcher.request_stop();
+        }
+        g.take()
+    };
+    let had_watcher = old_watcher.is_some();
+    if let Some(engine) = engine.as_ref() {
+        engine.cancel();
+    }
+    drop(old_watcher);
+    replay::tick_mutex_wait();
+
+    // ---- Phase 1: fallible binary copy-back with no durable state change ----
     // If this fails (e.g. iCloud-evicted files, disk full), return an
     // error without touching any session or marker state. The user
     // sees "disable failed, please retry" and the system is still in
@@ -382,9 +413,31 @@ pub fn sync_disable(
 
     let ubiquity_dir = sync::migration::recorded_data_dir(&local.0)
         .or_else(icloud::icloud_data_dir_deterministic);
-    if let Some(ub) = ubiquity_dir.as_ref() {
-        copy_dir_contents(&ub.join("books"), &local.0.join("books"))?;
-        copy_dir_contents(&ub.join("covers"), &local.0.join("covers"))?;
+    let copy_result = if let Some(ub) = ubiquity_dir.as_ref() {
+        copy_dir_contents(&ub.join("books"), &local.0.join("books"))
+            .and_then(|_| copy_dir_contents(&ub.join("covers"), &local.0.join("covers")))
+    } else {
+        Ok(())
+    };
+    if let Err(e) = copy_result {
+        if had_watcher {
+            if let (Some(ub), Some(engine)) = (ubiquity_dir.as_ref(), engine.as_ref()) {
+                match watcher::spawn(ub.clone(), db.inner().clone(), Arc::clone(engine)) {
+                    Ok(watcher) => match sync_state.watcher.lock() {
+                        Ok(mut g) => *g = Some(watcher),
+                        Err(lock_err) => {
+                            log::error!("sync_disable: failed to restore watcher: {lock_err}");
+                        }
+                    },
+                    Err(restart_err) => {
+                        log::error!(
+                            "sync_disable: failed to restore watcher after copy-back error: {restart_err}"
+                        );
+                    }
+                }
+            }
+        }
+        return Err(e);
     }
 
     // ---- Phase 2: teardown + marker removal ----
@@ -392,19 +445,7 @@ pub fn sync_disable(
     // fallible copy-back above succeeded, so we're committed to
     // turning sync off.
 
-    // Drop the watcher first. Drop signals stop + joins the thread —
-    // no further fs events will trigger ticks while we mutate state.
-    {
-        let mut g = sync_state
-            .watcher
-            .lock()
-            .map_err(|e| AppError::Other(format!("watcher mutex: {e}")))?;
-        *g = None;
-    }
-    // Drop the engine. The Arc may still be held by a tick in flight
-    // (sync_now), but `set_log(None)` below stops new outbox flushes
-    // from finding a log handle; the in-flight tick finishes against
-    // its captured Arc and that's the end of it.
+    // Watcher already dropped above. Drop the engine.
     {
         let mut g = sync_state
             .engine
@@ -443,6 +484,18 @@ pub fn sync_disable(
     let legacy_marker = local.0.join(".icloud_enabled");
     let _ = fs::remove_file(&legacy_marker);
 
+    Ok(())
+}
+
+#[tauri::command]
+pub fn sync_cancel(
+    app: tauri::AppHandle,
+    sync_state: State<'_, SyncState>,
+) -> AppResult<()> {
+    if let Some(engine) = sync_state.engine_snapshot()? {
+        engine.cancel();
+    }
+    let _ = tauri::Emitter::emit(&app, "sync-initial-tick-done", ());
     Ok(())
 }
 
