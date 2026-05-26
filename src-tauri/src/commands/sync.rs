@@ -37,6 +37,11 @@ pub struct SyncState {
     /// `WatcherHandle` is dropped on `sync_disable`; the `Drop` impl
     /// signals the watcher thread to stop and joins it.
     pub watcher: Mutex<Option<WatcherHandle>>,
+    /// Monotonic counter incremented by `sync_disable` (and `sync_enable`).
+    /// The async boot thread captures the generation at spawn time and
+    /// only installs the engine if the generation hasn't changed — so a
+    /// disable that races with a slow boot wins cleanly.
+    pub generation: std::sync::atomic::AtomicU64,
 }
 
 impl SyncState {
@@ -47,7 +52,18 @@ impl SyncState {
         Self {
             engine: Mutex::new(engine),
             watcher: Mutex::new(watcher),
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Bump the generation. Called by sync_disable / sync_enable so
+    /// an in-flight async boot recognizes it's stale.
+    pub fn bump_generation(&self) -> u64 {
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+
+    pub fn current_generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Lock-free read for `sync_now` and `sync_status`. Holding the
@@ -431,7 +447,8 @@ pub fn sync_disable(
     // fallible copy-back above succeeded, so we're committed to
     // turning sync off.
 
-    // Watcher already dropped above. Drop the engine.
+    // Watcher already dropped above. Drop the engine + bump generation
+    // so any in-flight async boot thread knows it's stale.
     {
         let mut g = sync_state
             .engine
@@ -439,6 +456,7 @@ pub fn sync_disable(
             .map_err(|e| AppError::Other(format!("engine mutex: {e}")))?;
         *g = None;
     }
+    sync_state.bump_generation();
 
     // Stop publishing. Future `with_tx` calls neither queue into
     // `_pending_publish` nor try to drain it.

@@ -516,10 +516,19 @@ pub fn run() {
                         let bg_writer: tauri::State<SyncWriter> = bg_handle.state();
                         let bg_device: tauri::State<DeviceIdentity> = bg_handle.state();
                         let bg_sync: tauri::State<SyncState> = bg_handle.state();
+                        let gen = bg_sync.current_generation();
                         match boot_sync_engine(
                             ub, &bg_device.device_uuid, &bg_db, &bg_writer, &bg_handle,
                         ) {
                             Ok((engine, watcher)) => {
+                                if bg_sync.current_generation() != gen {
+                                    log::warn!(
+                                        "sync: boot completed but generation changed \
+                                         (sync was toggled during boot) — discarding engine"
+                                    );
+                                    bg_writer.set_log(None);
+                                    return;
+                                }
                                 log::info!("sync: engine booted (replay + watcher active)");
                                 if let Some(e) = engine {
                                     *bg_sync.engine.lock().unwrap() = Some(e);
@@ -527,6 +536,7 @@ pub fn run() {
                                 if let Some(w) = watcher {
                                     *bg_sync.watcher.lock().unwrap() = Some(w);
                                 }
+                                let _ = bg_handle.emit("sync-status-changed", ());
                             }
                             Err(e) => {
                                 log::error!("sync: failed to boot sync engine: {e}");
