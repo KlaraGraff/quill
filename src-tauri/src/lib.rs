@@ -278,11 +278,11 @@ fn boot_sync_engine(
         .name("sync-initial-tick".into())
         .spawn(move || {
             let result = bg_engine.tick_with_progress(&bg_db, Some(&bg_handle));
-            let _ = bg_handle.emit("sync-initial-tick-done", ());
             if let Err(e) = result {
                 log::warn!("sync: initial replay tick failed: {e}");
             }
             trigger_cover_downloads(&bg_data_dir);
+            let _ = bg_handle.emit("sync-initial-tick-done", ());
         })
         .ok();
 
