@@ -17,13 +17,13 @@ Manage Quill's feature pipeline: specs live in `docs/features/`, tracking lives 
 Create a new feature from scratch.
 
 1. Ask the user to describe the feature (motivation, scope, key decisions).
-2. Assign the next available number by checking existing files in `docs/features/`.
-3. Create `docs/features/{number}-{slug}.md` with sections: Motivation, Scope, Implementation Phases, Verification.
-4. **Pick a priority** (see Priority below). If the user didn't state one, propose one and confirm before filing. Don't file unlabeled.
-5. Create a GitHub Issue with labels `feature` and the chosen `P0`/`P1`/`P2`/`P3`:
+2. **Pick a priority** (see Priority below). If the user didn't state one, propose one and confirm before filing. Don't file unlabeled.
+3. Create a GitHub Issue with labels `feature` and the chosen `P0`/`P1`/`P2`/`P3`:
    - Title: `feat: <short description>`
-   - Body: Motivation, Scope summary, Implementation Phases, and a reference back to the spec file.
+   - Body: Motivation, Scope summary, Implementation Phases, and a placeholder note that the spec path will be added after the issue number is assigned.
    - Command shape: `gh issue create --label feature --label P1 --title "…" --body "…"`
+4. Use the GitHub issue number as the spec number. Create `docs/features/{issue-number}-{slug}.md` with sections: Motivation, Scope, Implementation Phases, Verification, and a `GitHub issue: <issue-url>` line near the top.
+5. Edit the GitHub Issue body to replace the placeholder with the final spec path. The issue body and spec must cross-link each other.
 6. Update `docs/features/README.md` to include the new spec.
 7. Report the spec path, issue URL, and assigned priority.
 
@@ -54,7 +54,8 @@ Set or change the priority of an existing feature.
 Open or create a spec for an existing feature issue.
 
 1. If a spec file already exists, show its path.
-2. If not, create one following the same format as `new`, pre-populated from the issue body.
+2. If not, fetch the issue, use the issue number as the spec number, and create `docs/features/{issue-number}-{slug}.md` following the same format as `new`, pre-populated from the issue body.
+3. Edit the issue body to include the new spec path if it does not already reference it.
 
 ## Labels
 
@@ -75,7 +76,7 @@ When in doubt between two levels, pick the lower-urgency one and say why; over-l
 
 ## Conventions
 
-- Spec files are numbered sequentially: `01-product-spec.md`, `02-ai-quick-explain.md`, etc.
+- Spec files are numbered by their GitHub issue number: `276-reset-all-data.md` for issue `#276`. The heading must use the same number.
 - Slugs are lowercase kebab-case derived from the feature name.
 - Specs for shipped features move to `docs/features/archive/` — the implementation is the source of truth, but the spec stays as the "what we were going for" record.
 - The `docs/features/README.md` index only lists in-progress/planned specs.
@@ -83,5 +84,5 @@ When in doubt between two levels, pick the lower-urgency one and say why; over-l
 ## Notes
 
 - Do not commit or push unless the user explicitly asks.
-- When creating issues, always include a reference to the spec file path in the issue body.
+- When creating issues, always update the issue body with the final spec file path after the issue number is known.
 - When creating specs, always include a reference to the GitHub issue URL.
