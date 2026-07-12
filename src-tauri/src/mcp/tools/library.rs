@@ -8,11 +8,11 @@
 //! Write tools are gated behind `McpState.sync` — they return a clear
 //! error when write access is disabled.
 
-use rmcp::ErrorData;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content};
 use rmcp::tool;
 use rmcp::tool_router;
+use rmcp::ErrorData;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +51,8 @@ struct McpBook {
     description: Option<String>,
     file_path: String,
     format: String,
+    source_format: Option<String>,
+    render_format: Option<String>,
     genre: Option<String>,
     pages: Option<i32>,
     status: String,
@@ -71,6 +73,8 @@ impl From<books::Book> for McpBook {
             description: b.description,
             file_path: b.file_path,
             format: b.format,
+            source_format: b.source_format,
+            render_format: b.render_format,
             genre: b.genre,
             pages: b.pages,
             status: b.status,
@@ -92,18 +96,16 @@ impl QuillMcpHandler {
         &self,
         Parameters(ListBooksArgs { filter, search }): Parameters<ListBooksArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let raw = books::query_books_lite(
-            &self.state.db,
-            filter.as_deref(),
-            search.as_deref(),
-            1000,
-        )
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let raw =
+            books::query_books_lite(&self.state.db, filter.as_deref(), search.as_deref(), 1000)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let books: Vec<McpBook> = raw.into_iter().map(McpBook::from).collect();
         Ok(CallToolResult::success(vec![Content::json(&books)?]))
     }
 
-    #[tool(description = "Fetch a single book by its ID, including reading progress and current CFI.")]
+    #[tool(
+        description = "Fetch a single book by its ID, including reading progress and current CFI."
+    )]
     pub async fn get_book(
         &self,
         Parameters(GetBookArgs { book_id }): Parameters<GetBookArgs>,
@@ -124,7 +126,8 @@ impl QuillMcpHandler {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AddBookArgs {
-    /// Absolute path to an .epub or .pdf file on the local filesystem.
+    /// Absolute path to a supported local ebook file (.epub, .pdf, .txt,
+    /// .md, .html, .mobi/.azw/.azw3, .fb2/.fbz, or .cbz).
     pub file_path: String,
 }
 
@@ -202,29 +205,15 @@ pub(crate) fn require_sync(
 #[tool_router(router = library_write_router, vis = "pub(crate)")]
 impl QuillMcpHandler {
     #[tool(
-        description = "Import a book from a local file path (.epub or .pdf) into the library."
+        description = "Import a supported local ebook file into the library. Supported formats include EPUB, PDF, TXT, Markdown, HTML, MOBI/AZW/AZW3, FB2/FBZ, and CBZ."
     )]
     pub async fn add_book(
         &self,
         Parameters(AddBookArgs { file_path }): Parameters<AddBookArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let sync = require_sync(self)?;
-        let ext = file_path
-            .rsplit('.')
-            .next()
-            .unwrap_or("")
-            .to_lowercase();
-        let book = match ext.as_str() {
-            "epub" => books::do_import_epub(&file_path, &self.state.db, sync),
-            "pdf" => books::do_import_pdf(&file_path, &self.state.db, sync),
-            _ => {
-                return Err(ErrorData::invalid_params(
-                    format!("Unsupported format '.{ext}'. Only .epub and .pdf are supported."),
-                    None,
-                ))
-            }
-        }
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let book = books::do_import_from_path(&file_path, &self.state.db, sync)
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         self.state.notify("books", "created", &book.id);
         let mcp_book: McpBook = book.into();
         Ok(CallToolResult::success(vec![Content::json(&mcp_book)?]))

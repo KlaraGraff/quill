@@ -93,19 +93,12 @@ pub(crate) fn claude_code_is_enabled_at(path: &Path) -> AppResult<bool> {
     }
     let val: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| AppError::Other(format!("parse {}: {e}", path.display())))?;
-    Ok(val
-        .get("mcpServers")
-        .and_then(|m| m.get("quill"))
-        .is_some())
+    Ok(val.get("mcpServers").and_then(|m| m.get("quill")).is_some())
 }
 
 /// Inner: takes the explicit config path. Sibling entries under
 /// `mcpServers` and unrelated top-level keys are preserved.
-pub(crate) fn claude_code_write_at(
-    path: &Path,
-    enabled: bool,
-    binary_path: &str,
-) -> AppResult<()> {
+pub(crate) fn claude_code_write_at(path: &Path, enabled: bool, binary_path: &str) -> AppResult<()> {
     let mut val: serde_json::Value = if path.exists() {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| AppError::Other(format!("read {}: {e}", path.display())))?;
@@ -146,9 +139,8 @@ pub(crate) fn claude_code_write_at(
         servers.remove("quill");
     }
 
-    let mut out = serde_json::to_string_pretty(&val).map_err(|e| {
-        AppError::Other(format!("serialize {}: {e}", path.display()))
-    })?;
+    let mut out = serde_json::to_string_pretty(&val)
+        .map_err(|e| AppError::Other(format!("serialize {}: {e}", path.display())))?;
     out.push('\n');
     std::fs::write(path, out)
         .map_err(|e| AppError::Other(format!("write {}: {e}", path.display())))?;
@@ -177,11 +169,7 @@ pub(crate) fn codex_is_enabled_at(path: &Path) -> AppResult<bool> {
         .is_some())
 }
 
-pub(crate) fn codex_write_at(
-    path: &Path,
-    enabled: bool,
-    binary_path: &str,
-) -> AppResult<()> {
+pub(crate) fn codex_write_at(path: &Path, enabled: bool, binary_path: &str) -> AppResult<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| AppError::Other(format!("mkdir {}: {e}", parent.display())))?;
@@ -330,15 +318,24 @@ mod tests {
         claude_code_write_at(&path, true, "/test/quill").unwrap();
         let after_enable: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(after_enable["mcpServers"]["quill"]["command"], json!("/test/quill"));
-        assert_eq!(after_enable["mcpServers"]["github"]["command"], json!("gh-mcp"));
+        assert_eq!(
+            after_enable["mcpServers"]["quill"]["command"],
+            json!("/test/quill")
+        );
+        assert_eq!(
+            after_enable["mcpServers"]["github"]["command"],
+            json!("gh-mcp")
+        );
         assert_eq!(after_enable["theme"], json!("dark"));
 
         claude_code_write_at(&path, false, "/test/quill").unwrap();
         let after_disable: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(after_disable["mcpServers"].get("quill").is_none());
-        assert_eq!(after_disable["mcpServers"]["github"]["command"], json!("gh-mcp"));
+        assert_eq!(
+            after_disable["mcpServers"]["github"]["command"],
+            json!("gh-mcp")
+        );
         assert_eq!(after_disable["theme"], json!("dark"));
         assert!(!claude_code_is_enabled_at(&path).unwrap());
     }
@@ -371,8 +368,7 @@ mod tests {
         codex_write_at(&path, true, "/test/quill").unwrap();
 
         assert!(path.exists());
-        let doc: toml_edit::DocumentMut =
-            std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        let doc: toml_edit::DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         assert_eq!(
             doc["mcp_servers"]["quill"]["command"].as_str(),
             Some("/test/quill")
@@ -394,14 +390,23 @@ mod tests {
         let after: toml_edit::DocumentMut =
             std::fs::read_to_string(&path).unwrap().parse().unwrap();
         assert_eq!(after["model"].as_str(), Some("gpt-5"));
-        assert_eq!(after["mcp_servers"]["github"]["command"].as_str(), Some("gh-mcp"));
-        assert_eq!(after["mcp_servers"]["quill"]["command"].as_str(), Some("/test/quill"));
+        assert_eq!(
+            after["mcp_servers"]["github"]["command"].as_str(),
+            Some("gh-mcp")
+        );
+        assert_eq!(
+            after["mcp_servers"]["quill"]["command"].as_str(),
+            Some("/test/quill")
+        );
 
         codex_write_at(&path, false, "/test/quill").unwrap();
         let after2: toml_edit::DocumentMut =
             std::fs::read_to_string(&path).unwrap().parse().unwrap();
         assert!(after2["mcp_servers"].get("quill").is_none());
-        assert_eq!(after2["mcp_servers"]["github"]["command"].as_str(), Some("gh-mcp"));
+        assert_eq!(
+            after2["mcp_servers"]["github"]["command"].as_str(),
+            Some("gh-mcp")
+        );
         assert_eq!(after2["model"].as_str(), Some("gpt-5"));
     }
 
@@ -418,7 +423,10 @@ mod tests {
 
     #[test]
     fn client_parse_rejects_unknown() {
-        assert!(matches!(Client::parse("claude_code"), Ok(Client::ClaudeCode)));
+        assert!(matches!(
+            Client::parse("claude_code"),
+            Ok(Client::ClaudeCode)
+        ));
         assert!(matches!(Client::parse("codex"), Ok(Client::Codex)));
         assert!(Client::parse("cursor").is_err());
     }

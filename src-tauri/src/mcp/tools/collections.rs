@@ -1,8 +1,8 @@
-use rmcp::ErrorData;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content};
 use rmcp::tool;
 use rmcp::tool_router;
+use rmcp::ErrorData;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -108,13 +108,8 @@ impl QuillMcpHandler {
         }): Parameters<CollectionBookArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let sync = require_sync(self)?;
-        collections::do_remove_book_from_collection(
-            &collection_id,
-            &book_id,
-            &self.state.db,
-            sync,
-        )
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        collections::do_remove_book_from_collection(&collection_id, &book_id, &self.state.db, sync)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         self.state.notify("collections", "updated", &collection_id);
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Book {book_id} removed from collection {collection_id}."

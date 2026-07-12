@@ -1,13 +1,29 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { emitTo, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { X, Loader2, Sparkles, BookmarkPlus, Check, Copy, Settings, MessageSquareMore } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import Markdown from "react-markdown";
 import { LOOKUP_PROSE } from "./lookup-prose";
+import { aiErrorMessageKey, getAiErrorCode, isAiSettingsError, type AiErrorCode } from "../utils/aiError";
 
 const TRANSLATION_MARKER = "[[QUILL_TRANSLATION]]";
+
+async function notifyReaderWindows(event: "lookup-record-changed" | "vocab-changed", detail: { bookId: string; cfi?: string }) {
+  const windows = await WebviewWindow.getAll();
+  await Promise.all(
+    windows
+      .filter((window) => window.label === `reader-${detail.bookId}`)
+      .map((window) => emitTo(window.label, event, detail)),
+  );
+}
+
+interface AiStreamChunk {
+  delta: string;
+  done: boolean;
+  error?: string;
+}
 
 interface LookupPopoverProps {
   x: number;
@@ -32,29 +48,39 @@ function useStreamingLookup(
   const contentRef = useRef("");
   const [content, setContent] = useState("");
   const [streaming, setStreaming] = useState(true);
-  const [notConfigured, setNotConfigured] = useState(false);
+  const [aiError, setAiError] = useState<AiErrorCode | null>(null);
   const [translationLanguageNotConfigured, setTranslationLanguageNotConfigured] = useState(false);
+  const [streamError, setStreamError] = useState(false);
   const unlistenRef = useRef<UnlistenFn | null>(null);
+  const requestIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     contentRef.current = "";
     setContent("");
     setStreaming(true);
-    setNotConfigured(false);
+    setAiError(null);
     setTranslationLanguageNotConfigured(false);
+    setStreamError(false);
 
     const run = async () => {
       const requestId = crypto.randomUUID();
+      requestIdRef.current = requestId;
 
-      unlistenRef.current = await listen<{ delta: string; done: boolean }>(
+      unlistenRef.current = await listen<AiStreamChunk>(
         `ai-lookup-chunk-${requestId}`,
         (event) => {
           if (cancelled) return;
           if (event.payload.done) {
+            if (event.payload.error) {
+              const errorCode = getAiErrorCode(event.payload.error);
+              if (isAiSettingsError(errorCode)) setAiError(errorCode);
+              else setStreamError(true);
+            }
             setStreaming(false);
             unlistenRef.current?.();
             unlistenRef.current = null;
+            requestIdRef.current = null;
             return;
           }
           contentRef.current += event.payload.delta;
@@ -74,14 +100,20 @@ function useStreamingLookup(
       } catch (err) {
         if (!cancelled) {
           const msg = String(err);
-          if (msg.includes("AI_NOT_CONFIGURED")) {
-            setNotConfigured(true);
+          const errorCode = getAiErrorCode(msg);
+          if (isAiSettingsError(errorCode)) {
+            setAiError(errorCode);
           } else if (msg.includes("LOOKUP_TRANSLATION_LANGUAGE_NOT_CONFIGURED")) {
             setTranslationLanguageNotConfigured(true);
           } else {
             setContent(`Error: ${msg}`);
           }
           setStreaming(false);
+        }
+        if (requestIdRef.current === requestId) {
+          requestIdRef.current = null;
+          unlistenRef.current?.();
+          unlistenRef.current = null;
         }
       }
     };
@@ -90,12 +122,14 @@ function useStreamingLookup(
 
     return () => {
       cancelled = true;
+      if (requestIdRef.current) invoke("ai_cancel", { requestId: requestIdRef.current }).catch(() => {});
+      requestIdRef.current = null;
       unlistenRef.current?.();
       unlistenRef.current = null;
     };
   }, [word, sentence, bookTitle, chapter, kind]);
 
-  return { content, contentRef, streaming, notConfigured, translationLanguageNotConfigured };
+  return { content, contentRef, streaming, aiError, translationLanguageNotConfigured, streamError };
 }
 
 function splitDefinitionContent(content: string, streaming: boolean): {
@@ -154,15 +188,16 @@ export default function LookupPopover({
   // Split the backend-marked translation from the definition stream.
   const { translationLine, definitionText } = splitDefinitionContent(definition.content, definition.streaming);
 
-  const aiNotConfigured = definition.notConfigured || context.notConfigured;
+  const aiError = definition.aiError || context.aiError;
   const translationLanguageNotConfigured =
     definition.translationLanguageNotConfigured || context.translationLanguageNotConfigured;
-  const hasConfigurationError = aiNotConfigured || translationLanguageNotConfigured;
+  const streamError = definition.streamError || context.streamError;
+  const hasConfigurationError = aiError !== null || translationLanguageNotConfigured;
   const allDone = !definition.streaming && !context.streaming;
   const hasContent = definition.content || context.content;
 
   useEffect(() => {
-    if (!allDone || !hasContent || hasConfigurationError || historySavedRef.current) return;
+    if (!allDone || !hasContent || hasConfigurationError || streamError || historySavedRef.current) return;
     historySavedRef.current = true;
     invoke("save_lookup_record", {
       bookId,
@@ -172,8 +207,11 @@ export default function LookupPopover({
       cfi: cfi || null,
       definition: displayedDefinitionContent(definition.contentRef.current),
       contextExplanation: context.contentRef.current || null,
+    }).then(() => {
+      window.dispatchEvent(new CustomEvent("lookup-record-changed", { detail: { bookId, cfi } }));
+      notifyReaderWindows("lookup-record-changed", { bookId, cfi: cfi || undefined }).catch(() => {});
     }).catch((err) => console.error("Failed to save lookup history:", err));
-  }, [allDone, bookId, cfi, chapter, context.contentRef, definition.contentRef, hasConfigurationError, hasContent, sentence, word]);
+  }, [allDone, bookId, cfi, chapter, context.contentRef, definition.contentRef, hasConfigurationError, hasContent, sentence, streamError, word]);
 
   // Position clamping — re-run whenever the popover resizes (e.g. as content streams in)
   const [pos, setPos] = useState({ left: x, top: y });
@@ -217,6 +255,8 @@ export default function LookupPopover({
         cfi: cfi || null,
       });
       setSaved(true);
+      window.dispatchEvent(new CustomEvent("vocab-changed", { detail: { bookId, cfi } }));
+      notifyReaderWindows("vocab-changed", { bookId, cfi: cfi || undefined }).catch(() => {});
     } catch (err) {
       console.error("Failed to save vocab word:", err);
     }
@@ -294,7 +334,9 @@ export default function LookupPopover({
         {hasConfigurationError ? (
           <div className="flex flex-col items-center gap-2 py-4 text-center">
             <p className="text-[13px] text-text-muted">
-              {translationLanguageNotConfigured ? t("lookup.translationLanguageNotConfigured") : t("ai.notConfigured")}
+              {translationLanguageNotConfigured
+                ? t("lookup.translationLanguageNotConfigured")
+                : aiError ? t(aiErrorMessageKey(aiError)) : null}
             </p>
             <button
               onClick={async () => {
@@ -311,8 +353,12 @@ export default function LookupPopover({
           </div>
         ) : null}
 
+        {!hasConfigurationError && streamError ? (
+          <p className="py-3 text-[13px] text-text-muted">{t("ai.requestFailed")}</p>
+        ) : null}
+
         {/* Definition section */}
-        {!hasConfigurationError && (definition.streaming && !definition.content ? (
+        {!hasConfigurationError && !streamError && (definition.streaming && !definition.content ? (
           <div className="flex items-center gap-1.5 py-1">
             <Loader2 size={14} className="animate-spin text-text-muted" />
             <span className="text-[13px] text-text-muted">{t("lookup.lookingUp")}</span>
@@ -332,7 +378,7 @@ export default function LookupPopover({
         ))}
 
         {/* In this context — card */}
-        {!hasConfigurationError && (context.content || context.streaming) && (
+        {!hasConfigurationError && !streamError && (context.content || context.streaming) && (
           <div className="mt-3 mb-1 p-3 rounded-lg bg-bg-muted border border-border/50">
             <span className="block text-[12px] font-medium text-text-muted mb-1">
               {t("lookup.inContext")}
@@ -355,7 +401,7 @@ export default function LookupPopover({
       </div>
 
       {/* Footer — Save & Copy */}
-      {allDone && hasContent && !hasConfigurationError && (
+      {allDone && hasContent && !hasConfigurationError && !streamError && (
         <div className="flex items-center justify-between px-4 py-2.5 border-t border-border/40">
           <div className="flex items-center gap-3">
             <button

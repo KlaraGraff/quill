@@ -45,9 +45,8 @@ impl McpState {
             return;
         };
         let ts = chrono::Utc::now().timestamp_millis();
-        let payload = format!(
-            r#"{{"domain":"{domain}","action":"{action}","id":"{id}","ts":{ts}}}"#
-        );
+        let payload =
+            format!(r#"{{"domain":"{domain}","action":"{action}","id":"{id}","ts":{ts}}}"#);
         if let Err(e) = std::fs::write(path, payload.as_bytes()) {
             eprintln!("mcp: failed to write notify sentinel: {e}");
         }

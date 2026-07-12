@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use rusqlite::{params, Connection, Transaction};
@@ -47,8 +47,9 @@ pub const COMPACT_LOG_EVENT_THRESHOLD: usize = 5_000;
 pub const COMPACT_AGE_THRESHOLD_MS: i64 = 30 * 24 * 60 * 60 * 1_000; // 30 days
 
 pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Snapshot {
     pub v: u32,
     pub device: String,
@@ -64,7 +65,7 @@ pub struct Snapshot {
     pub state: SnapshotState,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SnapshotState {
     #[serde(default)]
     pub books: BTreeMap<String, BookRow>,
@@ -99,6 +100,16 @@ pub struct BookRow {
     pub genre: Option<String>,
     pub pages: Option<i64>,
     pub format: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sha256: Option<String>,
+    #[serde(default)]
+    pub conversion_version: i32,
     pub status: String,
     pub progress: i32,
     pub current_cfi: Option<String>,
@@ -130,7 +141,7 @@ pub struct BookmarkRow {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VocabRow {
     pub book_id: String,
     pub word: String,
@@ -142,9 +153,25 @@ pub struct VocabRow {
     pub mastery: String,
     pub review_count: i64,
     pub next_review_at: Option<i64>,
+    #[serde(default)]
+    pub review_interval_days: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reviewed_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_review_rating: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fsrs_stability: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fsrs_difficulty: Option<f64>,
+    #[serde(default = "default_fsrs_version")]
+    pub fsrs_version: i64,
     pub created_at: i64,
     pub updated_at: i64,
     pub updated_by_device: String,
+}
+
+fn default_fsrs_version() -> i64 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -318,9 +345,8 @@ impl Snapshot {
     }
 
     pub fn read_from(path: &Path) -> AppResult<Self> {
-        let bytes = fs::read(path)?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| AppError::Other(format!("snapshot parse: {e}")))
+        let bytes = read_snapshot_bytes(path)?;
+        serde_json::from_slice(&bytes).map_err(|e| AppError::Other(format!("snapshot parse: {e}")))
     }
 
     /// Like `read_from` but skips iCloud-evicted files and applies a
@@ -352,7 +378,7 @@ impl Snapshot {
         let path_buf = path.to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = fs::read(&path_buf);
+            let result = read_snapshot_bytes(&path_buf);
             on_thread_done();
             let _ = tx.send(result);
         });
@@ -363,8 +389,8 @@ impl Snapshot {
                     .map_err(|e| AppError::Other(format!("snapshot parse: {e}")))?;
                 Ok(Some(snap))
             }
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Ok(Err(e)) => Err(AppError::Io(e)),
+            Ok(Err(AppError::Io(e))) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Ok(Err(e)) => Err(e),
             Err(_) => {
                 log::warn!(
                     "sync: timed out reading peer snapshot {} after {}s — backing off",
@@ -387,6 +413,35 @@ impl Snapshot {
     /// the migration apply-back case (where the snapshot's `device` is the
     /// migrating device but `_replay_state` still treats it as a peer).
     pub fn apply_peer(&self, tx: &Transaction, peer_device: &str) -> AppResult<ApplyOutcome> {
+        super::validation::validate_peer_device(peer_device)?;
+        if self.device != peer_device
+            || self.v != SNAPSHOT_SCHEMA_VERSION
+            || self.id.parse::<Ulid>().is_err()
+        {
+            return Err(AppError::Other(
+                "SYNC_SNAPSHOT_ENVELOPE_INVALID".to_string(),
+            ));
+        }
+        let snapshot_id = self
+            .id
+            .parse::<Ulid>()
+            .map_err(|_| AppError::Other("SYNC_SNAPSHOT_ENVELOPE_INVALID".to_string()))?;
+        super::validation::ensure_not_from_far_future(
+            self.generated_at,
+            "SYNC_SNAPSHOT_ENVELOPE_INVALID",
+        )?;
+        super::validation::ensure_not_from_far_future(
+            i64::try_from(snapshot_id.timestamp_ms())
+                .map_err(|_| AppError::Other("SYNC_SNAPSHOT_ENVELOPE_INVALID".to_string()))?,
+            "SYNC_SNAPSHOT_ENVELOPE_INVALID",
+        )?;
+        for (id, book) in &self.state.books {
+            super::validation::validate_entity_id(id)?;
+            super::validation::validate_book_path(&book.file_path)?;
+            if let Some(path) = book.cover_path.as_deref() {
+                super::validation::validate_cover_path(path)?;
+            }
+        }
         let prior: Option<(Option<String>, Option<String>)> = tx
             .query_row(
                 "SELECT last_snapshot_id, last_event_id
@@ -409,7 +464,10 @@ impl Snapshot {
 
         // Spec step 4b: snapshot summarises events we've already individually
         // applied — skip rows but bump last_snapshot_id so we don't re-parse.
-        if prior_event.as_deref().is_some_and(|e| e >= self.id.as_str()) {
+        if prior_event
+            .as_deref()
+            .is_some_and(|e| e >= self.id.as_str())
+        {
             upsert_replay_state(tx, peer_device, Some(&self.id), prior_event.as_deref())?;
             return Ok(ApplyOutcome::HeaderOnly);
         }
@@ -487,6 +545,26 @@ impl Snapshot {
     }
 }
 
+fn read_snapshot_bytes(path: &Path) -> AppResult<Vec<u8>> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > MAX_SNAPSHOT_BYTES {
+        return Err(AppError::Other(format!(
+            "snapshot exceeds {MAX_SNAPSHOT_BYTES} byte limit: {}",
+            path.display()
+        )));
+    }
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SNAPSHOT_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
+        return Err(AppError::Other(format!(
+            "snapshot exceeds {MAX_SNAPSHOT_BYTES} byte limit: {}",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
 /// Open the parent directory of `path` and `fsync` it. POSIX requires
 /// this for a preceding `rename` to actually survive a power cut: the
 /// data write + `fsync` makes the temp file durable, the rename
@@ -525,9 +603,7 @@ fn fsync_parent_dir(_path: &Path) -> std::io::Result<()> {
 /// `false` when the log doesn't exist yet (fresh enable, no events
 /// emitted) or every threshold is below the limit.
 pub fn should_compact(shared_dir: &Path, device: &str) -> bool {
-    let log_path = shared_dir
-        .join("logs")
-        .join(format!("{device}.jsonl"));
+    let log_path = shared_dir.join("logs").join(format!("{device}.jsonl"));
     let snap_path = shared_dir
         .join("logs")
         .join(format!("{device}.snapshot.json"));
@@ -541,10 +617,8 @@ pub fn should_compact(shared_dir: &Path, device: &str) -> bool {
 
     // Cheap line count via byte scan — avoids deserializing every event
     // just to decide whether compaction is needed.
-    let log_lines = match fs::read(&log_path) {
-        Ok(b) => b.iter().filter(|&&c| c == b'\n').count(),
-        Err(_) => 0,
-    };
+    let log_lines =
+        count_lines_bounded(&log_path, COMPACT_LOG_EVENT_THRESHOLD + 1).unwrap_or_default();
     if log_lines > COMPACT_LOG_EVENT_THRESHOLD {
         return true;
     }
@@ -567,6 +641,22 @@ pub fn should_compact(shared_dir: &Path, device: &str) -> bool {
     false
 }
 
+fn count_lines_bounded(path: &Path, stop_after: usize) -> std::io::Result<usize> {
+    let mut file = fs::File::open(path)?;
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut lines = 0;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(lines);
+        }
+        lines += buffer[..read].iter().filter(|byte| **byte == b'\n').count();
+        if lines >= stop_after {
+            return Ok(lines);
+        }
+    }
+}
+
 /// Compact the device's own log: fold the existing snapshot + every
 /// event currently in the log into a fresh snapshot, then truncate
 /// the log to events past the new watermark (typically empty).
@@ -578,17 +668,18 @@ pub fn should_compact(shared_dir: &Path, device: &str) -> bool {
 ///
 /// Idempotent: running compaction twice on an unchanged log is a
 /// no-op the second time (log is already empty after the first run).
-pub fn compact_own_log(
-    shared_dir: &Path,
-    log_handle: &EventLog,
-) -> AppResult<CompactReport> {
+pub fn compact_own_log(shared_dir: &Path, log_handle: &EventLog) -> AppResult<CompactReport> {
     let device = log_handle.device().to_string();
     let snap_path = shared_dir
         .join("logs")
         .join(format!("{device}.snapshot.json"));
 
-    let pre_log_size = fs::metadata(log_handle.path()).map(|m| m.len() as i64).unwrap_or(0);
-    let pre_snap_size = fs::metadata(&snap_path).map(|m| m.len() as i64).unwrap_or(0);
+    let pre_log_size = fs::metadata(log_handle.path())
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
+    let pre_snap_size = fs::metadata(&snap_path)
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
 
     let report = log_handle.with_locked_log(|log_path, events| {
         if events.is_empty() {
@@ -676,8 +767,12 @@ pub fn compact_own_log(
         return Ok(report);
     }
 
-    let post_log_size = fs::metadata(log_handle.path()).map(|m| m.len() as i64).unwrap_or(0);
-    let post_snap_size = fs::metadata(&snap_path).map(|m| m.len() as i64).unwrap_or(0);
+    let post_log_size = fs::metadata(log_handle.path())
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
+    let post_snap_size = fs::metadata(&snap_path)
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
     Ok(CompactReport {
         bytes_freed: (pre_log_size - post_log_size) - (post_snap_size - pre_snap_size),
         ..report
@@ -694,8 +789,8 @@ fn upsert_book(tx: &Transaction, id: &str, r: &BookRow) -> AppResult<()> {
     tx.execute(
         "INSERT INTO books
          (id, title, author, description, cover_path, file_path, genre, pages,
-          format, status, progress, current_cfi, created_at, updated_at, updated_by_device)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+          format, source_format, render_format, source_file_path, source_sha256, conversion_version, status, progress, current_cfi, created_at, updated_at, updated_by_device)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
          ON CONFLICT(id) DO UPDATE SET
            title=excluded.title,
            author=excluded.author,
@@ -705,6 +800,11 @@ fn upsert_book(tx: &Transaction, id: &str, r: &BookRow) -> AppResult<()> {
            genre=excluded.genre,
            pages=excluded.pages,
            format=excluded.format,
+           source_format=excluded.source_format,
+           render_format=excluded.render_format,
+           source_file_path=excluded.source_file_path,
+           source_sha256=excluded.source_sha256,
+           conversion_version=excluded.conversion_version,
            status=excluded.status,
            progress=excluded.progress,
            current_cfi=excluded.current_cfi,
@@ -714,8 +814,9 @@ fn upsert_book(tx: &Transaction, id: &str, r: &BookRow) -> AppResult<()> {
              < (excluded.updated_at, excluded.updated_by_device)",
         params![
             id, r.title, r.author, r.description, r.cover_path, r.file_path,
-            r.genre, r.pages, r.format, r.status, r.progress, r.current_cfi,
-            r.created_at, r.updated_at, r.updated_by_device,
+            r.genre, r.pages, r.format, r.source_format, r.render_format,
+            r.source_file_path, r.source_sha256, r.conversion_version,
+            r.status, r.progress, r.current_cfi, r.created_at, r.updated_at, r.updated_by_device,
         ],
     )?;
     Ok(())
@@ -736,8 +837,15 @@ fn upsert_highlight(tx: &Transaction, id: &str, r: &HighlightRow) -> AppResult<(
          WHERE (highlights.updated_at, highlights.updated_by_device)
              < (excluded.updated_at, excluded.updated_by_device)",
         params![
-            id, r.book_id, r.cfi_range, r.color, r.note, r.text_content,
-            r.created_at, r.updated_at, r.updated_by_device,
+            id,
+            r.book_id,
+            r.cfi_range,
+            r.color,
+            r.note,
+            r.text_content,
+            r.created_at,
+            r.updated_at,
+            r.updated_by_device,
         ],
     )?;
     Ok(())
@@ -758,20 +866,44 @@ fn upsert_vocab(tx: &Transaction, id: &str, r: &VocabRow) -> AppResult<()> {
         "INSERT INTO vocab_words
          (id, book_id, word, definition, context_sentence, context_explanation, cfi,
           mastery, review_count, next_review_at,
+          review_interval_days, last_reviewed_at, last_review_rating,
+          fsrs_stability, fsrs_difficulty, fsrs_version,
           created_at, updated_at, updated_by_device)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
          ON CONFLICT(id) DO UPDATE SET
            mastery=excluded.mastery,
            review_count=excluded.review_count,
            next_review_at=excluded.next_review_at,
+           review_interval_days=excluded.review_interval_days,
+           last_reviewed_at=excluded.last_reviewed_at,
+           last_review_rating=excluded.last_review_rating,
+           fsrs_stability=excluded.fsrs_stability,
+           fsrs_difficulty=excluded.fsrs_difficulty,
+           fsrs_version=excluded.fsrs_version,
            updated_at=excluded.updated_at,
            updated_by_device=excluded.updated_by_device
          WHERE (vocab_words.updated_at, vocab_words.updated_by_device)
              < (excluded.updated_at, excluded.updated_by_device)",
         params![
-            id, r.book_id, r.word, r.definition, r.context_sentence, r.context_explanation, r.cfi,
-            r.mastery, r.review_count, r.next_review_at,
-            r.created_at, r.updated_at, r.updated_by_device,
+            id,
+            r.book_id,
+            r.word,
+            r.definition,
+            r.context_sentence,
+            r.context_explanation,
+            r.cfi,
+            r.mastery,
+            r.review_count,
+            r.next_review_at,
+            r.review_interval_days,
+            r.last_reviewed_at,
+            r.last_review_rating,
+            r.fsrs_stability,
+            r.fsrs_difficulty,
+            r.fsrs_version,
+            r.created_at,
+            r.updated_at,
+            r.updated_by_device,
         ],
     )?;
     Ok(())
@@ -789,7 +921,14 @@ fn upsert_collection(tx: &Transaction, id: &str, r: &CollectionRow) -> AppResult
            updated_by_device=excluded.updated_by_device
          WHERE (collections.updated_at, collections.updated_by_device)
              < (excluded.updated_at, excluded.updated_by_device)",
-        params![id, r.name, r.sort_order, r.created_at, r.updated_at, r.updated_by_device],
+        params![
+            id,
+            r.name,
+            r.sort_order,
+            r.created_at,
+            r.updated_at,
+            r.updated_by_device
+        ],
     )?;
     Ok(())
 }
@@ -804,7 +943,13 @@ fn upsert_collection_book(tx: &Transaction, r: &CollectionBookRow) -> AppResult<
            updated_by_device=excluded.updated_by_device
          WHERE (collection_books.updated_at, collection_books.updated_by_device)
              < (excluded.updated_at, excluded.updated_by_device)",
-        params![r.collection_id, r.book_id, r.created_at, r.updated_at, r.updated_by_device],
+        params![
+            r.collection_id,
+            r.book_id,
+            r.created_at,
+            r.updated_at,
+            r.updated_by_device
+        ],
     )?;
     Ok(())
 }
@@ -824,8 +969,15 @@ fn upsert_chat(tx: &Transaction, id: &str, r: &ChatRow) -> AppResult<()> {
          WHERE (chats.updated_at, chats.updated_by_device)
              < (excluded.updated_at, excluded.updated_by_device)",
         params![
-            id, r.book_id, r.title, r.model, r.pinned as i64, r.metadata,
-            r.created_at, r.updated_at, r.updated_by_device,
+            id,
+            r.book_id,
+            r.title,
+            r.model,
+            r.pinned as i64,
+            r.metadata,
+            r.created_at,
+            r.updated_at,
+            r.updated_by_device,
         ],
     )?;
     Ok(())
@@ -836,7 +988,16 @@ fn insert_chat_message(tx: &Transaction, id: &str, r: &ChatMessageRow) -> AppRes
         "INSERT OR IGNORE INTO chat_messages
          (id, chat_id, role, content, context, metadata, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![id, r.chat_id, r.role, r.content, r.context, r.metadata, r.created_at, r.updated_at],
+        params![
+            id,
+            r.chat_id,
+            r.role,
+            r.content,
+            r.context,
+            r.metadata,
+            r.created_at,
+            r.updated_at
+        ],
     )?;
     Ok(())
 }
@@ -871,7 +1032,7 @@ fn dump_state(conn: &Connection) -> AppResult<SnapshotState> {
     // books — cover_data excluded from snapshots; covers sync via .img files
     let mut stmt = conn.prepare(
         "SELECT id, title, author, description, cover_path, file_path, genre, pages,
-                format, status, progress, current_cfi,
+                format, source_format, render_format, source_file_path, source_sha256, conversion_version, status, progress, current_cfi,
                 created_at, updated_at, updated_by_device
          FROM books",
     )?;
@@ -887,12 +1048,17 @@ fn dump_state(conn: &Connection) -> AppResult<SnapshotState> {
                 genre: r.get(6)?,
                 pages: r.get(7)?,
                 format: r.get(8)?,
-                status: r.get(9)?,
-                progress: r.get(10)?,
-                current_cfi: r.get(11)?,
-                created_at: r.get(12)?,
-                updated_at: r.get(13)?,
-                updated_by_device: r.get(14)?,
+                source_format: r.get(9)?,
+                render_format: r.get(10)?,
+                source_file_path: r.get(11)?,
+                source_sha256: r.get(12)?,
+                conversion_version: r.get::<_, Option<i32>>(13)?.unwrap_or(0),
+                status: r.get(14)?,
+                progress: r.get(15)?,
+                current_cfi: r.get(16)?,
+                created_at: r.get(17)?,
+                updated_at: r.get(18)?,
+                updated_by_device: r.get(19)?,
                 cover_data: None,
             },
         ))
@@ -930,9 +1096,8 @@ fn dump_state(conn: &Connection) -> AppResult<SnapshotState> {
     drop(stmt);
 
     // bookmarks
-    let mut stmt = conn.prepare(
-        "SELECT id, book_id, cfi, label, created_at, updated_at FROM bookmarks",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT id, book_id, cfi, label, created_at, updated_at FROM bookmarks")?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -954,7 +1119,9 @@ fn dump_state(conn: &Connection) -> AppResult<SnapshotState> {
     // vocab_words
     let mut stmt = conn.prepare(
         "SELECT id, book_id, word, definition, context_sentence, cfi,
-                mastery, review_count, next_review_at,
+                mastery, review_count, next_review_at, review_interval_days,
+                last_reviewed_at, last_review_rating,
+                fsrs_stability, fsrs_difficulty, fsrs_version,
                 created_at, updated_at, updated_by_device, context_explanation FROM vocab_words",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -969,10 +1136,16 @@ fn dump_state(conn: &Connection) -> AppResult<SnapshotState> {
                 mastery: r.get(6)?,
                 review_count: r.get(7)?,
                 next_review_at: r.get(8)?,
-                created_at: r.get(9)?,
-                updated_at: r.get(10)?,
-                updated_by_device: r.get(11)?,
-                context_explanation: r.get(12)?,
+                review_interval_days: r.get(9)?,
+                last_reviewed_at: r.get(10)?,
+                last_review_rating: r.get(11)?,
+                fsrs_stability: r.get(12)?,
+                fsrs_difficulty: r.get(13)?,
+                fsrs_version: r.get(14)?,
+                created_at: r.get(15)?,
+                updated_at: r.get(16)?,
+                updated_by_device: r.get(17)?,
+                context_explanation: r.get(18)?,
             },
         ))
     })?;
@@ -1134,6 +1307,11 @@ mod tests {
             cover_path: None,
             file_path: format!("books/{id}.epub"),
             format: "epub".into(),
+            source_format: None,
+            render_format: None,
+            source_file_path: None,
+            source_sha256: None,
+            conversion_version: 0,
             genre: None,
             pages: Some(100),
         })
@@ -1191,7 +1369,8 @@ mod tests {
                  (id, book_id, cfi_range, color, created_at, updated_at, updated_by_device)
                  VALUES ('h1', 'b1', 'epubcfi(/6/4!/2)', 'yellow', 1100, 1100, 'migration')",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         let snap = {
@@ -1200,7 +1379,10 @@ mod tests {
         };
 
         assert_eq!(snap.device, "dev-MIGRATING");
-        assert_eq!(snap.truncated_before, None, "legacy snapshots have no log to truncate");
+        assert_eq!(
+            snap.truncated_before, None,
+            "legacy snapshots have no log to truncate"
+        );
         assert!(!snap.id.is_empty(), "id should be a freshly-minted ULID");
         assert_eq!(snap.state.books.len(), 1);
         assert_eq!(snap.state.highlights.len(), 1);
@@ -1245,7 +1427,8 @@ mod tests {
 
         let count: i64 = {
             let conn = dst_db.conn.lock().unwrap();
-            conn.query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0)).unwrap()
+            conn.query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0))
+                .unwrap()
         };
         assert_eq!(count, 1);
     }
@@ -1434,7 +1617,9 @@ mod tests {
             tx.commit().unwrap();
         }
         let n: i64 = local
-            .query_row("SELECT COUNT(*) FROM highlights WHERE id = 'h1'", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM highlights WHERE id = 'h1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(n, 0, "local tombstone should suppress snapshot insertion");
     }
@@ -1479,7 +1664,9 @@ mod tests {
             tx.commit().unwrap();
         }
         let progress: i32 = local
-            .query_row("SELECT progress FROM books WHERE id = 'b1'", [], |r| r.get(0))
+            .query_row("SELECT progress FROM books WHERE id = 'b1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(progress, 80, "newer local value survives older snapshot");
     }
@@ -1546,15 +1733,13 @@ mod tests {
             let n: i64 = local
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(
-                n, 0,
-                "snapshot tombstone for book must cascade to {table}"
-            );
+            assert_eq!(n, 0, "snapshot tombstone for book must cascade to {table}");
         }
         let tomb: i64 = local
             .query_row(
                 "SELECT COUNT(*) FROM _tombstones WHERE entity = 'book' AND id = 'b1'",
-                [], |r| r.get(0),
+                [],
+                |r| r.get(0),
             )
             .unwrap();
         assert_eq!(tomb, 1);
@@ -1753,12 +1938,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let shared = tmp.path();
         std::fs::create_dir_all(shared.join("logs")).unwrap();
-        let _log = EventLog::open(
-            &shared.join("logs/dev-A.jsonl"),
-            "dev-A",
-            false,
-        )
-        .unwrap();
+        let _log = EventLog::open(&shared.join("logs/dev-A.jsonl"), "dev-A", false).unwrap();
         assert!(!should_compact(shared, "dev-A"));
     }
 
@@ -1907,8 +2087,7 @@ mod tests {
         // Compaction path: compact the log → snapshot, then apply the
         // snapshot to a fresh DB.
         compact_own_log(shared, &log).unwrap();
-        let snap =
-            Snapshot::read_from(&shared.join("logs/dev-A.snapshot.json")).unwrap();
+        let snap = Snapshot::read_from(&shared.join("logs/dev-A.snapshot.json")).unwrap();
         let mut db_via_snap = open_db();
         {
             let tx = db_via_snap.transaction().unwrap();
@@ -1934,12 +2113,7 @@ mod tests {
             .collect()
         };
 
-        for table in [
-            "books",
-            "highlights",
-            "collections",
-            "collection_books",
-        ] {
+        for table in ["books", "highlights", "collections", "collection_books"] {
             assert_eq!(
                 dump(&db_direct, table),
                 dump(&db_via_snap, table),
@@ -2013,8 +2187,11 @@ mod tests {
         log.append(import("b2"), 9_999).unwrap();
         compact_own_log(shared, &log).unwrap();
 
-        let snap =
-            Snapshot::read_from(&shared.join("logs/dev-A.snapshot.json")).unwrap();
-        assert_eq!(snap.state.books.len(), 2, "fresh snapshot must include both books");
+        let snap = Snapshot::read_from(&shared.join("logs/dev-A.snapshot.json")).unwrap();
+        assert_eq!(
+            snap.state.books.len(),
+            2,
+            "fresh snapshot must include both books"
+        );
     }
 }

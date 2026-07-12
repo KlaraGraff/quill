@@ -42,7 +42,7 @@ fn quill_binary() -> PathBuf {
 /// given a fake `$HOME`. macOS-only path layout.
 fn seed_db(home: &std::path::Path) -> rusqlite::Connection {
     // Mirrors `bundle_identifier_for_build()` for debug builds.
-    let identifier = "com.wycstudios.quill-dev";
+    let identifier = "com.klaragraff.quill-dev";
     let app_data = home.join("Library/Application Support").join(identifier);
     std::fs::create_dir_all(&app_data).expect("mkdir app_data");
 
@@ -138,7 +138,9 @@ fn quill_mcp_initialize_lists_tools_and_calls_get_collections() {
     let list_line = read_line_with_timeout(&mut reader, timeout);
     let list_resp: serde_json::Value =
         serde_json::from_str(&list_line).expect("parse tools/list response");
-    let tools = list_resp["result"]["tools"].as_array().expect("tools array");
+    let tools = list_resp["result"]["tools"]
+        .as_array()
+        .expect("tools array");
     let names: std::collections::BTreeSet<&str> = tools
         .iter()
         .map(|t| t["name"].as_str().expect("tool name"))
@@ -173,8 +175,7 @@ fn quill_mcp_initialize_lists_tools_and_calls_get_collections() {
     let body = call_resp["result"]["content"][0]["text"]
         .as_str()
         .expect("text content");
-    let payload: serde_json::Value =
-        serde_json::from_str(body).expect("parse collections payload");
+    let payload: serde_json::Value = serde_json::from_str(body).expect("parse collections payload");
     assert_eq!(payload[0]["name"], "Integration Test Collection");
 
     let status = child.wait().expect("wait child");
@@ -187,7 +188,11 @@ fn quill_mcp_errors_clearly_when_db_missing() {
     // No seed — quill.db absent under fake $HOME.
 
     let binary = quill_binary();
-    assert!(binary.exists(), "quill binary not built at {}", binary.display());
+    assert!(
+        binary.exists(),
+        "quill binary not built at {}",
+        binary.display()
+    );
 
     let out = Command::new(&binary)
         .arg("mcp")
@@ -198,7 +203,10 @@ fn quill_mcp_errors_clearly_when_db_missing() {
         .output()
         .expect("run quill mcp");
 
-    assert!(!out.status.success(), "should exit non-zero when DB is missing");
+    assert!(
+        !out.status.success(),
+        "should exit non-zero when DB is missing"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("no library found"),

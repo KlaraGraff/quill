@@ -2,8 +2,8 @@
 //!
 //! Lives at `<shared>/logs/<device-uuid>.jsonl`. One line per event.
 //!
-//! A single `Mutex<Inner>` covers both the `ulid::Generator` and the file
-//! append. This is load-bearing: without it two concurrent appends can
+//! A single `Mutex<Inner>` covers both ULID allocation and the file append.
+//! This is load-bearing: without it two concurrent appends can
 //! generate IDs `id_A < id_B` but reach the file in the other order
 //! (`id_B\nid_A\n`), which permanently hides `id_A` from
 //! `read_after(last_id=id_B)`. Holding the lock across generation AND the
@@ -17,7 +17,7 @@
 //! and writing to the iCloud path.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
@@ -28,6 +28,10 @@ use crate::error::{AppError, AppResult};
 
 use super::events::{Event, EventBody, EVENT_SCHEMA_VERSION};
 
+pub const MAX_LOG_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_LOG_LINE_BYTES: usize = 256 * 1024;
+pub const MAX_LOG_EVENTS: usize = 20_000;
+
 pub struct EventLog {
     path: PathBuf,
     device: String,
@@ -36,7 +40,11 @@ pub struct EventLog {
 }
 
 struct Inner {
-    gen: ulid::Generator,
+    /// Last ULID successfully allocated by this process, seeded from the
+    /// existing log on open. Keeping this explicit (rather than relying on a
+    /// fresh `ulid::Generator`) preserves append order across restarts and
+    /// wall-clock rollback.
+    last_id: Option<ulid::Ulid>,
 }
 
 impl EventLog {
@@ -52,13 +60,16 @@ impl EventLog {
         }
         // Touch the file so subsequent reads don't fail before any write.
         let _ = OpenOptions::new().create(true).append(true).open(path)?;
+        let last_id = read_log_file(path)?
+            .into_iter()
+            .filter(|event| event.device == device && event.v == EVENT_SCHEMA_VERSION)
+            .filter_map(|event| event.id.parse::<ulid::Ulid>().ok())
+            .max();
         Ok(Self {
             path: path.to_path_buf(),
             device: device.to_string(),
             use_coordinator,
-            inner: Mutex::new(Inner {
-                gen: ulid::Generator::new(),
-            }),
+            inner: Mutex::new(Inner { last_id }),
         })
     }
 
@@ -122,16 +133,16 @@ impl EventLog {
             .lock()
             .map_err(|e| AppError::Other(format!("EventLog inner lock poisoned: {e}")))?;
 
-        // ULID timestamps come from wall clock to preserve generator
-        // monotonicity across process restarts; `ts` on the event is the
-        // caller-supplied value (usually a few milliseconds earlier).
+        // ULID timestamps come from wall clock; `ts` on the event is the
+        // caller-supplied logical timestamp (usually a few milliseconds
+        // earlier). `next_ulid` also compares against the last ID persisted
+        // by a prior process, so a clock rollback cannot make this append
+        // sort before an existing line.
         let now = SystemTime::now();
         let mut events = Vec::with_capacity(entries.len());
         for (body, ts) in entries {
-            let ulid = inner
-                .gen
-                .generate_from_datetime(now)
-                .map_err(|e| AppError::Other(format!("ulid generate: {e:?}")))?;
+            let ulid = next_ulid(inner.last_id, now)?;
+            inner.last_id = Some(ulid);
             events.push(Event {
                 id: ulid.to_string(),
                 ts,
@@ -171,15 +182,25 @@ impl EventLog {
     }
 }
 
+fn next_ulid(previous: Option<ulid::Ulid>, now: SystemTime) -> AppResult<ulid::Ulid> {
+    let candidate = ulid::Ulid::from_datetime(now);
+    match previous {
+        Some(previous) if previous >= candidate => previous.increment().ok_or_else(|| {
+            AppError::Other("sync log ULID space exhausted at current timestamp".to_string())
+        }),
+        _ => Ok(candidate),
+    }
+}
+
 /// Read every event from a log file at `path` without opening an `EventLog`
 /// (no writer, no generator). Used by `ReplayEngine` to ingest peer logs
 /// without touching them. Missing files return an empty vec — a peer that
 /// hasn't published a log yet is the same as a peer with zero events.
 pub fn read_log_file(path: &Path) -> AppResult<Vec<Event>> {
-    let bytes = match fs::read(path) {
+    let bytes = match read_file_bounded(path, MAX_LOG_FILE_BYTES) {
         Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(AppError::Io(e)),
+        Err(AppError::Io(e)) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
     parse_log_bytes(&bytes, path)
 }
@@ -223,7 +244,7 @@ pub fn read_log_file_with_timeout(
     let path_buf = path.to_path_buf();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result = fs::read(&path_buf);
+        let result = read_file_bounded_io(&path_buf, MAX_LOG_FILE_BYTES);
         on_thread_done();
         let _ = tx.send(result);
     });
@@ -252,6 +273,20 @@ fn parse_log_bytes(bytes: &[u8], path: &Path) -> AppResult<Vec<Event>> {
         if line.is_empty() {
             continue;
         }
+        if line.len() > MAX_LOG_LINE_BYTES {
+            return Err(AppError::Other(format!(
+                "sync log line exceeds {} bytes in {}",
+                MAX_LOG_LINE_BYTES,
+                path.display()
+            )));
+        }
+        if out.len() >= MAX_LOG_EVENTS {
+            return Err(AppError::Other(format!(
+                "sync log exceeds {} events in {}",
+                MAX_LOG_EVENTS,
+                path.display()
+            )));
+        }
         match serde_json::from_slice::<Event>(line) {
             Ok(ev) => out.push(ev),
             Err(e) => {
@@ -264,6 +299,29 @@ fn parse_log_bytes(bytes: &[u8], path: &Path) -> AppResult<Vec<Event>> {
         }
     }
     Ok(out)
+}
+
+fn read_file_bounded(path: &Path, max_bytes: u64) -> AppResult<Vec<u8>> {
+    read_file_bounded_io(path, max_bytes).map_err(AppError::Io)
+}
+
+fn read_file_bounded_io(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    if fs::metadata(path)?.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds {max_bytes} byte limit"),
+        ));
+    }
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds {max_bytes} byte limit"),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Like `read_log_file` but skips events with `id <= last_id`. ULIDs sort
@@ -312,9 +370,7 @@ fn naive_append(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(target_os = "macos")]
 fn coordinated_append(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use block2::StackBlock;
-    use objc2_foundation::{
-        NSFileCoordinator, NSFileCoordinatorWritingOptions, NSString, NSURL,
-    };
+    use objc2_foundation::{NSFileCoordinator, NSFileCoordinatorWritingOptions, NSString, NSURL};
     use std::cell::RefCell;
     use std::ptr::NonNull;
 
@@ -375,6 +431,11 @@ mod tests {
             cover_path: None,
             file_path: format!("books/b{n}.epub"),
             format: "epub".into(),
+            source_format: None,
+            render_format: None,
+            source_file_path: None,
+            source_sha256: None,
+            conversion_version: 0,
             genre: None,
             pages: None,
         })
@@ -422,6 +483,26 @@ mod tests {
     }
 
     #[test]
+    fn reopen_seeds_monotonic_id_from_existing_log() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("logs").join("dev-A.jsonl");
+        let first = EventLog::open(&path, "dev-A", false)
+            .unwrap()
+            .append(sample_body(1), 1_714_770_000_000)
+            .unwrap();
+
+        let reopened = EventLog::open(&path, "dev-A", false).unwrap();
+        let second = reopened.append(sample_body(2), 1_714_770_000_001).unwrap();
+        assert!(
+            second.id > first.id,
+            "reopened writer must append after prior ID"
+        );
+
+        let events = reopened.read_all().unwrap();
+        assert!(events.windows(2).all(|pair| pair[0].id < pair[1].id));
+    }
+
+    #[test]
     fn append_batch_shares_ts_and_generates_distinct_ids() {
         let tmp = TempDir::new().unwrap();
         let log = open_log(&tmp);
@@ -432,8 +513,7 @@ mod tests {
         for e in &evs {
             assert_eq!(e.ts, ts);
         }
-        let ids: std::collections::HashSet<&str> =
-            evs.iter().map(|e| e.id.as_str()).collect();
+        let ids: std::collections::HashSet<&str> = evs.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids.len(), 3, "ulid collision in batch");
         let read = log.read_all().unwrap();
         assert_eq!(read, evs);
@@ -514,17 +594,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("dev-A.jsonl");
         let log_a = EventLog::open(&p, "dev-A", false).unwrap();
-        let id_a = log_a
-            .append(sample_body(1), 1_714_770_000_000)
-            .unwrap()
-            .id;
+        let id_a = log_a.append(sample_body(1), 1_714_770_000_000).unwrap().id;
         std::thread::sleep(std::time::Duration::from_millis(2));
         drop(log_a);
         let log_b = EventLog::open(&p, "dev-A", false).unwrap();
-        let id_b = log_b
-            .append(sample_body(2), 1_714_770_000_002)
-            .unwrap()
-            .id;
+        let id_b = log_b.append(sample_body(2), 1_714_770_000_002).unwrap().id;
         assert!(
             id_b > id_a,
             "post-restart id {id_b} should sort after pre-restart id {id_a}"
@@ -572,17 +646,18 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "manual smoke test against the real iCloud ubiquity container"]
-    fn coordinated_append_smoke_on_real_icloud_path() {
-        let shared_dir = crate::icloud::icloud_data_dir()
-            .expect("expected a local iCloud Documents container");
+    #[ignore = "manual smoke test against a user-selected iCloud Drive folder"]
+    fn coordinated_append_smoke_on_selected_icloud_path() {
+        let Some(local_dir) = std::env::var_os("QUILL_SYNC_SMOKE_LOCAL_DIR").map(PathBuf::from)
+        else {
+            return;
+        };
+        let shared_dir = crate::sync::migration::recorded_data_dir(&local_dir)
+            .expect("configure a shared folder before running this smoke test");
         let logs_dir = shared_dir.join("logs");
         std::fs::create_dir_all(&logs_dir).unwrap();
 
-        let file = logs_dir.join(format!(
-            "_codex-sync-smoke-{}.jsonl",
-            uuid::Uuid::new_v4()
-        ));
+        let file = logs_dir.join(format!("_codex-sync-smoke-{}.jsonl", uuid::Uuid::new_v4()));
         let log = EventLog::open(&file, "dev-smoke", true).unwrap();
 
         let ev = log.append(sample_body(1), 1_714_770_000_000).unwrap();

@@ -58,12 +58,6 @@ jobs:
           security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
 
-      - name: Install Provisioning Profile
-        env:
-          PROVISIONING_PROFILE: ${{ secrets.PROVISIONING_PROFILE }}
-        run: |
-          echo "$PROVISIONING_PROFILE" | base64 --decode > src-tauri/embedded.provisionprofile
-
       - name: Verify Certificate
         run: |
           CERT_INFO=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application")
@@ -74,6 +68,10 @@ jobs:
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
+          QUILL_BUILD_COMMIT: ${{ github.sha }}
+          QUILL_BUILD_DATE: ${{ github.event.head_commit.timestamp }}
+          QUILL_BUILD_CHANNEL: stable
+          QUILL_UPSTREAM_BASELINE: "1.2.10"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -85,7 +83,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: "Quill ${{ github.ref_name }}"
+          releaseName: "Quill Personal ${{ github.ref_name }}"
           releaseBody: "See the [commits](https://github.com/${{ github.repository }}/commits/${{ github.ref_name }}) for details."
           releaseDraft: true
           prerelease: false
@@ -119,12 +117,16 @@ jobs:
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
+          QUILL_BUILD_COMMIT: ${{ github.sha }}
+          QUILL_BUILD_DATE: ${{ github.event.head_commit.timestamp }}
+          QUILL_BUILD_CHANNEL: stable
+          QUILL_UPSTREAM_BASELINE: "1.2.10"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: "Quill ${{ github.ref_name }}"
+          releaseName: "Quill Personal ${{ github.ref_name }}"
           releaseBody: "See the [commits](https://github.com/${{ github.repository }}/commits/${{ github.ref_name }}) for details."
           releaseDraft: true
           prerelease: false

@@ -9,7 +9,11 @@ export interface Book {
   description: string | null;
   cover_path: string | null;
   file_path: string;
-  format: "epub" | "pdf";
+  // Text-like source files render as EPUB; native Foliate formats retain
+  // their original extension so its built-in detector selects the parser.
+  format: "epub" | "pdf" | "mobi" | "azw" | "azw3" | "fb2" | "fbz" | "cbz";
+  source_format: string | null;
+  render_format: string | null;
   genre: string | null;
   pages: number | null;
   status: "reading" | "finished" | "unread";
@@ -87,7 +91,7 @@ export function useBooks(filter?: string, search?: string, collectionId?: string
 async function pickFile(): Promise<string | null> {
   return open({
     multiple: false,
-    filters: [{ name: "Books", extensions: ["epub", "pdf"] }],
+    filters: [{ name: "Books", extensions: ["epub", "pdf", "txt", "md", "markdown", "html", "htm", "mobi", "azw", "azw3", "fb2", "fbz", "cbz"] }],
   });
 }
 

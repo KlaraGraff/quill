@@ -4,8 +4,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import Home from "./pages/Home";
 import Reader from "./pages/Reader";
-import { UpdateProvider } from "./contexts/UpdateContext";
-import UpdateToast from "./components/UpdateToast";
 import { reconcileLanguage } from "./i18n";
 
 const isMainWindow = getCurrentWebviewWindow().label === "main";
@@ -57,7 +55,6 @@ export default function App() {
 
   const content = (
     <>
-      {isMainWindow && <UpdateToast />}
       <Routes>
         <Route path="/" element={<Home />} />
         <Route path="/reader/:bookId" element={<Reader />} />
@@ -67,7 +64,7 @@ export default function App() {
 
   return (
     <BrowserRouter>
-      {isMainWindow ? <UpdateProvider>{content}</UpdateProvider> : content}
+      {content}
     </BrowserRouter>
   );
 }

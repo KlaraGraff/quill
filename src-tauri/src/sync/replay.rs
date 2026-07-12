@@ -18,8 +18,10 @@
 //! 3. **Sort + apply.** Snapshots applied per-peer first (each updates its
 //!    own watermarks). Events from every peer merged into one global vec
 //!    sorted by `(ts, device)`, then applied one per transaction via the
-//!    write connection. The separate read connection (`Db::reader()`)
-//!    ensures frontend queries are never blocked by the replay engine.
+//!    write connection. A failed event blocks only later events from that
+//!    same peer during the current tick, preserving its contiguous replay
+//!    watermark. The separate read connection (`Db::reader()`) ensures
+//!    frontend queries are never blocked by the replay engine.
 //! 4. **Commit + advance event watermarks** to the max id seen per peer.
 //!
 //! Concurrent ticks are serialized by a process-wide mutex; the OS
@@ -180,7 +182,8 @@ impl ReplayEngine {
 
     /// Signal any in-flight tick to stop after the current event.
     pub fn cancel(&self) {
-        self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn is_cancelled(&self) -> bool {
@@ -211,11 +214,18 @@ impl ReplayEngine {
             .lock()
             .map_err(|e| AppError::Other(format!("replay tick mutex poisoned: {e}")))?;
 
-        self.cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.cancelled
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let started = std::time::Instant::now();
 
         if let Some(handle) = app_handle {
-            let _ = handle.emit("sync-progress", SyncProgress { applied: 0, total: 0 });
+            let _ = handle.emit(
+                "sync-progress",
+                SyncProgress {
+                    applied: 0,
+                    total: 0,
+                },
+            );
         }
 
         // Phase 0 — drain the outbox into the device log. Manages its
@@ -256,7 +266,8 @@ impl ReplayEngine {
             }
         }
 
-        if events_applied > 0 || snapshots_applied > 0 || outbox_flushed > 0 || covers_ingested > 0 {
+        if events_applied > 0 || snapshots_applied > 0 || outbox_flushed > 0 || covers_ingested > 0
+        {
             ::log::info!(
                 "sync: batch applied events={events_applied} snapshots={snapshots_applied} outbox_flushed={outbox_flushed} elapsed_ms={}",
                 started.elapsed().as_millis(),
@@ -307,7 +318,8 @@ impl ReplayEngine {
             match snapshot::compact_own_log(&self.shared_dir, &self.own_log) {
                 Ok(report) if report.snapshot_written => ::log::info!(
                     "sync: compacted own log — {} events folded, {} bytes freed",
-                    report.events_folded, report.bytes_freed,
+                    report.events_folded,
+                    report.bytes_freed,
                 ),
                 Ok(_) => {}
                 Err(e) => ::log::warn!("sync: compaction failed: {e}"),
@@ -356,16 +368,29 @@ impl ReplayEngine {
                 continue;
             };
             if is_stalled(snap_path) || is_in_flight(snap_path) {
-                ::log::debug!("sync: skipping stalled/in-flight snapshot {}", snap_path.display());
+                ::log::debug!(
+                    "sync: skipping stalled/in-flight snapshot {}",
+                    snap_path.display()
+                );
                 continue;
             }
             mark_in_flight(snap_path);
             let snap_path_owned = snap_path.to_path_buf();
             match Snapshot::read_from_with_timeout(
-                snap_path, read_timeout, mark_stalled, clear_stalled,
+                snap_path,
+                read_timeout,
+                mark_stalled,
+                clear_stalled,
                 move || clear_in_flight(&snap_path_owned),
             ) {
-                Ok(Some(s)) => snapshots.push((device.clone(), s)),
+                Ok(Some(s)) => {
+                    if s.device != *device {
+                        clear_in_flight(snap_path);
+                        ::log::warn!("sync: snapshot device mismatch for {}", snap_path.display());
+                        continue;
+                    }
+                    snapshots.push((device.clone(), s));
+                }
                 Ok(None) => {
                     if !is_stalled(snap_path) {
                         // No thread was spawned (evicted/missing) — clear now.
@@ -389,13 +414,19 @@ impl ReplayEngine {
                 continue;
             };
             if is_stalled(log_path) || is_in_flight(log_path) {
-                ::log::debug!("sync: skipping stalled/in-flight log {}", log_path.display());
+                ::log::debug!(
+                    "sync: skipping stalled/in-flight log {}",
+                    log_path.display()
+                );
                 continue;
             }
             mark_in_flight(log_path);
             let log_path_owned = log_path.to_path_buf();
             let events = log::read_log_file_with_timeout(
-                log_path, read_timeout, mark_stalled, clear_stalled,
+                log_path,
+                read_timeout,
+                mark_stalled,
+                clear_stalled,
                 move || clear_in_flight(&log_path_owned),
             )?;
             if events.is_empty() {
@@ -406,6 +437,16 @@ impl ReplayEngine {
                 if !is_stalled(log_path) {
                     clear_in_flight(log_path);
                 }
+            }
+            let mut previous_id: Option<&str> = None;
+            let valid = events.iter().all(|event| {
+                let ordered = previous_id.is_none_or(|previous| previous < event.id.as_str());
+                previous_id = Some(&event.id);
+                ordered && super::validation::validate_event(event, device).is_ok()
+            });
+            if !valid {
+                ::log::warn!("sync: rejecting invalid event log for peer {device}");
+                continue;
             }
             peer_logs.push((device.clone(), events));
         }
@@ -464,20 +505,35 @@ impl ReplayEngine {
         }
 
         if let Some(handle) = app_handle {
-            let _ = handle.emit("sync-progress", SyncProgress { applied: 0, total: total_events });
+            let _ = handle.emit(
+                "sync-progress",
+                SyncProgress {
+                    applied: 0,
+                    total: total_events,
+                },
+            );
         }
 
         // -- Phase C — apply events one at a time. --
-        // FK stays ON (the connection default). If an event references
-        // a parent that hasn't arrived yet (out-of-order peer delivery),
-        // the INSERT fails and we skip it — the watermark doesn't
-        // advance past it, so the next tick retries after the parent
-        // lands.
+        // A peer's watermark is a contiguous prefix of its log. Once an
+        // event from a peer fails, do not apply or watermark its later
+        // events this tick: otherwise a later success would advance the
+        // watermark past the failed event and make the promised retry
+        // impossible. Other peers continue independently.
         let mut events_applied = 0usize;
+        let mut blocked_peers = HashSet::new();
         for ev in &all_events {
             if self.is_cancelled() {
                 ::log::info!("sync: tick cancelled after {events_applied}/{total_events} events");
                 break;
+            }
+            if blocked_peers.contains(&ev.device) {
+                ::log::debug!(
+                    "sync: deferring event {} from {} behind an earlier failed event",
+                    ev.id,
+                    ev.device
+                );
+                continue;
             }
             let mut conn = db
                 .conn
@@ -491,18 +547,23 @@ impl ReplayEngine {
                     tx.commit()?;
                     events_applied += 1;
                     if let Some(handle) = app_handle {
-                        let _ = handle.emit("sync-progress", SyncProgress {
-                            applied: events_applied,
-                            total: total_events,
-                        });
+                        let _ = handle.emit(
+                            "sync-progress",
+                            SyncProgress {
+                                applied: events_applied,
+                                total: total_events,
+                            },
+                        );
                     }
                 }
                 Err(e) => {
                     ::log::warn!(
-                        "sync: skipping event {} from {} (will retry next tick): {e}",
-                        ev.id, ev.device
+                        "sync: deferring event {} from {} and its later peer events (will retry next tick): {e}",
+                        ev.id,
+                        ev.device
                     );
                     let _ = tx.rollback();
+                    blocked_peers.insert(ev.device.clone());
                 }
             }
             drop(conn);
@@ -510,7 +571,6 @@ impl ReplayEngine {
 
         Ok((snapshots_applied, events_applied))
     }
-
 }
 
 /// Drain `_pending_publish` into `log` as a single batched write. All
@@ -548,10 +608,7 @@ pub fn flush_outbox(db: &Db, log: &EventLog) -> AppResult<usize> {
         .iter()
         .map(|row| {
             let body: EventBody = serde_json::from_str(&row.body_json).map_err(|e| {
-                AppError::Other(format!(
-                    "outbox row {}: malformed body_json: {e}",
-                    row.id
-                ))
+                AppError::Other(format!("outbox row {}: malformed body_json: {e}", row.id))
             })?;
             Ok((body, row.ts))
         })
@@ -611,17 +668,38 @@ fn discover_peers(shared_dir: &Path) -> AppResult<BTreeMap<String, PeerFiles>> {
             None => continue,
         };
         if let Some(device) = name.strip_suffix(".snapshot.json") {
+            if super::validation::validate_peer_device(device).is_err() {
+                continue;
+            }
             peers.entry(device.to_string()).or_default().snap_path = Some(path);
         } else if let Some(device) = name.strip_suffix(".jsonl") {
+            if super::validation::validate_peer_device(device).is_err() {
+                continue;
+            }
             peers.entry(device.to_string()).or_default().log_path = Some(path);
-        } else if let Some(inner) = name.strip_prefix('.').and_then(|s| s.strip_suffix(".icloud")) {
+        } else if let Some(inner) = name
+            .strip_prefix('.')
+            .and_then(|s| s.strip_suffix(".icloud"))
+        {
             // iCloud placeholder: `.dev-uuid.jsonl.icloud` → real path `dev-uuid.jsonl`
             let real_path = logs_dir.join(inner);
             if let Some(device) = inner.strip_suffix(".snapshot.json") {
-                peers.entry(device.to_string()).or_default().snap_path
+                if super::validation::validate_peer_device(device).is_err() {
+                    continue;
+                }
+                peers
+                    .entry(device.to_string())
+                    .or_default()
+                    .snap_path
                     .get_or_insert(real_path);
             } else if let Some(device) = inner.strip_suffix(".jsonl") {
-                peers.entry(device.to_string()).or_default().log_path
+                if super::validation::validate_peer_device(device).is_err() {
+                    continue;
+                }
+                peers
+                    .entry(device.to_string())
+                    .or_default()
+                    .log_path
                     .get_or_insert(real_path);
             }
         }
@@ -682,8 +760,7 @@ fn read_outbox(conn: &Connection) -> AppResult<Vec<OutboxRow>> {
     // tx). The merge engine already converges on (ts, device) order across
     // peers, but cross-event causality inside a single device still needs
     // append-order preserved when we drain the outbox into the log.
-    let mut stmt = conn
-        .prepare("SELECT id, ts, body_json FROM _pending_publish ORDER BY rowid")?;
+    let mut stmt = conn.prepare("SELECT id, ts, body_json FROM _pending_publish ORDER BY rowid")?;
     let collected: Vec<OutboxRow> = stmt
         .query_map([], |r| {
             Ok(OutboxRow {
@@ -706,7 +783,9 @@ fn ingest_peer_covers(shared_dir: &Path, db: &Db) -> usize {
     // Phase 1: collect candidates — quick SQL check per file, no file I/O.
     // Recognizes both real files (foo.img) and iCloud placeholders (.foo.img.icloud).
     let candidates: Vec<(String, std::path::PathBuf)> = {
-        let Ok(conn) = db.read_conn.lock() else { return 0 };
+        let Ok(conn) = db.read_conn.lock() else {
+            return 0;
+        };
         entries
             .flatten()
             .filter_map(|entry| {
@@ -743,7 +822,10 @@ fn ingest_peer_covers(shared_dir: &Path, db: &Db) -> usize {
     let loaded: Vec<(String, Vec<u8>)> = candidates
         .into_iter()
         .filter_map(|(id, path)| {
-            std::fs::read(&path).ok().filter(|b| !b.is_empty()).map(|b| (id, b))
+            std::fs::read(&path)
+                .ok()
+                .filter(|b| !b.is_empty())
+                .map(|b| (id, b))
         })
         .collect();
 
@@ -855,6 +937,11 @@ mod tests {
             cover_path: None,
             file_path: format!("books/{id}.epub"),
             format: "epub".into(),
+            source_format: None,
+            render_format: None,
+            source_file_path: None,
+            source_sha256: None,
+            conversion_version: 0,
             genre: None,
             pages: Some(100),
         })
@@ -1000,7 +1087,8 @@ mod tests {
             .conn()
             .query_row(
                 "SELECT last_event_id FROM _replay_state WHERE peer_device = 'peer-A'",
-                [], |r| r.get(0),
+                [],
+                |r| r.get(0),
             )
             .unwrap();
         assert_eq!(last.as_deref(), Some(peer_events[1].id.as_str()));
@@ -1037,7 +1125,9 @@ mod tests {
 
         let progress: i32 = env
             .conn()
-            .query_row("SELECT progress FROM books WHERE id = 'b1'", [], |r| r.get(0))
+            .query_row("SELECT progress FROM books WHERE id = 'b1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(progress, 50);
     }
@@ -1046,20 +1136,26 @@ mod tests {
     fn cross_peer_events_apply_in_global_ts_order() {
         let env = setup("self");
         // Two peers write the same book progress at different ts.
-        write_peer_log(&env.shared, "peer-A", &[
-            ev(1000, "peer-A", import("b1")),
-            ev(
-                1500,
-                "peer-A",
-                EventBody::BookProgressSet {
-                    book: "b1".into(),
-                    progress: 25,
-                    cfi: Some("cA".into()),
-                },
-            ),
-        ]);
-        write_peer_log(&env.shared, "peer-B", &[
-            ev(
+        write_peer_log(
+            &env.shared,
+            "peer-A",
+            &[
+                ev(1000, "peer-A", import("b1")),
+                ev(
+                    1500,
+                    "peer-A",
+                    EventBody::BookProgressSet {
+                        book: "b1".into(),
+                        progress: 25,
+                        cfi: Some("cA".into()),
+                    },
+                ),
+            ],
+        );
+        write_peer_log(
+            &env.shared,
+            "peer-B",
+            &[ev(
                 2000,
                 "peer-B",
                 EventBody::BookProgressSet {
@@ -1067,13 +1163,15 @@ mod tests {
                     progress: 80,
                     cfi: Some("cB".into()),
                 },
-            ),
-        ]);
+            )],
+        );
 
         env.engine.tick(&env.db).unwrap();
         let progress: i32 = env
             .conn()
-            .query_row("SELECT progress FROM books WHERE id = 'b1'", [], |r| r.get(0))
+            .query_row("SELECT progress FROM books WHERE id = 'b1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(progress, 80, "later peer-B event wins");
     }
@@ -1175,6 +1273,67 @@ mod tests {
         assert_eq!(n_books, 1);
     }
 
+    #[test]
+    fn failed_event_does_not_advance_peer_watermark_past_it() {
+        let env = setup("self");
+        let events = vec![
+            ev(1000, "peer-A", import("b1")),
+            ev(
+                2000,
+                "peer-A",
+                EventBody::BookMetadataSet {
+                    book: "b1".into(),
+                    field: "title".into(),
+                    value: serde_json::json!(42), // rejected by merge
+                },
+            ),
+            ev(
+                3000,
+                "peer-A",
+                EventBody::BookProgressSet {
+                    book: "b1".into(),
+                    progress: 75,
+                    cfi: Some("c75".into()),
+                },
+            ),
+            ev(
+                4000,
+                "peer-B",
+                EventBody::BookProgressSet {
+                    book: "b1".into(),
+                    progress: 25,
+                    cfi: Some("c25".into()),
+                },
+            ),
+        ];
+        write_peer_log(&env.shared, "peer-A", &events[..3]);
+        write_peer_log(&env.shared, "peer-B", &events[3..]);
+
+        let report = env.engine.tick(&env.db).unwrap();
+        assert_eq!(
+            report.events_applied, 2,
+            "peer-A import and peer-B progress apply"
+        );
+
+        let peer_a_watermark: Option<String> = env
+            .conn()
+            .query_row(
+                "SELECT last_event_id FROM _replay_state WHERE peer_device = 'peer-A'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(peer_a_watermark.as_deref(), Some(events[0].id.as_str()));
+
+        let progress: i32 = env
+            .conn()
+            .query_row("SELECT progress FROM books WHERE id = 'b1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(progress, 25, "later peer-A event must remain deferred");
+    }
+
     /// Regression for umbrella-PR review finding #3: every successful
     /// `tick()` must bump self's `_replay_state.updated_at` so the
     /// settings UI's "Last sync" reflects the most recent tick — not
@@ -1197,7 +1356,10 @@ mod tests {
                 |r| r.get(0),
             )
             .ok();
-        assert!(row1.is_some(), "first tick must upsert self into _replay_state");
+        assert!(
+            row1.is_some(),
+            "first tick must upsert self into _replay_state"
+        );
         assert!(row1.unwrap() >= before);
 
         // Sleep a few millis so the second tick's timestamp is
@@ -1258,10 +1420,19 @@ mod tests {
 
         let peers = discover_peers(&shared).unwrap();
 
-        assert!(peers.contains_key("peer-A"), "real file should be discovered");
-        assert_eq!(peers["peer-A"].log_path.as_deref(), Some(logs.join("peer-A.jsonl").as_path()));
+        assert!(
+            peers.contains_key("peer-A"),
+            "real file should be discovered"
+        );
+        assert_eq!(
+            peers["peer-A"].log_path.as_deref(),
+            Some(logs.join("peer-A.jsonl").as_path())
+        );
 
-        assert!(peers.contains_key("peer-B"), "placeholder should be discovered");
+        assert!(
+            peers.contains_key("peer-B"),
+            "placeholder should be discovered"
+        );
         assert_eq!(
             peers["peer-B"].log_path.as_deref(),
             Some(logs.join("peer-B.jsonl").as_path()),
@@ -1414,7 +1585,9 @@ mod tests {
 
         let blob: Vec<u8> = env
             .conn()
-            .query_row("SELECT cover_data FROM books WHERE id = 'b1'", [], |r| r.get(0))
+            .query_row("SELECT cover_data FROM books WHERE id = 'b1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(blob, b"\x89PNG fake cover bytes");
     }
@@ -1425,8 +1598,11 @@ mod tests {
         {
             let conn = env.conn();
             insert_book_no_cover(&conn, "b1");
-            conn.execute("UPDATE books SET cover_data = ?1 WHERE id = 'b1'", params![b"existing"])
-                .unwrap();
+            conn.execute(
+                "UPDATE books SET cover_data = ?1 WHERE id = 'b1'",
+                params![b"existing"],
+            )
+            .unwrap();
         }
 
         let covers = env.shared.join("covers");
@@ -1434,11 +1610,16 @@ mod tests {
         fs::write(covers.join("b1.img"), b"newer bytes").unwrap();
 
         let ingested = ingest_peer_covers(&env.shared, &env.db);
-        assert_eq!(ingested, 0, "a book that already has a cover BLOB is left untouched");
+        assert_eq!(
+            ingested, 0,
+            "a book that already has a cover BLOB is left untouched"
+        );
 
         let blob: Vec<u8> = env
             .conn()
-            .query_row("SELECT cover_data FROM books WHERE id = 'b1'", [], |r| r.get(0))
+            .query_row("SELECT cover_data FROM books WHERE id = 'b1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(blob, b"existing", "existing BLOB must not be overwritten");
     }
@@ -1455,13 +1636,20 @@ mod tests {
         fs::write(covers.join(".b1.img.icloud"), b"placeholder").unwrap();
 
         let ingested = ingest_peer_covers(&env.shared, &env.db);
-        assert_eq!(ingested, 0, "placeholder-only cover is deferred, not ingested");
+        assert_eq!(
+            ingested, 0,
+            "placeholder-only cover is deferred, not ingested"
+        );
 
         let blob: Option<Vec<u8>> = env
             .conn()
-            .query_row("SELECT cover_data FROM books WHERE id = 'b1'", [], |r| r.get(0))
+            .query_row("SELECT cover_data FROM books WHERE id = 'b1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert!(blob.is_none(), "no bytes should be written from a placeholder");
+        assert!(
+            blob.is_none(),
+            "no bytes should be written from a placeholder"
+        );
     }
-
 }

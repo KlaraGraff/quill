@@ -3,7 +3,7 @@
   "app": {
     "security": {
       "assetProtocol": {
-        "scope": ["$APPDATA/**", "$HOME/Library/Application Support/com.wycstudios.quill-dev/**", "$HOME/Library/Mobile Documents/iCloud~com~wycstudios~quill/Documents/**"]
+        "scope": ["$APPDATA/**"]
       }
     }
   }

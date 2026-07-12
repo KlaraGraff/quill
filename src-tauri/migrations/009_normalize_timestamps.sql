@@ -10,11 +10,11 @@
 -- transaction; any failure rolls back the whole thing leaving the DB
 -- byte-identical to pre-migration.
 --
--- Foreign keys are toggled OFF around the rebuild because rebuilding a parent
--- table (books, collections) would otherwise cascade-delete child rows via
--- ON DELETE CASCADE. PRAGMA foreign_keys can only change outside a
--- transaction, hence the OFF → BEGIN → … → COMMIT → ON sequence. Child tables
--- are rebuilt after their parents so their FK declarations resolve.
+-- The migration runner disables foreign keys before beginning its transaction
+-- because rebuilding a parent table (books, collections) would otherwise
+-- cascade-delete child rows via ON DELETE CASCADE. It restores the previous
+-- connection setting after the commit. Child tables are rebuilt after their
+-- parents so their FK declarations resolve.
 --
 -- Timestamp conversion formula:
 --   CAST(strftime('%s', ts) AS INTEGER) * 1000
@@ -31,10 +31,6 @@
 -- construction; the user's DB is never left in an intermediate state.
 --
 -- See `docs/impls/31-sync.md` §"Schema normalization" for the design rationale.
-
-PRAGMA foreign_keys = OFF;
-
-BEGIN;
 
 -- ---------------------------------------------------------------------------
 -- books (parent — rebuild before any table that references it)
@@ -262,8 +258,3 @@ FROM translations;
 DROP TABLE translations;
 ALTER TABLE translations_new RENAME TO translations;
 CREATE INDEX IF NOT EXISTS idx_translations_book ON translations(book_id);
-
-COMMIT;
-
--- FK enforcement intentionally left OFF — the app handles all
--- cascading deletes explicitly. See merge.rs module docstring.

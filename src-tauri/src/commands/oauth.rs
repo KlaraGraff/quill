@@ -11,7 +11,10 @@ use crate::error::{AppError, AppResult};
 use crate::secrets::Secrets;
 
 #[tauri::command]
-pub async fn openai_oauth_login(app: AppHandle, secrets: State<'_, Secrets>) -> AppResult<OAuthStatus> {
+pub async fn openai_oauth_login(
+    app: AppHandle,
+    secrets: State<'_, Secrets>,
+) -> AppResult<OAuthStatus> {
     let (verifier, challenge) = generate_pkce();
     let state = generate_state();
     let auth_url = build_auth_url(&challenge, &state);

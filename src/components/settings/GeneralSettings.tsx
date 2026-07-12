@@ -1,6 +1,8 @@
 import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
+import { emitTo } from "@tauri-apps/api/event";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import i18n from "../../i18n";
 import Select from "../ui/Select";
 import Toggle from "../ui/Toggle";
@@ -12,15 +14,15 @@ export default function GeneralSettings({ settings, loading, save, showSavedToas
   const [displayName, setDisplayName] = useState("Reader");
   const [language, setLanguage] = useState("en");
   const [autoSave, setAutoSave] = useState(true);
-  const [autoCheckUpdates, setAutoCheckUpdates] = useState(true);
+  const [lookupHistoryRetention, setLookupHistoryRetention] = useState("0");
 
   useEffect(() => {
     if (loading) return;
     if (settings.user_name) setDisplayName(settings.user_name);
     if (settings.language) setLanguage(settings.language);
     if (settings.auto_save) setAutoSave(settings.auto_save === "true");
-    if (settings.auto_check_updates !== undefined) {
-      setAutoCheckUpdates(settings.auto_check_updates !== "false");
+    if (settings.lookup_history_retention_days) {
+      setLookupHistoryRetention(settings.lookup_history_retention_days);
     }
   }, [settings, loading]);
 
@@ -78,23 +80,31 @@ export default function GeneralSettings({ settings, loading, save, showSavedToas
         />
       </div>
 
-      {/* Updates */}
-      <div className="mt-8 mb-2 text-[11px] font-medium uppercase tracking-[0.5px] text-text-muted">
-        {t("settings.updates.title")}
-      </div>
-      <div className="h-px bg-border-light" />
       <div className="flex items-center justify-between h-[73px]">
         <div>
-          <p className="text-[14px] font-medium text-text-primary tracking-[-0.15px]">{t("settings.updates.autoCheck")}</p>
-          <p className="text-[12px] text-text-muted mt-0.5">{t("settings.updates.autoCheckHint")}</p>
+          <p className="text-[14px] font-medium text-text-primary tracking-[-0.15px]">{t("settings.general.lookupHistoryRetention")}</p>
+          <p className="text-[12px] text-text-muted mt-0.5">{t("settings.general.lookupHistoryRetentionHint")}</p>
         </div>
-        <Toggle
-          checked={autoCheckUpdates}
-          onChange={(v) => {
-            setAutoCheckUpdates(v);
-            save("auto_check_updates", String(v));
+        <Select
+          className="w-[130px] shrink-0"
+          value={lookupHistoryRetention}
+          onChange={async (days) => {
+            setLookupHistoryRetention(days);
+            await save("lookup_history_retention_days", days);
+            await invoke("prune_lookup_records", { retentionDays: Number(days) || null });
+            window.dispatchEvent(new CustomEvent("lookup-record-changed", { detail: {} }));
+            const windows = await WebviewWindow.getAll();
+            await Promise.all(windows
+              .filter((window) => window.label.startsWith("reader-"))
+              .map((window) => emitTo(window.label, "lookup-record-changed", {})));
             showSavedToast();
           }}
+          options={[
+            { value: "0", label: t("settings.general.lookupHistoryForever") },
+            { value: "30", label: t("settings.general.lookupHistory30Days") },
+            { value: "90", label: t("settings.general.lookupHistory90Days") },
+            { value: "365", label: t("settings.general.lookupHistory1Year") },
+          ]}
         />
       </div>
 

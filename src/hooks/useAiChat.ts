@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getAiErrorCode } from "../utils/aiError";
 
 export interface ChatMessage {
   id: string;
@@ -33,6 +34,12 @@ interface ChatMsgRecord {
   updated_at: number;
 }
 
+interface AiStreamChunk {
+  delta: string;
+  done: boolean;
+  error?: string;
+}
+
 /** Derive a short title from the user's first message (truncated at word boundary). */
 /** Fallback: truncate user message into a short title. */
 function deriveTitle(userMsg: string): string {
@@ -54,52 +61,43 @@ function deriveTitle(userMsg: string): string {
 async function generateAiTitle(
   userMsg: string,
 ): Promise<string | null> {
-  const requestId = `title-${Date.now()}`;
+  const requestId = `title-${crypto.randomUUID()}`;
   const eventName = `ai-title-chunk-${requestId}`;
-
   let title = "";
-  let resolveFn: (val: string | null) => void;
-  const promise = new Promise<string | null>((r) => { resolveFn = r; });
-  let done = false;
-
-  const timeout = setTimeout(() => {
-    if (!done) { done = true; resolve(null); }
-  }, 15000);
-
-  function resolve(val: string | null) {
-    if (done) return;
-    done = true;
-    clearTimeout(timeout);
-    resolveFn(val);
-  }
-
-  // Register listener BEFORE invoking the command
-  const unlisten = await listen<{ delta: string; done: boolean }>(eventName, (event) => {
-    if (event.payload.done) {
-      unlisten();
-      title = title.replace(/^["']|["']$/g, "").replace(/[.!]$/, "").trim();
-      if (title.length > 50) {
-        title = title.substring(0, 50).trim() + "...";
+  let finished = false;
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  let unlisten: UnlistenFn | undefined;
+  try {
+    let resolveResult: (value: string | null) => void = () => {};
+    const resultPromise = new Promise<string | null>((resolve) => { resolveResult = resolve; });
+    const finish = (value: string | null) => {
+      if (finished) return;
+      finished = true;
+      resolveResult(value);
+    };
+    unlisten = await listen<AiStreamChunk>(eventName, (event) => {
+      if (!event.payload.done) {
+        title += event.payload.delta;
+        return;
       }
-      resolve(title || null);
-      return;
-    }
-    if (!event.payload.delta.startsWith("Error:")) {
-      title += event.payload.delta;
-    }
-  });
-
-  // Fire the command (returns immediately, streaming happens in background)
-  invoke("ai_generate_title", {
-    userMessage: userMsg,
-    assistantMessage: "",
-    requestId,
-  }).catch(() => {
-    unlisten();
-    resolve(null);
-  });
-
-  return promise;
+      if (event.payload.error) return finish(null);
+      title = title.replace(/^["']|["']$/g, "").replace(/[.!]$/, "").trim();
+      if (title.length > 50) title = title.substring(0, 50).trim() + "...";
+      finish(title || null);
+    });
+    timeoutId = setTimeout(() => finish(null), 15000);
+    invoke("ai_generate_title", {
+      userMessage: userMsg,
+      assistantMessage: "",
+      requestId,
+    }).catch(() => finish(null));
+    const result = await resultPromise;
+    return result;
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+    unlisten?.();
+    if (!title || !finished) invoke("ai_cancel", { requestId }).catch(() => {});
+  }
 }
 
 let msgIdCounter = 0;
@@ -129,6 +127,7 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
   const messagesRef = useRef<ChatMessage[]>([]);
   const chatIdRef = useRef<string | null>(null);
   const streamingRef = useRef(false);
+  const activeRequestIdRef = useRef<string | null>(null);
   const initializingRef = useRef(true);
 
   // Keep the ref in lockstep with the state so send() (which reads refs to
@@ -143,6 +142,8 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
     return () => {
       unlistenRef.current?.();
       unlistenRef.current = null;
+      if (activeRequestIdRef.current) invoke("ai_cancel", { requestId: activeRequestIdRef.current }).catch(() => {});
+      activeRequestIdRef.current = null;
     };
   }, []);
 
@@ -249,7 +250,6 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
     }
   }, [bookId, refreshChats, loadChat]);
 
-  /* eslint-disable react-hooks/preserve-manual-memoization */
   const send = useCallback(
     async (content: string, context?: string, contextCfi?: string) => {
       // Refuse while the session chat is still loading — otherwise the lazy
@@ -330,17 +330,32 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
       // Accumulate full assistant content for persistence
       let fullContent = "";
 
-      unlistenRef.current = await listen<{ delta: string; done: boolean }>(
-        "ai-stream-chunk",
+      const requestId = crypto.randomUUID();
+      activeRequestIdRef.current = requestId;
+      unlistenRef.current = await listen<AiStreamChunk>(
+        `ai-stream-chunk-${requestId}`,
         async (event) => {
           if (event.payload.done) {
             setStreaming(false);
             streamingRef.current = false;
+            activeRequestIdRef.current = null;
             unlistenRef.current?.();
             unlistenRef.current = null;
 
-            // Persist assistant message
-            if (fullContent && !fullContent.startsWith("Error:")) {
+            if (event.payload.error) {
+              const errorCode = getAiErrorCode(event.payload.error) ?? "AI_STREAM_FAILED";
+              updateMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantId
+                    ? { ...m, content: fullContent || errorCode }
+                    : m
+                )
+              );
+              return;
+            }
+
+            // Only a provider-confirmed completed stream may become history.
+            if (fullContent) {
               try {
                 await invoke("save_chat_message", {
                   chatId: currentChatId,
@@ -385,15 +400,15 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
           bookTitle: bookContext?.title ?? null,
           bookAuthor: bookContext?.author ?? null,
           currentChapter: bookContext?.chapter ?? null,
+          requestId,
         });
       } catch (err) {
         setStreaming(false);
         streamingRef.current = false;
+        activeRequestIdRef.current = null;
         unlistenRef.current?.();
         unlistenRef.current = null;
-        const errorContent = String(err).includes("AI_NOT_CONFIGURED")
-          ? "AI_NOT_CONFIGURED"
-          : `Error: ${err}`;
+        const errorContent = getAiErrorCode(err) ?? "AI_STREAM_FAILED";
         updateMessages((prev) =>
           prev.map((m) =>
             m.id === assistantId
@@ -405,7 +420,17 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
     },
     [bookId, bookContext?.title, bookContext?.author, bookContext?.chapter, createChat, refreshChats]
   );
-  /* eslint-enable react-hooks/preserve-manual-memoization */
+
+  const cancel = useCallback(() => {
+    const requestId = activeRequestIdRef.current;
+    if (!requestId) return;
+    invoke("ai_cancel", { requestId }).catch(() => {});
+    activeRequestIdRef.current = null;
+    unlistenRef.current?.();
+    unlistenRef.current = null;
+    streamingRef.current = false;
+    setStreaming(false);
+  }, []);
 
   const deleteChat = useCallback(async (id: string) => {
     const currentBookId = bookId;
@@ -413,6 +438,8 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
 
     // Cancel active stream if deleting the streaming chat
     if (id === chatIdRef.current && streamingRef.current) {
+      if (activeRequestIdRef.current) invoke("ai_cancel", { requestId: activeRequestIdRef.current }).catch(() => {});
+      activeRequestIdRef.current = null;
       unlistenRef.current?.();
       unlistenRef.current = null;
       setStreaming(false);
@@ -443,6 +470,8 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
     if (!bookId) return;
     // Stop any active stream
     if (streamingRef.current) {
+      if (activeRequestIdRef.current) invoke("ai_cancel", { requestId: activeRequestIdRef.current }).catch(() => {});
+      activeRequestIdRef.current = null;
       unlistenRef.current?.();
       unlistenRef.current = null;
       setStreaming(false);
@@ -457,6 +486,7 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
   return {
     messages,
     streaming,
+    cancel,
     titling,
     initializing,
     send,

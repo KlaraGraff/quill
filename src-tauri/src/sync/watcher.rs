@@ -24,8 +24,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc,
-    Arc,
+    mpsc, Arc,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -98,11 +97,7 @@ impl Drop for WatcherHandle {
 /// only after a real fs event arrives. The launch flow runs an explicit
 /// initial tick before spawning the watcher, so we don't need a "fire
 /// once on startup" arm here.
-pub fn spawn(
-    shared_dir: PathBuf,
-    db: Db,
-    engine: Arc<ReplayEngine>,
-) -> AppResult<WatcherHandle> {
+pub fn spawn(shared_dir: PathBuf, db: Db, engine: Arc<ReplayEngine>) -> AppResult<WatcherHandle> {
     let logs_dir = shared_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
     let covers_dir = shared_dir.join("covers");
@@ -229,8 +224,8 @@ fn is_snapshot_path(p: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::events::{BookImportPayload, EventBody, EVENT_SCHEMA_VERSION};
     use crate::sync::events::Event;
+    use crate::sync::events::{BookImportPayload, EventBody, EVENT_SCHEMA_VERSION};
     use crate::sync::log::EventLog;
     use rusqlite::Connection;
     use serde_json::Map;
@@ -257,6 +252,11 @@ mod tests {
             cover_path: None,
             file_path: format!("books/{id}.epub"),
             format: "epub".into(),
+            source_format: None,
+            render_format: None,
+            source_file_path: None,
+            source_sha256: None,
+            conversion_version: 0,
             genre: None,
             pages: Some(100),
         })
@@ -282,9 +282,8 @@ mod tests {
     fn make_engine(shared: &Path, dev: &str) -> (Arc<ReplayEngine>, std::path::PathBuf) {
         let logs = shared.join("logs");
         fs::create_dir_all(&logs).unwrap();
-        let own_log = Arc::new(
-            EventLog::open(&logs.join(format!("{dev}.jsonl")), dev, false).unwrap(),
-        );
+        let own_log =
+            Arc::new(EventLog::open(&logs.join(format!("{dev}.jsonl")), dev, false).unwrap());
         let engine = Arc::new(ReplayEngine::new(
             shared.to_path_buf(),
             dev.to_string(),
@@ -326,7 +325,11 @@ mod tests {
         // is loose but keeps the test stable in CI.
         handle.drain_for_test(Duration::from_millis(1500));
 
-        assert_eq!(books_in(&db), 1, "watcher should have triggered replay tick");
+        assert_eq!(
+            books_in(&db),
+            1,
+            "watcher should have triggered replay tick"
+        );
     }
 
     /// Bursty writes should coalesce into one (or very few) ticks
@@ -370,9 +373,9 @@ mod tests {
 
     #[test]
     fn is_relevant_event_filters_irrelevant_paths() {
-        let base = notify::Event::new(notify::EventKind::Modify(
-            notify::event::ModifyKind::Data(notify::event::DataChange::Content),
-        ));
+        let base = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Content,
+        )));
         let relevant = |p: &str| {
             let mut ev = base.clone();
             ev.paths.clear();
@@ -425,7 +428,9 @@ mod tests {
             .conn
             .lock()
             .unwrap()
-            .query_row("SELECT cover_data FROM books WHERE id = 'b1'", [], |r| r.get(0))
+            .query_row("SELECT cover_data FROM books WHERE id = 'b1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(
             blob.as_deref(),
@@ -444,9 +449,8 @@ mod tests {
         // by hand.
         let logs = shared_dir.path().join("logs");
         fs::create_dir_all(&logs).unwrap();
-        let own_log = Arc::new(
-            EventLog::open(&logs.join(format!("{dev}.jsonl")), dev, false).unwrap(),
-        );
+        let own_log =
+            Arc::new(EventLog::open(&logs.join(format!("{dev}.jsonl")), dev, false).unwrap());
         // Now remove the logs dir to verify spawn re-creates it.
         fs::remove_dir_all(&logs).unwrap();
 

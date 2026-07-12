@@ -51,10 +51,53 @@ fn resolve_log_level(default: log::LevelFilter) -> log::LevelFilter {
 /// already in the setup() callback for `app_data_dir`.
 fn bundle_identifier_for_build() -> &'static str {
     if cfg!(debug_assertions) {
-        "com.wycstudios.quill-dev"
+        "com.klaragraff.quill-dev"
     } else {
-        "com.wycstudios.quill"
+        "com.klaragraff.quill"
     }
+}
+
+/// Copy data from the original app or the first Personal build whose bundle
+/// identifier contained a typo. This runs only before a new data directory
+/// gains `quill.db`, so it never overwrites data already owned by this build.
+fn migrate_legacy_app_data(target: &Path) -> error::AppResult<()> {
+    if target.join("quill.db").exists() {
+        return Ok(());
+    }
+    let legacy_ids: &[&str] = if cfg!(debug_assertions) {
+        &["com.klagragraff.quill-dev", "com.wycstudios.quill-dev"]
+    } else {
+        &["com.klagragraff.quill", "com.wycstudios.quill"]
+    };
+    for id in legacy_ids {
+        let source = target.with_file_name(id);
+        if !source.join("quill.db").is_file() {
+            continue;
+        }
+        log::info!(
+            "migration: adopting legacy application data from {}",
+            source.display()
+        );
+        copy_dir_missing(&source, target)?;
+        break;
+    }
+    Ok(())
+}
+
+fn copy_dir_missing(source: &Path, target: &Path) -> error::AppResult<()> {
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            copy_dir_missing(&source_path, &target_path)?;
+        } else if metadata.is_file() && !target_path.exists() {
+            std::fs::copy(&source_path, &target_path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the OS-conventional log directory for *this* build.
@@ -90,9 +133,7 @@ pub(crate) fn resolve_log_dir() -> PathBuf {
     {
         let base = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))
-            })
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
             .expect("HOME or XDG_DATA_HOME env var");
         base.join(identifier).join("logs")
     }
@@ -129,9 +170,7 @@ pub(crate) fn resolve_app_data_dir() -> PathBuf {
     {
         let base = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))
-            })
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
             .expect("HOME or XDG_DATA_HOME env var");
         base.join(identifier)
     }
@@ -162,16 +201,14 @@ pub fn mcp_stdio_main() {
 
     let write_enabled = is_mcp_write_enabled(&db_path);
 
-    // Resolve the data_dir the same way the Tauri app does: if the
-    // user has migrated to iCloud sync, blobs (books/, covers/) live
-    // under the ubiquity container, not the local app-data dir.
-    let data_dir = if sync::migration::is_sync_enabled(&local_dir) {
-        sync::migration::recorded_data_dir(&local_dir)
-            .or_else(icloud::icloud_data_dir)
-            .unwrap_or_else(|| local_dir.clone())
-    } else {
-        local_dir.clone()
-    };
+    // The marker stores user intent, not unrestricted path authority. Only
+    // use the shared directory after confirming it is still an accessible,
+    // writable iCloud Drive folder; otherwise MCP stays on the local copy.
+    let sync_enabled = sync::migration::is_sync_enabled(&local_dir);
+    let shared_dir = sync_enabled
+        .then(|| sync::migration::recorded_usable_icloud_dir(&local_dir))
+        .flatten();
+    let data_dir = shared_dir.clone().unwrap_or_else(|| local_dir.clone());
 
     let (db, sync) = if write_enabled {
         let db = match Db::open_readwrite(&db_path) {
@@ -187,8 +224,11 @@ pub fn mcp_stdio_main() {
         let device = sync::device::DeviceIdentity::load_or_create(&local_dir)
             .expect("failed to load device identity");
         let sw = SyncWriter::new(device.device_uuid);
-        if sync::migration::is_sync_enabled(&local_dir) {
+        sw.set_process_lock_path(local_dir.join(".sync-transition.lock"));
+        if sync_enabled {
             sw.set_should_queue(true);
+        }
+        if shared_dir.is_some() {
             sw.spawn_cover_writer();
         }
         (db, Some(sw))
@@ -237,7 +277,6 @@ fn is_mcp_write_enabled(db_path: &Path) -> bool {
     .unwrap_or(false)
 }
 
-
 /// Boot the sync engine: open EventLog, create ReplayEngine, spawn
 /// watcher, wire the SyncWriter, and kick off the initial replay tick.
 ///
@@ -252,6 +291,10 @@ fn boot_sync_engine(
     app_handle: &tauri::AppHandle,
     needs_cover_backfill: bool,
 ) -> error::AppResult<()> {
+    let _transition = sync_writer.begin_transition()?;
+    let local_dir: tauri::State<LocalDir> = app_handle.state();
+    commands::sync::reconcile_local_blobs_to_ubiquity(&local_dir.0, &shared_dir)?;
+
     let log_path = shared_dir.join("logs").join(format!("{device_uuid}.jsonl"));
     let log = Arc::new(EventLog::open(&log_path, device_uuid, true)?);
 
@@ -264,26 +307,25 @@ fn boot_sync_engine(
         .with_app_handle(app_handle.clone()),
     );
 
-    let watcher = sync::watcher::spawn(
-        shared_dir,
-        db.clone(),
-        Arc::clone(&engine),
-    )?;
+    let watcher = sync::watcher::spawn(shared_dir, db.clone(), Arc::clone(&engine))?;
 
     // Atomic check-and-install: hold the engine mutex across both the
     // marker recheck and the state writes. sync_disable also locks
     // engine before clearing, so this prevents the race where disable
     // slips in between the check and the install.
     {
-        let local_dir: tauri::State<LocalDir> = app_handle.state();
-        let mut engine_guard = sync_state.engine.lock()
+        let mut engine_guard = sync_state
+            .engine
+            .lock()
             .map_err(|e| error::AppError::Other(format!("engine mutex: {e}")))?;
         if !sync::migration::is_sync_enabled(&local_dir.0) {
             log::warn!("sync: boot finished but sync was disabled during boot — discarding engine");
             drop(watcher);
             return Ok(());
         }
-        let mut watcher_guard = sync_state.watcher.lock()
+        let mut watcher_guard = sync_state
+            .watcher
+            .lock()
             .map_err(|e| error::AppError::Other(format!("watcher mutex: {e}")))?;
         *engine_guard = Some(Arc::clone(&engine));
         *watcher_guard = Some(watcher);
@@ -362,8 +404,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
         .menu(|handle| {
             // Start from the per-platform default menu so the standard
             // App / Edit / View / Window entries stay intact. Only the
@@ -397,33 +437,6 @@ pub fn run() {
                 }
             }
 
-            // "Check for Updates…" — on macOS it belongs in the app menu
-            // next to About; elsewhere there's no app menu, so it goes in
-            // Help. Same English-at-boot limitation as `reveal_logs`.
-            let check = tauri::menu::MenuItem::with_id(
-                handle,
-                "check_for_updates",
-                "Check for Updates…",
-                true,
-                None::<&str>,
-            )?;
-            #[cfg(target_os = "macos")]
-            {
-                if let Some(app_kind) = menu.items()?.first() {
-                    if let Some(app_sub) = app_kind.as_submenu() {
-                        // 0 = About; place ours right after it.
-                        app_sub.insert(&check, 1)?;
-                    }
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                if let Some(help_kind) = menu.get(tauri::menu::HELP_SUBMENU_ID) {
-                    if let Some(help) = help_kind.as_submenu() {
-                        help.append(&check)?;
-                    }
-                }
-            }
             Ok(menu)
         })
         .on_menu_event(|app, event| {
@@ -431,15 +444,6 @@ pub fn run() {
                 if let Err(e) = commands::app::reveal_logs(app.clone()) {
                     log::warn!("menu: reveal_logs failed: {e}");
                 }
-            } else if event.id() == "check_for_updates" {
-                // Surface the main window (it may be hidden) so the
-                // update toast's feedback is visible, then let the
-                // frontend run the check via the updater plugin.
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
-                let _ = app.emit("menu:check-for-updates", ());
             }
         })
         .on_window_event(|window, event| {
@@ -469,34 +473,34 @@ pub fn run() {
                     .app_data_dir()
                     .expect("failed to resolve app data dir");
                 if cfg!(debug_assertions) {
-                    base.with_file_name("com.wycstudios.quill-dev")
+                    base.with_file_name("com.klaragraff.quill-dev")
                 } else {
                     base
                 }
             };
+            migrate_legacy_app_data(&local_dir).expect("failed to migrate legacy app data");
             std::fs::create_dir_all(&local_dir).expect("failed to create app data dir");
 
-            // Self-heal: if .icloud_setting survived but quill.db
+            // Self-heal: if .sync_setting survived but quill.db
             // was deleted (e.g. user cleared app data via Finder, which
             // skips hidden dot-files), remove the stale marker so the
             // app starts fresh.
-            if !local_dir.join("quill.db").exists()
-                && sync::migration::is_sync_enabled(&local_dir)
+            if !local_dir.join("quill.db").exists() && sync::migration::is_sync_enabled(&local_dir)
             {
                 log::warn!(
-                    "sync: quill.db missing but .icloud_setting survived — \
+                    "sync: quill.db missing but .sync_setting survived — \
                      clearing stale marker to start fresh"
                 );
-                let _ = std::fs::remove_file(local_dir.join(".icloud_setting"));
+                let _ = std::fs::remove_file(local_dir.join(".sync_setting"));
             }
 
-            // Resolve the iCloud Documents path when sync is enabled.
-            let ubiquity_dir = if sync::migration::is_sync_enabled(&local_dir) {
-                sync::migration::recorded_data_dir(&local_dir)
-                    .or_else(icloud::icloud_data_dir)
-            } else {
-                None
-            };
+            // The marker stores intent only. Never create or serve blobs from
+            // a recorded path unless it remains inside iCloud Drive and is
+            // writable this launch.
+            let sync_enabled = sync::migration::is_sync_enabled(&local_dir);
+            let ubiquity_dir = sync_enabled
+                .then(|| sync::migration::recorded_usable_icloud_dir(&local_dir))
+                .flatten();
 
             let device =
                 DeviceIdentity::load_or_create(&local_dir).expect("failed to load device id");
@@ -504,13 +508,17 @@ pub fn run() {
             // When sync is on, blobs (books/, covers/) live in iCloud;
             // otherwise they're local.
             let data_dir = ubiquity_dir.clone().unwrap_or_else(|| local_dir.clone());
-            let (db, needs_cover_backfill) = Db::init_split(&local_dir, &data_dir)
-                .expect("failed to initialize database");
+            if let Some(shared_dir) = ubiquity_dir.as_ref() {
+                app.asset_protocol_scope()
+                    .allow_directory(shared_dir, true)
+                    .expect("failed to allow selected sync folder in asset scope");
+            }
+            let (db, needs_cover_backfill) =
+                Db::init_split(&local_dir, &data_dir).expect("failed to initialize database");
 
             // DB cover backfill for non-sync users. When sync boots, the
             // initial-tick thread handles both DB and .img backfill sequentially.
-            let sync_will_boot = sync::migration::is_sync_enabled(&local_dir)
-                && ubiquity_dir.as_ref().is_some_and(|p| p.exists());
+            let sync_will_boot = ubiquity_dir.is_some();
             if needs_cover_backfill && !sync_will_boot {
                 let backfill_db = db.clone();
                 std::thread::Builder::new()
@@ -530,14 +538,19 @@ pub fn run() {
                 schema = db.schema_version(),
             );
 
-            let secrets =
-                Secrets::init(&local_dir).expect("failed to initialize secrets store");
+            let secrets = Secrets::init(&local_dir).expect("failed to initialize secrets store");
             secrets
                 .migrate_from_settings(&db)
                 .expect("failed to migrate secrets");
+            secrets
+                .migrate_from_legacy_keychain_services(&db)
+                .expect("failed to migrate legacy Keychain secrets");
+            ai::router::migrate_legacy_config(&db, &secrets)
+                .expect("failed to migrate AI profile configuration");
 
             let sync_writer = SyncWriter::new(device.device_uuid.clone());
-            if sync::migration::is_sync_enabled(&local_dir) {
+            sync_writer.set_process_lock_path(local_dir.join(".sync-transition.lock"));
+            if sync_enabled {
                 sync_writer.set_should_queue(true);
             }
 
@@ -572,9 +585,7 @@ pub fn run() {
             // enabled), so any writes the user makes before the engine
             // finishes booting are safely queued in _pending_publish
             // and drained on the first successful tick.
-            let should_boot = sync::migration::is_sync_enabled(&local_dir)
-                .then(|| ubiquity_dir.clone().filter(|p| p.exists()))
-                .flatten();
+            let should_boot = ubiquity_dir.clone();
             if let Some(ub) = should_boot {
                 let bg_handle = app.handle().clone();
                 let bg_needs_backfill = needs_cover_backfill;
@@ -586,7 +597,13 @@ pub fn run() {
                         let bg_device: tauri::State<DeviceIdentity> = bg_handle.state();
                         let bg_sync: tauri::State<SyncState> = bg_handle.state();
                         match boot_sync_engine(
-                            ub, &bg_device.device_uuid, &bg_db, &bg_writer, &bg_sync, &bg_handle, bg_needs_backfill,
+                            ub,
+                            &bg_device.device_uuid,
+                            &bg_db,
+                            &bg_writer,
+                            &bg_sync,
+                            &bg_handle,
+                            bg_needs_backfill,
                         ) {
                             Ok(()) => {
                                 log::info!("sync: engine booted (replay + watcher active)");
@@ -598,9 +615,9 @@ pub fn run() {
                         }
                     })
                     .ok();
-            } else if sync::migration::is_sync_enabled(&local_dir) {
+            } else if sync_enabled {
                 log::warn!(
-                    "sync: skipping engine boot — iCloud container not reachable \
+                    "sync: skipping engine boot — selected sync folder not reachable \
                      this launch; outbox preserved for the next launch"
                 );
             }
@@ -611,6 +628,7 @@ pub fn run() {
             // App lifecycle
             commands::app::app_ready,
             commands::app::reveal_logs,
+            commands::app::app_build_info,
             // Books
             commands::books::import_book,
             commands::books::list_books,
@@ -626,6 +644,16 @@ pub fn run() {
             // Settings
             commands::settings::get_all_settings,
             commands::settings::ai_api_key_configured,
+            commands::settings::set_ai_api_key,
+            commands::settings::ai_active_profile,
+            commands::settings::ai_save_profile,
+            commands::settings::ai_list_credentials,
+            commands::settings::ai_add_credential,
+            commands::settings::ai_replace_credential,
+            commands::settings::ai_set_credential_enabled,
+            commands::settings::ai_reorder_credentials,
+            commands::settings::ai_delete_credential,
+            commands::settings::ai_test_credential,
             commands::settings::get_setting,
             commands::settings::set_setting,
             commands::settings::set_settings_bulk,
@@ -655,6 +683,7 @@ pub fn run() {
             commands::ai::ai_lookup,
             commands::ai::ai_explain,
             commands::ai::ai_generate_title,
+            commands::ai::ai_cancel,
             // OAuth
             commands::oauth::openai_oauth_login,
             commands::oauth::openai_oauth_status,
@@ -666,12 +695,21 @@ pub fn run() {
             commands::vocab::check_vocab_exists,
             commands::vocab::list_all_vocab_words,
             commands::vocab::update_vocab_mastery,
+            commands::vocab::record_vocab_review,
             commands::vocab::list_vocab_due_for_review,
             commands::vocab::get_vocab_stats,
+            commands::vocab::export_vocab_backup,
+            commands::vocab::preview_vocab_import,
+            commands::vocab::import_vocab_backup,
+            commands::vocab::bulk_delete_vocab_words,
+            commands::vocab::bulk_update_vocab_mastery,
             // Local lookup history
             commands::lookup_history::save_lookup_record,
             commands::lookup_history::list_lookup_records,
             commands::lookup_history::list_all_lookup_records,
+            commands::lookup_history::delete_lookup_record,
+            commands::lookup_history::clear_lookup_records,
+            commands::lookup_history::prune_lookup_records,
             // Chats
             commands::chats::create_chat,
             commands::chats::list_chats,
@@ -690,6 +728,7 @@ pub fn run() {
             commands::mcp::mcp_set_write_access,
             // Sync
             commands::sync::sync_status,
+            commands::sync::sync_set_shared_dir,
             commands::sync::sync_enable,
             commands::sync::sync_disable,
             commands::sync::sync_now,
@@ -709,7 +748,19 @@ pub fn run() {
                 .filter_map(|url| url.to_file_path().ok())
                 .filter(|p: &PathBuf| {
                     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-                    ext.eq_ignore_ascii_case("epub") || ext.eq_ignore_ascii_case("pdf")
+                    ext.eq_ignore_ascii_case("epub")
+                        || ext.eq_ignore_ascii_case("pdf")
+                        || ext.eq_ignore_ascii_case("txt")
+                        || ext.eq_ignore_ascii_case("md")
+                        || ext.eq_ignore_ascii_case("markdown")
+                        || ext.eq_ignore_ascii_case("html")
+                        || ext.eq_ignore_ascii_case("htm")
+                        || ext.eq_ignore_ascii_case("mobi")
+                        || ext.eq_ignore_ascii_case("azw")
+                        || ext.eq_ignore_ascii_case("azw3")
+                        || ext.eq_ignore_ascii_case("fb2")
+                        || ext.eq_ignore_ascii_case("fbz")
+                        || ext.eq_ignore_ascii_case("cbz")
                 })
                 .filter_map(|p: PathBuf| p.to_str().map(String::from))
                 .collect();
@@ -760,16 +811,12 @@ mod tests {
     /// migration story if the identifier ever needs to change.
     #[test]
     fn bundle_identifier_matches_log_path_assumption() {
-        let conf = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tauri.conf.json"
-        ))
-        .expect("read tauri.conf.json");
-        let v: serde_json::Value =
-            serde_json::from_str(&conf).expect("parse tauri.conf.json");
+        let conf = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json"))
+            .expect("read tauri.conf.json");
+        let v: serde_json::Value = serde_json::from_str(&conf).expect("parse tauri.conf.json");
         let id = v["identifier"].as_str().expect("identifier field");
         assert_eq!(
-            id, "com.wycstudios.quill",
+            id, "com.klaragraff.quill",
             "bundle identifier changed — update log path docs and migration",
         );
     }
@@ -824,9 +871,9 @@ mod tests {
     fn resolve_log_dir_uses_dev_suffix_in_debug() {
         let dir = resolve_log_dir();
         let expected_id = if cfg!(debug_assertions) {
-            "com.wycstudios.quill-dev"
+            "com.klaragraff.quill-dev"
         } else {
-            "com.wycstudios.quill"
+            "com.klaragraff.quill"
         };
         let dir_str = dir.to_string_lossy().to_string();
         assert!(
@@ -838,9 +885,9 @@ mod tests {
         // In debug builds, the prod-only id must not appear in the
         // path UNLESS it's the substring of the dev id itself.
         if cfg!(debug_assertions) {
-            let stripped = dir_str.replace("com.wycstudios.quill-dev", "");
+            let stripped = dir_str.replace("com.klaragraff.quill-dev", "");
             assert!(
-                !stripped.contains("com.wycstudios.quill"),
+                !stripped.contains("com.klaragraff.quill"),
                 "debug build log dir {dir_str} leaks the prod identifier outside the -dev suffix",
             );
         }

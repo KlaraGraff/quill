@@ -1,33 +1,31 @@
 # Privacy Policy
 
-*Last updated: April 12, 2026*
+Last updated: July 12, 2026
 
 ## Overview
 
-Quill is an ebook reader with AI features. Your privacy is simple: your data stays on your device unless you explicitly choose to send it somewhere.
+Quill Personal is a local-first ebook reader. Your library and learning data stay on your Mac unless you choose to use an external AI provider or enable folder-based sync.
 
-## Data Storage
+## Local Storage
 
-Quill stores your library, highlights, bookmarks, annotations, vocabulary, and chat history locally on your device. No account is required and no personal data is sent to Quill's servers.
+Books, reading progress, highlights, bookmarks, lookup history, vocabulary, and chats are stored locally. API keys and OAuth tokens are stored in the operating system credential store. The app does not expose secret values to its webview or sync them to iCloud.
 
-## iCloud Sync
+## iCloud Drive Folder Sync
 
-If you enable iCloud Sync in Settings, your data is stored in your personal iCloud container managed by Apple. Apple handles encryption and access control under their own privacy policy. You can disable iCloud Sync at any time.
+Sync is optional. When enabled, you explicitly select a folder in your iCloud Drive. Quill Personal stores sync logs, book files, covers, and synchronized library records in that folder so another Mac can use the same library after selecting the same folder. Lookup history and its "looked up" markers remain local to each Mac. This edition does not use or access the original Quill private iCloud container.
 
 ## AI Features
 
-AI features (word lookup, translation, passage explanation, chat) use the provider you configure — OpenAI, Anthropic, or another compatible service. When you use these features, the selected text or message is sent directly to that provider's API under their terms of service.
+Word lookup, translation, passage explanation, and chat send the selected text or message directly to the AI provider you configure. That provider's privacy policy and terms apply to those requests. Quill Personal does not relay the requests through a service it operates.
 
-Quill does not relay, store, or analyze that traffic on any intermediary server. The connection is between your device and your chosen AI provider.
+## Analytics
 
-## Analytics & Tracking
-
-Quill does not collect analytics, usage data, or telemetry. There are no third-party tracking SDKs.
+Quill Personal does not include analytics, telemetry, or third-party tracking SDKs.
 
 ## Data Deletion
 
-You can delete any of your data at any time from within the app — highlights, bookmarks, vocabulary, chat history, and imported books can all be removed from their respective screens.
+You can delete imported books, highlights, bookmarks, vocabulary, chats, and local app data. Disabling sync copies available synced books back to the Mac and keeps the selected folder authorization for a later re-enable; deleting the shared folder itself is your responsibility.
 
 ## Contact
 
-If you have questions about this privacy policy, open an issue at [github.com/yicheng47/quill](https://github.com/yicheng47/quill/issues) or email [jason3gb@gmail.com](mailto:jason3gb@gmail.com).
+For this edition, open an issue at [KlaraGraff/quill](https://github.com/KlaraGraff/quill/issues). The original Quill maintainers do not provide support for Quill Personal.

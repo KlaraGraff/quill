@@ -1,4 +1,5 @@
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { emitTo, listen } from "@tauri-apps/api/event";
 
 interface ReaderWindowOptions {
   openVocab?: boolean;
@@ -37,6 +38,24 @@ export async function openReaderWindow(
   // Focus existing window if already open
   const existing = await WebviewWindow.getByLabel(label);
   if (existing) {
+    const navigationId = crypto.randomUUID();
+    let acknowledge: () => void = () => {};
+    const acknowledged = new Promise<void>((resolve) => { acknowledge = resolve; });
+    const unlisten = await listen<{ navigationId: string }>("reader:navigate:ack", (event) => {
+      if (event.payload.navigationId === navigationId) acknowledge();
+    });
+    await emitTo(label, "reader:navigate", {
+      navigationId,
+      cfi: options?.cfi ?? undefined,
+      openVocab: options?.openVocab ?? false,
+      openChat: options?.openChat ?? false,
+      chatId: options?.chatId ?? undefined,
+    });
+    await Promise.race([
+      acknowledged,
+      new Promise<void>((resolve) => setTimeout(resolve, 5000)),
+    ]);
+    unlisten();
     await existing.setFocus();
     return;
   }
@@ -57,7 +76,7 @@ export async function openReaderWindow(
 
   new WebviewWindow(label, {
     url,
-    title: "Quill",
+    title: "Quill Personal",
     width,
     height,
     minWidth: MIN_WIDTH,

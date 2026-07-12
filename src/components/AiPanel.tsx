@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { Sparkles, Send, Loader2, Plus, ChevronDown, ChevronUp, Trash2, X } from "lucide-react";
+import { Sparkles, Send, Loader2, Plus, ChevronDown, ChevronUp, Trash2, X, Square } from "lucide-react";
 import { useAiChat } from "../hooks/useAiChat";
 import { timeAgo } from "../utils/timeAgo";
 import MessageBubble from "./MessageBubble";
@@ -25,7 +25,7 @@ export default function AiPanel({ bookId, bookTitle, bookAuthor, currentChapter,
     t("ai.prompt.characters"),
   ];
   const {
-    messages, streaming, send, initialize,
+    messages, streaming, send, cancel, initialize,
     chatId, chats, titling, initializing, loadChat, deleteChat, renameChat, reset,
   } = useAiChat(bookId, { title: bookTitle, author: bookAuthor, chapter: currentChapter });
 
@@ -290,14 +290,16 @@ export default function AiPanel({ bookId, bookTitle, bookAuthor, currentChapter,
             className="flex-1 h-[60px] bg-bg-input rounded-lg px-3 py-2 text-[14px] text-text-primary placeholder:text-text-placeholder tracking-[-0.15px] leading-5 outline-none border border-transparent focus:border-accent resize-none"
           />
           <button
-            onClick={handleSend}
-            disabled={!input.trim() || streaming || initializing}
+            onClick={streaming ? cancel : handleSend}
+            title={streaming ? t("ai.stop") : t("ai.send")}
+            aria-label={streaming ? t("ai.stop") : t("ai.send")}
+            disabled={!streaming && (!input.trim() || initializing)}
             className={`size-[60px] shrink-0 rounded-lg flex items-center justify-center cursor-pointer bg-accent text-white ${
-              !input.trim() || streaming || initializing ? "opacity-50" : ""
+              !streaming && (!input.trim() || initializing) ? "opacity-50" : ""
             }`}
           >
             {streaming ? (
-              <Loader2 size={16} className="animate-spin" />
+              <Square size={14} fill="currentColor" />
             ) : (
               <Send size={16} />
             )}

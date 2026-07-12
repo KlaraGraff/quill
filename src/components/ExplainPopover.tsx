@@ -6,6 +6,7 @@ import { X, Loader2, WandSparkles, Check, Copy, Settings } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import Markdown from "react-markdown";
 import { LOOKUP_PROSE } from "./lookup-prose";
+import { aiErrorMessageKey, getAiErrorCode, isAiSettingsError, type AiErrorCode } from "../utils/aiError";
 
 interface ExplainPopoverProps {
   x: number;
@@ -19,6 +20,12 @@ interface ExplainPopoverProps {
   onClose: () => void;
 }
 
+interface AiStreamChunk {
+  delta: string;
+  done: boolean;
+  error?: string;
+}
+
 function useExplainStream(
   passage: string,
   surrounding: string | undefined,
@@ -28,24 +35,37 @@ function useExplainStream(
   const contentRef = useRef("");
   const [content, setContent] = useState("");
   const [streaming, setStreaming] = useState(true);
-  const [notConfigured, setNotConfigured] = useState(false);
+  const [aiError, setAiError] = useState<AiErrorCode | null>(null);
+  const [streamError, setStreamError] = useState(false);
   const unlistenRef = useRef<UnlistenFn | null>(null);
+  const requestIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     contentRef.current = "";
+    setContent("");
+    setStreaming(true);
+    setAiError(null);
+    setStreamError(false);
 
     const run = async () => {
       const requestId = crypto.randomUUID();
+      requestIdRef.current = requestId;
 
-      unlistenRef.current = await listen<{ delta: string; done: boolean }>(
+      unlistenRef.current = await listen<AiStreamChunk>(
         `ai-lookup-chunk-${requestId}`,
         (event) => {
           if (cancelled) return;
           if (event.payload.done) {
+            if (event.payload.error) {
+              const errorCode = getAiErrorCode(event.payload.error);
+              if (isAiSettingsError(errorCode)) setAiError(errorCode);
+              else setStreamError(true);
+            }
             setStreaming(false);
             unlistenRef.current?.();
             unlistenRef.current = null;
+            requestIdRef.current = null;
             return;
           }
           contentRef.current += event.payload.delta;
@@ -64,12 +84,18 @@ function useExplainStream(
       } catch (err) {
         if (!cancelled) {
           const msg = String(err);
-          if (msg.includes("AI_NOT_CONFIGURED")) {
-            setNotConfigured(true);
+          const errorCode = getAiErrorCode(msg);
+          if (isAiSettingsError(errorCode)) {
+            setAiError(errorCode);
           } else {
             setContent(`Error: ${msg}`);
           }
           setStreaming(false);
+        }
+        if (requestIdRef.current === requestId) {
+          requestIdRef.current = null;
+          unlistenRef.current?.();
+          unlistenRef.current = null;
         }
       }
     };
@@ -78,12 +104,14 @@ function useExplainStream(
 
     return () => {
       cancelled = true;
+      if (requestIdRef.current) invoke("ai_cancel", { requestId: requestIdRef.current }).catch(() => {});
+      requestIdRef.current = null;
       unlistenRef.current?.();
       unlistenRef.current = null;
     };
   }, [passage, surrounding, bookTitle, chapter]);
 
-  return { content, contentRef, streaming, notConfigured };
+  return { content, contentRef, streaming, aiError, streamError };
 }
 
 export default function ExplainPopover({
@@ -99,7 +127,7 @@ export default function ExplainPopover({
   const [copied, setCopied] = useState(false);
   const popoverRef = useRef<HTMLDivElement>(null);
 
-  const { content, contentRef, streaming, notConfigured } = useExplainStream(
+  const { content, contentRef, streaming, aiError, streamError } = useExplainStream(
     text,
     sentence,
     bookTitle,
@@ -193,9 +221,9 @@ export default function ExplainPopover({
           <p className="text-[12px] italic text-text-muted line-clamp-3">{text}</p>
         </div>
 
-        {notConfigured ? (
+        {aiError ? (
           <div className="flex flex-col items-center gap-2 py-4 text-center">
-            <p className="text-[13px] text-text-muted">{t("ai.notConfigured")}</p>
+            <p className="text-[13px] text-text-muted">{t(aiErrorMessageKey(aiError))}</p>
             <button
               onClick={async () => {
                 onClose();
@@ -214,6 +242,8 @@ export default function ExplainPopover({
             <Loader2 size={14} className="animate-spin text-text-muted" />
             <span className="text-[13px] text-text-muted">{t("explain.thinking")}</span>
           </div>
+        ) : streamError ? (
+          <p className="py-3 text-[13px] text-text-muted">{t("ai.requestFailed")}</p>
         ) : (
           <div className={`${LOOKUP_PROSE} text-[13px] text-text-primary pt-2.5`}>
             <Markdown>{content}</Markdown>
@@ -225,7 +255,7 @@ export default function ExplainPopover({
       </div>
 
       {/* Footer — Copy */}
-      {!streaming && content && !notConfigured && (
+      {!streaming && content && !aiError && !streamError && (
         <div className="flex items-center justify-end px-4 py-2.5 border-t border-border/40">
           <button
             onClick={handleCopy}

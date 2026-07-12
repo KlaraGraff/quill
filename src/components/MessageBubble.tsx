@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import Markdown from "react-markdown";
 import type { ChatMessage } from "../hooks/useAiChat";
+import { aiErrorMessageKey, isAiErrorCode, isAiSettingsError } from "../utils/aiError";
 
 interface MessageBubbleProps {
   msg: ChatMessage;
@@ -17,21 +18,27 @@ export default function MessageBubble({ msg, messages, streaming, onNavigateToCf
   const isLast = msg === messages[messages.length - 1];
 
   if (msg.role === "assistant") {
-    if (msg.content === "AI_NOT_CONFIGURED") {
+    const errorCode = isAiErrorCode(msg.content) ? msg.content : null;
+    if (errorCode) {
+      const needsSettings = isAiSettingsError(errorCode);
       return (
         <div className="bg-bg-surface border border-border rounded-lg px-[13px] py-[13px] max-w-[85%]">
-          <p className="text-[14px] text-text-muted mb-2">{t("ai.notConfigured")}</p>
-          <button
-            onClick={async () => {
-              await invoke("open_settings_on_main", { section: "ai" });
-              const main = await WebviewWindow.getByLabel("main");
-              await main?.setFocus();
-            }}
-            className="flex items-center gap-1.5 text-[13px] font-medium text-accent-text hover:opacity-70 cursor-pointer"
-          >
-            <Settings size={14} />
-            {t("ai.openSettings")}
-          </button>
+          <p className={`text-[14px] text-text-muted ${needsSettings ? "mb-2" : ""}`}>
+            {t(aiErrorMessageKey(errorCode))}
+          </p>
+          {needsSettings && (
+            <button
+              onClick={async () => {
+                await invoke("open_settings_on_main", { section: "ai" });
+                const main = await WebviewWindow.getByLabel("main");
+                await main?.setFocus();
+              }}
+              className="flex items-center gap-1.5 text-[13px] font-medium text-accent-text hover:opacity-70 cursor-pointer"
+            >
+              <Settings size={14} />
+              {t("ai.openSettings")}
+            </button>
+          )}
         </div>
       );
     }

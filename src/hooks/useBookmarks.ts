@@ -21,6 +21,10 @@ export interface Highlight {
   updated_at: number;
 }
 
+function notifyHighlightChanged(bookId: string) {
+  window.dispatchEvent(new CustomEvent("highlight-changed", { detail: { bookId } }));
+}
+
 export function useBookmarks(bookId: string) {
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
 
@@ -93,6 +97,7 @@ export function useHighlights(bookId: string) {
         textContent: textContent || null,
       });
       setHighlights((prev) => [highlight, ...prev]);
+      notifyHighlightChanged(bookId);
       return highlight;
     },
     [bookId]
@@ -101,21 +106,24 @@ export function useHighlights(bookId: string) {
   const remove = useCallback(async (id: string) => {
     await invoke("remove_highlight", { id });
     setHighlights((prev) => prev.filter((h) => h.id !== id));
-  }, []);
+    notifyHighlightChanged(bookId);
+  }, [bookId]);
 
   const updateNote = useCallback(async (id: string, note: string) => {
     await invoke("update_highlight_note", { id, note });
     setHighlights((prev) =>
       prev.map((h) => (h.id === id ? { ...h, note } : h))
     );
-  }, []);
+    notifyHighlightChanged(bookId);
+  }, [bookId]);
 
   const updateColor = useCallback(async (id: string, color: string) => {
     await invoke("update_highlight_color", { id, color });
     setHighlights((prev) =>
       prev.map((h) => (h.id === id ? { ...h, color } : h))
     );
-  }, []);
+    notifyHighlightChanged(bookId);
+  }, [bookId]);
 
   return { highlights, refresh, add, remove, updateNote, updateColor };
 }

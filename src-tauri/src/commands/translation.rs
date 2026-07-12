@@ -1,6 +1,6 @@
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
-use crate::commands::ai::{AiStreamChunk, ChatMessage};
+use crate::commands::ai::{emit_stream_failure, ChatMessage};
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
 use crate::secrets::Secrets;
@@ -42,15 +42,14 @@ fn configured_translation_language(
 pub async fn ai_translate_passage(
     text: String,
     context: Option<String>,
-    #[allow(unused_variables)]
-    book_id: String,
+    #[allow(unused_variables)] book_id: String,
     target_language: Option<String>,
     request_id: String,
     app: AppHandle,
     db: State<'_, Db>,
     secrets: State<'_, Secrets>,
 ) -> AppResult<()> {
-    let (target_lang, provider, model, base_url, keep_alive, auth_mode) = {
+    let target_lang = {
         let conn = db.reader();
         let get = |key: &str| -> Option<String> {
             conn.query_row(
@@ -60,38 +59,20 @@ pub async fn ai_translate_passage(
             )
             .ok()
         };
-        let tl = configured_translation_language(
+        configured_translation_language(
             target_language,
             get("translation_language"),
             get("language").or_else(|| Some("en".to_string())),
-        )?;
-        (
-            tl,
-            get("ai_provider").unwrap_or_else(|| "ollama".to_string()),
-            get("ai_model").unwrap_or_else(|| "llama3.2".to_string()),
-            get("ai_base_url"),
-            get("ai_keep_alive").unwrap_or_else(|| "30m".to_string()),
-            get("ai_auth_mode").unwrap_or_else(|| "api_key".to_string()),
-        )
-    };
-
-    let api_key = secrets.get("ai_api_key").unwrap_or_default();
-
-    let (api_key, oauth_account_id) = if auth_mode == "oauth" && provider == "openai" {
-        let (token, acct_id) = crate::ai::oauth::get_valid_token(&secrets).await?;
-        (token, acct_id)
-    } else {
-        if api_key.is_empty() && provider != "ollama" {
-            return Err(AppError::Other("AI_NOT_CONFIGURED".to_string()));
-        }
-        (api_key, None)
+        )?
     };
 
     let target_name = lang_display_name(&target_lang);
 
     // Context-aware prompt: if selection is shorter than surrounding paragraph,
     // provide the paragraph as context but only translate the selection
-    let has_context = context.as_ref().is_some_and(|c| c != &text && c.len() > text.len());
+    let has_context = context
+        .as_ref()
+        .is_some_and(|c| c != &text && c.len() > text.len());
     let system_prompt = if has_context {
         format!(
             "You are a translator embedded in an ebook reader. The user selected a portion of text they want translated into {}.\n\n\
@@ -121,34 +102,23 @@ pub async fn ai_translate_passage(
     ];
 
     let event_name = format!("ai-translate-chunk-{}", request_id);
-    let use_responses_api = auth_mode == "oauth" && provider == "openai";
-    let app_clone = app.clone();
-
+    let db = db.inner().clone();
+    let secrets = secrets.inner().clone();
+    // Keep the cancellation token available before the detached task starts.
+    crate::ai::router::register_request(&request_id);
     tauri::async_runtime::spawn(async move {
-        let result = match provider.as_str() {
-            "anthropic" => {
-                let url = base_url.unwrap_or_else(|| "https://api.anthropic.com".to_string());
-                crate::ai::anthropic::stream_chat(&app_clone, &url, &api_key, &model, 0.3, &messages, false, &event_name, None).await
-            }
-            _ if use_responses_api => {
-                let url = "https://chatgpt.com/backend-api/codex".to_string();
-                crate::ai::openai_responses::stream_chat(&app_clone, &url, &api_key, &model, &messages, oauth_account_id.as_deref(), &event_name).await
-            }
-            _ => {
-                let url = base_url.unwrap_or_else(|| "http://localhost:11434".to_string());
-                let ka = if provider == "ollama" { Some(keep_alive.clone()) } else { None };
-                crate::ai::openai_compat::stream_chat(&app_clone, &url, &api_key, &model, 0.3, &messages, ka.as_deref(), &event_name, None).await
-            }
-        };
-        if let Err(e) = result {
-            let _ = app_clone.emit(&event_name, AiStreamChunk {
-                delta: format!("Error: {}", e),
-                done: false,
-            });
-            let _ = app_clone.emit(&event_name, AiStreamChunk {
-                delta: String::new(),
-                done: true,
-            });
+        if let Err(error) = crate::ai::router::stream_with_failover(
+            &app,
+            &db,
+            &secrets,
+            &messages,
+            &event_name,
+            None,
+            Some(&request_id),
+        )
+        .await
+        {
+            emit_stream_failure(&app, &event_name, &error);
         }
     });
 
@@ -167,10 +137,14 @@ mod tests {
         let err = configured_translation_language(None, None, None).unwrap_err();
         assert_eq!(err.to_string(), "TRANSLATION_LANGUAGE_NOT_CONFIGURED");
 
-        let blank = configured_translation_language(None, Some("  ".to_string()), Some("  ".to_string())).unwrap_err();
+        let blank =
+            configured_translation_language(None, Some("  ".to_string()), Some("  ".to_string()))
+                .unwrap_err();
         assert_eq!(blank.to_string(), "TRANSLATION_LANGUAGE_NOT_CONFIGURED");
 
-        let blank_saved = configured_translation_language(None, Some("  ".to_string()), Some("zh".to_string())).unwrap();
+        let blank_saved =
+            configured_translation_language(None, Some("  ".to_string()), Some("zh".to_string()))
+                .unwrap();
         assert_eq!(blank_saved, "zh");
     }
 
@@ -184,7 +158,9 @@ mod tests {
         .unwrap();
         assert_eq!(lang, "zh");
 
-        let saved = configured_translation_language(None, Some(" en ".to_string()), Some("zh".to_string())).unwrap();
+        let saved =
+            configured_translation_language(None, Some(" en ".to_string()), Some("zh".to_string()))
+                .unwrap();
         assert_eq!(saved, "en");
     }
 }

@@ -13,11 +13,11 @@
 //!     server in-process; AI clients (Claude Code, Codex) launch this
 //!     subprocess themselves.
 
-use rmcp::handler::server::ServerHandler;
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::ServerHandler;
 use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
 use rmcp::transport::io::stdio;
-use rmcp::{ServiceExt, tool_handler};
+use rmcp::{tool_handler, ServiceExt};
 
 use super::state::McpState;
 
@@ -58,8 +58,7 @@ impl ServerHandler for QuillMcpHandler {
         // `ServerInfo` and `Implementation` are both `#[non_exhaustive]`.
         // Use the public constructors / builder methods rather than
         // struct literals.
-        let implementation =
-            Implementation::new("quill", env!("CARGO_PKG_VERSION"));
+        let implementation = Implementation::new("quill", env!("CARGO_PKG_VERSION"));
         let capabilities = ServerCapabilities::builder().enable_tools().build();
         ServerInfo::new(capabilities)
             .with_protocol_version(ProtocolVersion::LATEST)
@@ -119,12 +118,14 @@ mod tests {
                 "INSERT INTO collections (id, name, sort_order, created_at, updated_at)
                  VALUES ('c1','Favorites',0,?1,?1)",
                 params![now],
-            ).unwrap();
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO bookmarks (id, book_id, cfi, label, created_at, updated_at)
                  VALUES ('bm1','b1','epubcfi(/6/2!/4)','Ch1',?1,?1)",
                 params![now],
-            ).unwrap();
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO highlights (id, book_id, cfi_range, color, note, text_content, created_at, updated_at)
                  VALUES ('h1','b1','epubcfi(/6/4!/2,/4)','yellow','my note','quoted passage',?1,?1)",
@@ -165,8 +166,11 @@ mod tests {
     #[test]
     fn tool_router_registers_all_tools() {
         let router = QuillMcpHandler::tool_router();
-        let names: std::collections::BTreeSet<_> =
-            router.list_all().into_iter().map(|t| t.name.to_string()).collect();
+        let names: std::collections::BTreeSet<_> = router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
         let expected: std::collections::BTreeSet<_> = [
             "list_books",
             "get_book",
@@ -196,7 +200,10 @@ mod tests {
         let (_dir, state) = seeded();
         let handler = QuillMcpHandler::new(state);
         let info = handler.get_info();
-        assert!(info.capabilities.tools.is_some(), "tools capability missing");
+        assert!(
+            info.capabilities.tools.is_some(),
+            "tools capability missing"
+        );
         assert_eq!(info.server_info.name, "quill");
     }
 

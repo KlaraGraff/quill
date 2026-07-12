@@ -1,4 +1,8 @@
 use futures::StreamExt;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tauri::{AppHandle, Emitter};
 
 use crate::commands::ai::{AiStreamChunk, ChatMessage};
@@ -15,8 +19,9 @@ pub async fn stream_chat(
     use_bearer_auth: bool,
     event_name: &str,
     max_tokens_override: Option<u32>,
+    emitted: Arc<AtomicBool>,
 ) -> AppResult<()> {
-    let client = reqwest::Client::new();
+    let client = crate::ai::http_client();
 
     // Anthropic uses a separate system parameter
     let system_msg = messages
@@ -57,59 +62,73 @@ pub async fn stream_chat(
         request = request.header("x-api-key", api_key);
     }
 
-    let response = request
-        .json(&body)
-        .send()
+    let response = tokio::time::timeout(crate::ai::FIRST_BYTE_TIMEOUT, request.json(&body).send())
         .await
+        .map_err(|_| AppError::Ai("AI_FIRST_BYTE_TIMEOUT".to_string()))?
         .map_err(|e| AppError::Ai(e.to_string()))?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(AppError::Ai(format!("Anthropic API error {}: {}", status, body)));
+        return Err(crate::ai::http_status_error("Anthropic", response).await);
     }
 
     let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
+    let mut decoder = crate::ai::sse::SseDecoder::new();
 
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = tokio::time::timeout(crate::ai::STREAM_IDLE_TIMEOUT, stream.next())
+        .await
+        .map_err(|_| AppError::Ai("AI_STREAM_IDLE_TIMEOUT".to_string()))?
+    {
         let chunk = chunk.map_err(|e| AppError::Ai(e.to_string()))?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-        while let Some(line_end) = buffer.find('\n') {
-            let line = buffer[..line_end].trim().to_string();
-            buffer = buffer[line_end + 1..].to_string();
-
-            if let Some(data) = line.strip_prefix("data: ") {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-                    let event_type = parsed["type"].as_str().unwrap_or("");
-                    match event_type {
-                        "content_block_delta" => {
-                            if let Some(text) = parsed["delta"]["text"].as_str() {
-                                let _ = app.emit(event_name, AiStreamChunk {
-                                    delta: text.to_string(),
-                                    done: false,
-                                });
-                            }
-                        }
-                        "message_stop" => {
-                            let _ = app.emit(event_name, AiStreamChunk {
-                                delta: String::new(),
-                                done: true,
-                            });
-                            return Ok(());
-                        }
-                        _ => {}
-                    }
-                }
+        for data in decoder.push(&chunk)? {
+            if process_data(app, event_name, &data, &emitted)? {
+                return Ok(());
             }
         }
     }
 
-    let _ = app.emit(event_name, AiStreamChunk {
-        delta: String::new(),
-        done: true,
-    });
+    for data in decoder.finish()? {
+        if process_data(app, event_name, &data, &emitted)? {
+            return Ok(());
+        }
+    }
 
-    Ok(())
+    Err(AppError::Ai("AI_STREAM_INCOMPLETE".to_string()))
+}
+
+fn process_data(
+    app: &AppHandle,
+    event_name: &str,
+    data: &str,
+    emitted: &AtomicBool,
+) -> AppResult<bool> {
+    let parsed: serde_json::Value = serde_json::from_str(data)
+        .map_err(|_| AppError::Ai("AI_STREAM_PROTOCOL_ERROR: invalid JSON event".to_string()))?;
+    match parsed["type"].as_str().unwrap_or("") {
+        "content_block_delta" => {
+            if let Some(text) = parsed["delta"]["text"].as_str() {
+                emitted.store(true, Ordering::Relaxed);
+                let _ = app.emit(
+                    event_name,
+                    AiStreamChunk {
+                        delta: text.to_string(),
+                        done: false,
+                        error: None,
+                    },
+                );
+            }
+        }
+        "message_stop" => {
+            let _ = app.emit(
+                event_name,
+                AiStreamChunk {
+                    delta: String::new(),
+                    done: true,
+                    error: None,
+                },
+            );
+            return Ok(true);
+        }
+        _ => {}
+    }
+    Ok(false)
 }

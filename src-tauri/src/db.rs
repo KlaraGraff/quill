@@ -3,23 +3,46 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/001_init.sql")),
     (2, include_str!("../migrations/002_vocab.sql")),
     (3, include_str!("../migrations/003_chats.sql")),
     (4, include_str!("../migrations/004_pdf_support.sql")),
-    (5, include_str!("../migrations/005_collection_sort_order.sql")),
+    (
+        5,
+        include_str!("../migrations/005_collection_sort_order.sql"),
+    ),
     (6, include_str!("../migrations/006_translations.sql")),
     (7, include_str!("../migrations/007_book_settings.sql")),
     (8, include_str!("../migrations/008_drop_book_settings.sql")),
-    (9, include_str!("../migrations/009_normalize_timestamps.sql")),
+    (
+        9,
+        include_str!("../migrations/009_normalize_timestamps.sql"),
+    ),
     (10, include_str!("../migrations/010_replay_state.sql")),
-    (11, include_str!("../migrations/011_lww_tiebreak_and_outbox.sql")),
-    (12, include_str!("../migrations/012_vocab_context_explanation.sql")),
+    (
+        11,
+        include_str!("../migrations/011_lww_tiebreak_and_outbox.sql"),
+    ),
+    (
+        12,
+        include_str!("../migrations/012_vocab_context_explanation.sql"),
+    ),
     (13, include_str!("../migrations/013_covers_in_db.sql")),
     (14, include_str!("../migrations/014_lookup_history.sql")),
+    (15, include_str!("../migrations/015_ai_profiles.sql")),
+    (
+        16,
+        include_str!("../migrations/016_book_source_formats.sql"),
+    ),
+    (17, include_str!("../migrations/017_vocab_srs.sql")),
+    (
+        18,
+        include_str!("../migrations/018_book_source_metadata.sql"),
+    ),
+    (19, include_str!("../migrations/019_vocab_fsrs.sql")),
 ];
 
 /// SQLite handle for the local materialized view.
@@ -147,6 +170,7 @@ impl Db {
         fs::create_dir_all(data_dir)?;
         fs::create_dir_all(data_dir.join("books"))?;
         fs::create_dir_all(data_dir.join("covers"))?;
+        fs::create_dir_all(data_dir.join("sources"))?;
 
         let db_path = db_dir.join("quill.db");
         let conn = Connection::open(&db_path)?;
@@ -184,11 +208,14 @@ impl Db {
                 | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?;
 
-        Ok((Self {
-            conn: Arc::new(Mutex::new(conn)),
-            read_conn: Arc::new(Mutex::new(read_conn)),
-            data_dir: Arc::new(Mutex::new(data_dir.to_path_buf())),
-        }, needs_cover_backfill))
+        Ok((
+            Self {
+                conn: Arc::new(Mutex::new(conn)),
+                read_conn: Arc::new(Mutex::new(read_conn)),
+                data_dir: Arc::new(Mutex::new(data_dir.to_path_buf())),
+            },
+            needs_cover_backfill,
+        ))
     }
 
     fn run_migrations(conn: &Connection) -> AppResult<()> {
@@ -197,33 +224,57 @@ impl Db {
         )?;
 
         let mut current: i64 = conn
-            .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_version", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |r| r.get(0),
+            )
             .unwrap_or(0);
 
         for &(version, sql) in MIGRATIONS {
             if version > current {
                 log::info!("db: applying migration {version}");
-                // ALTER TABLE migrations may fail if column already exists
-                if version == 4 || version == 5 || version == 13 {
-                    let _ = conn.execute_batch(sql);
-                } else if let Err(e) = conn.execute_batch(sql) {
-                    log::error!("db: migration {version} failed: {e}");
-                    return Err(e.into());
-                }
-                // Advance schema_version per migration, so a failure in a later
-                // migration doesn't force successful earlier ones to re-run.
-                conn.execute("DELETE FROM schema_version", [])?;
-                conn.execute(
-                    "INSERT INTO schema_version (version) VALUES (?1)",
-                    params![version],
-                )?;
+                Self::apply_migration(conn, version, sql)?;
                 current = version;
             }
         }
 
         Ok(())
+    }
+
+    /// Apply one migration and its schema watermark atomically. Migration 009
+    /// rebuilds parent tables and needs foreign-key checks disabled before the
+    /// transaction begins; SQLite cannot toggle that pragma inside one.
+    fn apply_migration(conn: &Connection, version: i64, sql: &str) -> AppResult<()> {
+        let restore_foreign_keys = version == 9
+            && conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))? != 0;
+        if restore_foreign_keys {
+            conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        }
+
+        let result = (|| -> AppResult<()> {
+            let tx = conn.unchecked_transaction()?;
+            if let Err(error) = tx.execute_batch(sql) {
+                let duplicate_legacy_column = matches!(version, 4 | 5 | 13)
+                    && error.to_string().contains("duplicate column name");
+                if !duplicate_legacy_column {
+                    log::error!("db: migration {version} failed: {error}");
+                    return Err(error.into());
+                }
+            }
+            tx.execute("DELETE FROM schema_version", [])?;
+            tx.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                params![version],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+
+        if restore_foreign_keys {
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        }
+        result
     }
 
     /// Current schema version, read from the migration runner state. Returns
@@ -243,15 +294,13 @@ impl Db {
         .unwrap_or(0)
     }
 
-    /// Resolve a relative path (e.g. "books/abc.epub") to an absolute path using data_dir.
-    /// If the path is already absolute, returns it as-is.
-    pub fn resolve_path(&self, relative: &str) -> PathBuf {
-        let path = Path::new(relative);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.data_dir.lock().unwrap().join(relative)
-        }
+    /// Resolve a validated book/cover blob path against the active data directory.
+    pub fn resolve_path(&self, relative: &str) -> AppResult<PathBuf> {
+        let data_dir = self
+            .data_dir
+            .lock()
+            .map_err(|error| AppError::Other(error.to_string()))?;
+        crate::sync::validation::resolve_blob_path(&data_dir, relative)
     }
 
     /// Run migrations on an already-open connection. Public so the sync
@@ -271,9 +320,11 @@ impl Db {
         )?;
 
         let mut current: i64 = conn
-            .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_version", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |r| r.get(0),
+            )
             .unwrap_or(0);
 
         for &(version, sql) in MIGRATIONS {
@@ -281,16 +332,7 @@ impl Db {
                 break;
             }
             if version > current {
-                if version == 4 || version == 5 || version == 13 {
-                    let _ = conn.execute_batch(sql);
-                } else {
-                    conn.execute_batch(sql)?;
-                }
-                conn.execute("DELETE FROM schema_version", [])?;
-                conn.execute(
-                    "INSERT INTO schema_version (version) VALUES (?1)",
-                    params![version],
-                )?;
+                Self::apply_migration(conn, version, sql)?;
                 current = version;
             }
         }
@@ -312,13 +354,17 @@ impl Db {
 
         // Phase 1: find candidates via read conn
         let rows: Vec<(String, String)> = {
-            let Ok(conn) = self.read_conn.lock() else { return };
+            let Ok(conn) = self.read_conn.lock() else {
+                return;
+            };
             let Ok(mut stmt) = conn.prepare(
                 "SELECT id, cover_path FROM books
                  WHERE cover_data IS NULL
                    AND cover_path IS NOT NULL
                    AND cover_path != 'none'",
-            ) else { return };
+            ) else {
+                return;
+            };
             stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
                 .into_iter()
                 .flatten()
@@ -336,10 +382,13 @@ impl Db {
         let loaded: Vec<(String, Vec<u8>)> = rows
             .into_iter()
             .filter_map(|(id, cover_path)| {
-                let abs = if Path::new(&cover_path).is_absolute() {
-                    PathBuf::from(&cover_path)
-                } else {
-                    data_dir.join(&cover_path)
+                let abs = match crate::sync::validation::resolve_cover_path(&data_dir, &cover_path)
+                {
+                    Ok(path) => path,
+                    Err(error) => {
+                        log::warn!("db: refusing unsafe cover path for {id}: {error}");
+                        return None;
+                    }
                 };
                 match fs::read(&abs) {
                     Ok(bytes) => Some((id, bytes)),
@@ -366,14 +415,10 @@ impl Db {
 
     /// Migrate existing absolute paths in the books table to relative paths.
     fn migrate_to_relative_paths(conn: &Connection, data_dir: &Path) -> AppResult<()> {
-        let prefix = format!(
-            "{}/",
-            data_dir.to_string_lossy().trim_end_matches('/')
-        );
+        let prefix = format!("{}/", data_dir.to_string_lossy().trim_end_matches('/'));
 
-        let mut stmt = conn.prepare(
-            "SELECT id, file_path, cover_path FROM books WHERE file_path LIKE '/%'",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT id, file_path, cover_path FROM books WHERE file_path LIKE '/%'")?;
         let rows: Vec<(String, String, Option<String>)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -424,7 +469,7 @@ mod tests {
         assert!(!db_dir.path().join("books").exists());
 
         // resolve_path uses data_dir as the base.
-        let resolved = db.resolve_path("books/foo.epub");
+        let resolved = db.resolve_path("books/foo.epub").unwrap();
         assert_eq!(resolved, data_dir.path().join("books/foo.epub"));
     }
 
@@ -438,8 +483,9 @@ mod tests {
     fn test_fresh_db_creates_schema_version() {
         let (_dir, db) = setup();
         let conn = db.conn.lock().unwrap();
-        let version: i64 =
-            conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0)).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(version, MIGRATIONS.last().unwrap().0);
     }
 
@@ -474,8 +520,9 @@ mod tests {
         // Running init again should not fail
         let conn = db.conn.lock().unwrap();
         Db::run_migrations_on(&conn).unwrap();
-        let version: i64 =
-            conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0)).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(version, MIGRATIONS.last().unwrap().0);
     }
 
@@ -491,8 +538,9 @@ mod tests {
             params![now_ms],
         )
         .unwrap();
-        let format: String =
-            conn.query_row("SELECT format FROM books WHERE id = 'b1'", [], |r| r.get(0)).unwrap();
+        let format: String = conn
+            .query_row("SELECT format FROM books WHERE id = 'b1'", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(format, "epub");
     }
 
@@ -501,8 +549,9 @@ mod tests {
         let (_dir, db) = setup();
         let conn = db.conn.lock().unwrap();
         // Should have exactly one row
-        let count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -523,7 +572,8 @@ mod tests {
 
     fn seed_v8(dir: &TempDir) -> Connection {
         let conn = Connection::open(dir.path().join("quill.db")).unwrap();
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+            .unwrap();
         Db::run_migrations_up_to(&conn, 8).unwrap();
         conn
     }
@@ -534,11 +584,11 @@ mod tests {
         let conn = seed_v8(&dir);
 
         // Cover every format chrono to_rfc3339() can emit.
-        let ts_bare      = "2024-01-15T12:34:56+00:00";           // no sub-second
-        let ts_millis    = "2024-06-15T12:34:56.789+00:00";       // 3 digits
-        let ts_nanos     = "2026-03-10T08:15:30.123456789+00:00"; // 9 digits
-        let ts_z         = "2025-12-25T00:00:00Z";                // Z suffix, no frac
-        let ts_z_millis  = "2025-12-25T00:00:00.500Z";            // Z suffix with millis
+        let ts_bare = "2024-01-15T12:34:56+00:00"; // no sub-second
+        let ts_millis = "2024-06-15T12:34:56.789+00:00"; // 3 digits
+        let ts_nanos = "2026-03-10T08:15:30.123456789+00:00"; // 9 digits
+        let ts_z = "2025-12-25T00:00:00Z"; // Z suffix, no frac
+        let ts_z_millis = "2025-12-25T00:00:00.500Z"; // Z suffix with millis
 
         for (id, c, u) in [
             ("b1", ts_bare, ts_millis),
@@ -558,27 +608,42 @@ mod tests {
         let (ty_c, ty_u): (String, String) = {
             let mut types = std::collections::HashMap::new();
             let mut stmt = conn.prepare("PRAGMA table_info(books)").unwrap();
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?))).unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+                .unwrap();
             for row in rows {
                 let (n, t) = row.unwrap();
                 types.insert(n, t);
             }
-            (types.remove("created_at").unwrap(), types.remove("updated_at").unwrap())
+            (
+                types.remove("created_at").unwrap(),
+                types.remove("updated_at").unwrap(),
+            )
         };
         assert_eq!(ty_c, "INTEGER");
         assert_eq!(ty_u, "INTEGER");
 
         // Verify values.
         for (id, expected_c, expected_u) in [
-            ("b1", rfc3339_to_millis(ts_bare), rfc3339_to_millis(ts_millis)),
+            (
+                "b1",
+                rfc3339_to_millis(ts_bare),
+                rfc3339_to_millis(ts_millis),
+            ),
             ("b2", rfc3339_to_millis(ts_nanos), rfc3339_to_millis(ts_z)),
-            ("b3", rfc3339_to_millis(ts_z_millis), rfc3339_to_millis(ts_bare)),
+            (
+                "b3",
+                rfc3339_to_millis(ts_z_millis),
+                rfc3339_to_millis(ts_bare),
+            ),
         ] {
-            let (c, u): (i64, i64) = conn.query_row(
-                "SELECT created_at, updated_at FROM books WHERE id = ?1",
-                params![id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            ).unwrap();
+            let (c, u): (i64, i64) = conn
+                .query_row(
+                    "SELECT created_at, updated_at FROM books WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
             assert_eq!(c, expected_c, "book {id} created_at mismatch");
             assert_eq!(u, expected_u, "book {id} updated_at mismatch");
         }
@@ -603,13 +668,15 @@ mod tests {
             "INSERT INTO bookmarks (id, book_id, cfi, created_at)
              VALUES ('bm1', 'b1', 'epubcfi(/6/4!)', ?1)",
             params![bm_ts],
-        ).unwrap();
+        )
+        .unwrap();
         let hl_ts = "2024-03-01T10:30:45.500+00:00";
         conn.execute(
             "INSERT INTO highlights (id, book_id, cfi_range, color, created_at)
              VALUES ('hl1', 'b1', 'epubcfi(/6/4!/2)', 'yellow', ?1)",
             params![hl_ts],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Translation + chat_message (also created_at-only).
         let tr_ts = "2024-04-10T14:15:00+00:00";
@@ -624,26 +691,45 @@ mod tests {
             "INSERT INTO chats (id, book_id, title, pinned, created_at, updated_at)
              VALUES ('c1', 'b1', 'Chat', 0, ?1, ?1)",
             params![chat_ts],
-        ).unwrap();
+        )
+        .unwrap();
         let msg_ts = "2024-05-15T09:00:05+00:00";
         conn.execute(
             "INSERT INTO chat_messages (id, chat_id, role, content, created_at)
              VALUES ('m1', 'c1', 'user', 'hi', ?1)",
             params![msg_ts],
-        ).unwrap();
+        )
+        .unwrap();
 
         Db::run_migrations_up_to(&conn, 9).unwrap();
 
         // For append-only tables, updated_at should equal created_at.
         for (sql, expected) in [
-            ("SELECT created_at, updated_at FROM bookmarks WHERE id = 'bm1'", rfc3339_to_millis(bm_ts)),
-            ("SELECT created_at, updated_at FROM highlights WHERE id = 'hl1'", rfc3339_to_millis(hl_ts)),
-            ("SELECT created_at, updated_at FROM translations WHERE id = 'tr1'", rfc3339_to_millis(tr_ts)),
-            ("SELECT created_at, updated_at FROM chat_messages WHERE id = 'm1'", rfc3339_to_millis(msg_ts)),
+            (
+                "SELECT created_at, updated_at FROM bookmarks WHERE id = 'bm1'",
+                rfc3339_to_millis(bm_ts),
+            ),
+            (
+                "SELECT created_at, updated_at FROM highlights WHERE id = 'hl1'",
+                rfc3339_to_millis(hl_ts),
+            ),
+            (
+                "SELECT created_at, updated_at FROM translations WHERE id = 'tr1'",
+                rfc3339_to_millis(tr_ts),
+            ),
+            (
+                "SELECT created_at, updated_at FROM chat_messages WHERE id = 'm1'",
+                rfc3339_to_millis(msg_ts),
+            ),
         ] {
-            let (c, u): (i64, i64) = conn.query_row(sql, [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            let (c, u): (i64, i64) = conn
+                .query_row(sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap();
             assert_eq!(c, expected, "{sql}: created_at mismatch");
-            assert_eq!(u, expected, "{sql}: updated_at should equal created_at for append-only tables");
+            assert_eq!(
+                u, expected,
+                "{sql}: updated_at should equal created_at for append-only tables"
+            );
         }
     }
 
@@ -666,7 +752,8 @@ mod tests {
         conn.execute(
             "INSERT INTO collection_books (collection_id, book_id) VALUES ('c1', 'b1')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         let before_migrate_ms = chrono::Utc::now().timestamp_millis();
         Db::run_migrations_up_to(&conn, 9).unwrap();
@@ -677,8 +764,14 @@ mod tests {
             [], |r| Ok((r.get(0)?, r.get(1)?)),
         ).unwrap();
         // Backfilled with migration time — within the bracket [before, after].
-        assert!(c >= before_migrate_ms - 1000 && c <= after_migrate_ms + 1000, "created_at {c} not in bracket");
-        assert!(u >= before_migrate_ms - 1000 && u <= after_migrate_ms + 1000, "updated_at {u} not in bracket");
+        assert!(
+            c >= before_migrate_ms - 1000 && c <= after_migrate_ms + 1000,
+            "created_at {c} not in bracket"
+        );
+        assert!(
+            u >= before_migrate_ms - 1000 && u <= after_migrate_ms + 1000,
+            "updated_at {u} not in bracket"
+        );
     }
 
     #[test]
@@ -708,12 +801,20 @@ mod tests {
 
         Db::run_migrations_up_to(&conn, 9).unwrap();
 
-        let nr1: Option<i64> = conn.query_row(
-            "SELECT next_review_at FROM vocab_words WHERE id = 'v1'", [], |r| r.get(0),
-        ).unwrap();
-        let nr2: Option<i64> = conn.query_row(
-            "SELECT next_review_at FROM vocab_words WHERE id = 'v2'", [], |r| r.get(0),
-        ).unwrap();
+        let nr1: Option<i64> = conn
+            .query_row(
+                "SELECT next_review_at FROM vocab_words WHERE id = 'v1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let nr2: Option<i64> = conn
+            .query_row(
+                "SELECT next_review_at FROM vocab_words WHERE id = 'v2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(nr1, Some(rfc3339_to_millis(nr_ts)));
         assert_eq!(nr2, None);
     }
@@ -736,7 +837,8 @@ mod tests {
             conn.execute(
                 "INSERT INTO bookmarks (id, book_id, cfi, created_at) VALUES (?1, 'b0', 'cfi', ?2)",
                 params![format!("bm{i}"), ts],
-            ).unwrap();
+            )
+            .unwrap();
         }
         for i in 0..4 {
             conn.execute(
@@ -754,8 +856,15 @@ mod tests {
         ).unwrap();
 
         let counts_before: Vec<(String, i64)> = [
-            "books", "bookmarks", "highlights", "collections", "collection_books",
-            "vocab_words", "chats", "chat_messages", "translations",
+            "books",
+            "bookmarks",
+            "highlights",
+            "collections",
+            "collection_books",
+            "vocab_words",
+            "chats",
+            "chat_messages",
+            "translations",
         ]
         .iter()
         .map(|t| {
@@ -779,7 +888,9 @@ mod tests {
         // FK integrity post-migration.
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         let violations: i64 = conn
-            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(violations, 0, "foreign key violations after migration");
     }
@@ -795,7 +906,8 @@ mod tests {
     fn test_migration_011_backfills_updated_by_device_and_creates_outbox() {
         let dir = TempDir::new().unwrap();
         let conn = Connection::open(dir.path().join("quill.db")).unwrap();
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+            .unwrap();
         Db::run_migrations_up_to(&conn, 10).unwrap();
 
         let ts = chrono::Utc::now().timestamp_millis();
@@ -818,7 +930,8 @@ mod tests {
             "INSERT INTO highlights (id, book_id, cfi_range, color, created_at, updated_at)
              VALUES ('h1', 'b1', 'epubcfi(/6/4!/2)', 'yellow', ?1, ?1)",
             params![ts],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO vocab_words (id, book_id, word, definition, mastery, review_count, created_at, updated_at)
              VALUES ('v1', 'b1', 'serendipity', 'fortunate accident', 'new', 0, ?1, ?1)",
@@ -828,7 +941,8 @@ mod tests {
             "INSERT INTO chats (id, book_id, title, pinned, created_at, updated_at)
              VALUES ('ch1', 'b1', 'New chat', 0, ?1, ?1)",
             params![ts],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Apply migration 011.
         Db::run_migrations_up_to(&conn, 11).unwrap();
@@ -855,12 +969,15 @@ mod tests {
         assert!(err.is_err(), "NULL into NOT NULL column should fail");
 
         // _pending_publish exists and is empty.
-        let outbox_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM _pending_publish", [], |r| r.get(0)).unwrap();
+        let outbox_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _pending_publish", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(outbox_count, 0);
 
         // schema_version advanced.
-        let v: i64 = conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0)).unwrap();
+        let v: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, 11);
     }
 
@@ -884,14 +1001,23 @@ mod tests {
         ).unwrap();
 
         let result = Db::run_migrations_up_to(&conn, 9);
-        assert!(result.is_err(), "migration should fail on malformed timestamp");
+        assert!(
+            result.is_err(),
+            "migration should fail on malformed timestamp"
+        );
 
         // Schema is unchanged: created_at is still TEXT, both rows still present.
-        let ty: String = conn.query_row(
-            "SELECT type FROM pragma_table_info('books') WHERE name = 'created_at'",
-            [], |r| r.get(0),
-        ).unwrap();
-        assert_eq!(ty, "TEXT", "books.created_at should still be TEXT after rollback");
+        let ty: String = conn
+            .query_row(
+                "SELECT type FROM pragma_table_info('books') WHERE name = 'created_at'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ty, "TEXT",
+            "books.created_at should still be TEXT after rollback"
+        );
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0))
@@ -902,6 +1028,9 @@ mod tests {
         let v: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 8, "schema_version should not advance on failed migration");
+        assert_eq!(
+            v, 8,
+            "schema_version should not advance on failed migration"
+        );
     }
 }

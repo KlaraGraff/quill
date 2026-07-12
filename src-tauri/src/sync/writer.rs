@@ -58,11 +58,13 @@
 //! `log` separately based on whether the sync engine actually booted.
 //! Commands don't branch on either — the closure is identical.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc, Arc, Condvar, Mutex,
 };
 
 /// Channel-message shape for the `cover-writer` background thread:
@@ -70,6 +72,7 @@ use std::sync::{
 /// `type_complexity` lint isn't tripped by the inline tuple.
 type CoverTx = mpsc::Sender<(PathBuf, Vec<u8>)>;
 
+use fs2::FileExt;
 use rusqlite::{params, Transaction};
 
 use crate::db::Db;
@@ -83,6 +86,62 @@ use super::replay;
 /// before the second one is allowed through. See the throttle discussion
 /// in the module docstring.
 const PROGRESS_THROTTLE_MS: i64 = 2_000;
+
+thread_local! {
+    static MUTATION_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+#[derive(Default)]
+struct GateState {
+    active_mutations: usize,
+    transitioning: bool,
+}
+
+#[derive(Default)]
+struct TransitionGate {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+pub struct MutationGuard<'a> {
+    gate: &'a TransitionGate,
+    outermost: bool,
+    // Keep the file descriptor alive for the full operation. Its shared
+    // advisory lock coordinates this process with `quill mcp` subprocesses.
+    _process_lock: Option<File>,
+}
+
+pub struct TransitionGuard<'a> {
+    gate: &'a TransitionGate,
+    // An exclusive advisory lock blocks MCP writes while blob roots or sync
+    // publication state are being transitioned.
+    _process_lock: Option<File>,
+}
+
+impl Drop for MutationGuard<'_> {
+    fn drop(&mut self) {
+        let remaining = MUTATION_DEPTH.with(|depth| {
+            let remaining = depth.get().saturating_sub(1);
+            depth.set(remaining);
+            remaining
+        });
+        if self.outermost && remaining == 0 {
+            if let Ok(mut state) = self.gate.state.lock() {
+                state.active_mutations = state.active_mutations.saturating_sub(1);
+                self.gate.changed.notify_all();
+            }
+        }
+    }
+}
+
+impl Drop for TransitionGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.gate.state.lock() {
+            state.transitioning = false;
+            self.gate.changed.notify_all();
+        }
+    }
+}
 
 pub struct SyncWriter {
     /// UUID of this device. Stamped into LWW row writes via the closure
@@ -119,6 +178,11 @@ pub struct SyncWriter {
     /// worker coalesces a burst of signals into a single drain. Mirrors
     /// `cover_tx`'s lifecycle (set on boot/enable, cleared on disable).
     flush_tx: Mutex<Option<mpsc::Sender<()>>>,
+    transition_gate: TransitionGate,
+    /// Optional local lock file shared by the desktop process and MCP
+    /// subprocesses. This must stay under the local application directory,
+    /// never the movable iCloud blob root.
+    process_lock_path: Mutex<Option<PathBuf>>,
 }
 
 impl SyncWriter {
@@ -131,15 +195,52 @@ impl SyncWriter {
             flush_inline_for_tests: AtomicBool::new(false),
             cover_tx: Mutex::new(None),
             flush_tx: Mutex::new(None),
+            transition_gate: TransitionGate::default(),
+            process_lock_path: Mutex::new(None),
         }
+    }
+
+    /// Configure the local cross-process transition lock. Call this once
+    /// after resolving the application's local data directory, before this
+    /// writer accepts mutations.
+    pub fn set_process_lock_path(&self, path: PathBuf) {
+        *self
+            .process_lock_path
+            .lock()
+            .expect("process_lock_path mutex") = Some(path);
+    }
+
+    fn acquire_process_lock(&self, exclusive: bool) -> AppResult<Option<File>> {
+        let path = self
+            .process_lock_path
+            .lock()
+            .map_err(|e| AppError::Other(format!("sync process lock path: {e}")))?
+            .clone();
+        let Some(path) = path else {
+            return Ok(None);
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        if exclusive {
+            file.lock_exclusive()?;
+        } else {
+            file.lock_shared()?;
+        }
+        Ok(Some(file))
     }
 
     /// Test-only: force `with_tx`'s Phase 2 flush to run inline on the
     /// caller's thread. Production code never calls this.
     #[cfg(test)]
     pub fn set_flush_inline_for_tests(&self, on: bool) {
-        self.flush_inline_for_tests
-            .store(on, Ordering::SeqCst);
+        self.flush_inline_for_tests.store(on, Ordering::SeqCst);
     }
 
     pub fn self_device(&self) -> &str {
@@ -236,7 +337,9 @@ impl SyncWriter {
         if !self.should_queue.load(Ordering::SeqCst) {
             return;
         }
-        let Ok(data_dir) = db.data_dir.lock() else { return };
+        let Ok(data_dir) = db.data_dir.lock() else {
+            return;
+        };
         let path = data_dir.join("covers").join(format!("{book_id}.img"));
         if let Ok(guard) = self.cover_tx.lock() {
             if let Some(tx) = guard.as_ref() {
@@ -250,10 +353,14 @@ impl SyncWriter {
     /// missing files to the cover-writer thread. Only needed when
     /// upgrading from schema <13 (before covers-in-db existed).
     pub fn backfill_cover_files(&self, db: &crate::db::Db) {
-        let Ok(data_dir) = db.data_dir.lock() else { return };
+        let Ok(data_dir) = db.data_dir.lock() else {
+            return;
+        };
         let covers_dir = data_dir.join("covers");
 
-        let Ok(conn) = db.read_conn.lock() else { return };
+        let Ok(conn) = db.read_conn.lock() else {
+            return;
+        };
         let Ok(mut stmt) = conn.prepare(
             "SELECT id, cover_data FROM books WHERE cover_data IS NOT NULL AND LENGTH(cover_data) > 0",
         ) else { return };
@@ -266,7 +373,9 @@ impl SyncWriter {
         drop(stmt);
         drop(conn);
 
-        let Ok(guard) = self.cover_tx.lock() else { return };
+        let Ok(guard) = self.cover_tx.lock() else {
+            return;
+        };
         let Some(tx) = guard.as_ref() else { return };
 
         let mut queued = 0usize;
@@ -285,10 +394,97 @@ impl SyncWriter {
     /// Test/probe accessor — `true` when an `EventLog` is wired up
     /// (i.e. the post-commit flush will run, not just the queue write).
     pub fn is_sync_enabled(&self) -> bool {
-        self.log
+        self.log.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    /// Hold across an entire mutation when it performs filesystem work before
+    /// entering `with_tx` (notably book imports). Nested guards on the same
+    /// thread are coalesced, so `with_tx` can always protect itself as well.
+    pub fn mutation_guard(&self) -> AppResult<MutationGuard<'_>> {
+        let nested = MUTATION_DEPTH.with(|depth| {
+            let current = depth.get();
+            depth.set(current + 1);
+            current > 0
+        });
+        if nested {
+            return Ok(MutationGuard {
+                gate: &self.transition_gate,
+                outermost: false,
+                _process_lock: None,
+            });
+        }
+
+        loop {
+            let mut state = self
+                .transition_gate
+                .state
+                .lock()
+                .map_err(|e| AppError::Other(format!("sync transition gate: {e}")))?;
+            while state.transitioning {
+                state = self
+                    .transition_gate
+                    .changed
+                    .wait(state)
+                    .map_err(|e| AppError::Other(format!("sync transition gate: {e}")))?;
+            }
+            drop(state);
+
+            // Another process can be transitioning even when this writer's
+            // in-memory gate is idle. Acquire the shared file lock before
+            // declaring this mutation active locally, then re-check because
+            // a local transition could have started while we were blocked.
+            let process_lock = self.acquire_process_lock(false)?;
+            let mut state = self
+                .transition_gate
+                .state
+                .lock()
+                .map_err(|e| AppError::Other(format!("sync transition gate: {e}")))?;
+            if state.transitioning {
+                drop(state);
+                drop(process_lock);
+                continue;
+            }
+            state.active_mutations += 1;
+            return Ok(MutationGuard {
+                gate: &self.transition_gate,
+                outermost: true,
+                _process_lock: process_lock,
+            });
+        }
+    }
+
+    /// Exclusively freeze mutations while sync changes blob roots or publishes
+    /// a bootstrap snapshot. The returned guard contains no OS mutex guard and
+    /// is therefore safe to retain across the async copy-back operation.
+    pub fn begin_transition(&self) -> AppResult<TransitionGuard<'_>> {
+        let mut state = self
+            .transition_gate
+            .state
             .lock()
-            .map(|g| g.is_some())
-            .unwrap_or(false)
+            .map_err(|e| AppError::Other(format!("sync transition gate: {e}")))?;
+        while state.transitioning || state.active_mutations > 0 {
+            state = self
+                .transition_gate
+                .changed
+                .wait(state)
+                .map_err(|e| AppError::Other(format!("sync transition gate: {e}")))?;
+        }
+        state.transitioning = true;
+        drop(state);
+
+        match self.acquire_process_lock(true) {
+            Ok(process_lock) => Ok(TransitionGuard {
+                gate: &self.transition_gate,
+                _process_lock: process_lock,
+            }),
+            Err(error) => {
+                if let Ok(mut state) = self.transition_gate.state.lock() {
+                    state.transitioning = false;
+                    self.transition_gate.changed.notify_all();
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Run `f` inside a SQL transaction; queue any events the closure
@@ -314,6 +510,7 @@ impl SyncWriter {
     where
         F: FnOnce(&Transaction, &mut Vec<EventBody>) -> AppResult<R>,
     {
+        let _mutation = self.mutation_guard()?;
         // Snapshot the log handle once. Holding the log mutex across the
         // SQL transaction would serialize every writer; cloning the Arc
         // and dropping the lock keeps writers parallel.
@@ -349,9 +546,8 @@ impl SyncWriter {
                 // would be silently lost.
                 for body in &events {
                     let id = uuid::Uuid::new_v4().to_string();
-                    let body_json = serde_json::to_string(body).map_err(|e| {
-                        AppError::Other(format!("event serialize: {e}"))
-                    })?;
+                    let body_json = serde_json::to_string(body)
+                        .map_err(|e| AppError::Other(format!("event serialize: {e}")))?;
                     tx.execute(
                         "INSERT INTO _pending_publish (id, ts, body_json, created_at)
                          VALUES (?1, ?2, ?3, ?2)",
@@ -445,7 +641,9 @@ mod tests {
     }
 
     fn enable_sync(writer: &SyncWriter, dir: &std::path::Path) -> Arc<EventLog> {
-        let log_path = dir.join("logs").join(format!("{}.jsonl", writer.self_device()));
+        let log_path = dir
+            .join("logs")
+            .join(format!("{}.jsonl", writer.self_device()));
         let log = Arc::new(EventLog::open(&log_path, writer.self_device(), false).unwrap());
         writer.set_should_queue(true);
         writer.set_log(Some(log.clone()));
@@ -463,7 +661,8 @@ mod tests {
     }
 
     fn book_count(conn: &Connection) -> i64 {
-        conn.query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0)).unwrap()
+        conn.query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0))
+            .unwrap()
     }
 
     fn import_body(id: &str) -> EventBody {
@@ -475,6 +674,11 @@ mod tests {
             cover_path: None,
             file_path: format!("books/{id}.epub"),
             format: "epub".into(),
+            source_format: None,
+            render_format: None,
+            source_file_path: None,
+            source_sha256: None,
+            conversion_version: 0,
             genre: None,
             pages: Some(100),
         })
@@ -508,7 +712,11 @@ mod tests {
 
         let conn = db.conn.lock().unwrap();
         assert_eq!(book_count(&conn), 1);
-        assert_eq!(outbox_count(&conn), 0, "outbox stays empty when sync is off");
+        assert_eq!(
+            outbox_count(&conn),
+            0,
+            "outbox stays empty when sync is off"
+        );
     }
 
     #[test]
@@ -524,6 +732,38 @@ mod tests {
 
         let conn = db.conn.lock().unwrap();
         assert_eq!(book_count(&conn), 0, "tx must roll back on closure error");
+    }
+
+    #[test]
+    fn process_lock_blocks_an_independent_writer_during_transition() {
+        let (dir, _db) = setup_db();
+        let lock_path = dir.path().join(".sync-transition.lock");
+        let transition_writer = Arc::new(SyncWriter::new("desktop".into()));
+        let mutation_writer = Arc::new(SyncWriter::new("mcp".into()));
+        transition_writer.set_process_lock_path(lock_path.clone());
+        mutation_writer.set_process_lock_path(lock_path);
+
+        let transition = transition_writer.begin_transition().unwrap();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let mutation_writer_for_thread = Arc::clone(&mutation_writer);
+        let waiter = std::thread::spawn(move || {
+            let guard = mutation_writer_for_thread.mutation_guard().unwrap();
+            acquired_tx.send(()).unwrap();
+            drop(guard);
+        });
+
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "an independent writer must wait while a transition holds the exclusive lock",
+        );
+        drop(transition);
+
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("waiting writer should proceed after transition releases the lock");
+        waiter.join().unwrap();
     }
 
     // -------- behaviour with sync ENABLED --------
@@ -544,7 +784,11 @@ mod tests {
 
         let conn = db.conn.lock().unwrap();
         assert_eq!(book_count(&conn), 1);
-        assert_eq!(outbox_count(&conn), 0, "post-commit flush should drain the outbox");
+        assert_eq!(
+            outbox_count(&conn),
+            0,
+            "post-commit flush should drain the outbox"
+        );
 
         let events = log.read_all().unwrap();
         assert_eq!(events.len(), 1);
@@ -591,7 +835,9 @@ mod tests {
 
         let conn = db.conn.lock().unwrap();
         let updated_at: i64 = conn
-            .query_row("SELECT updated_at FROM books WHERE id = 'b1'", [], |r| r.get(0))
+            .query_row("SELECT updated_at FROM books WHERE id = 'b1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(
             updated_at, caller_ts,
@@ -690,7 +936,10 @@ mod tests {
         let writer = SyncWriter::new("dev-A".into());
         // Migration is complete (queue) but engine couldn't boot (no log).
         writer.set_should_queue(true);
-        assert!(!writer.is_sync_enabled(), "is_sync_enabled tracks the log, not should_queue");
+        assert!(
+            !writer.is_sync_enabled(),
+            "is_sync_enabled tracks the log, not should_queue"
+        );
 
         writer
             .with_tx(&db, 1_000, |tx, events| {
@@ -745,12 +994,18 @@ mod tests {
             .unwrap();
 
         let conn = db.conn.lock().unwrap();
-        assert_eq!(outbox_count(&conn), 0, "post-commit flush should drain everything");
+        assert_eq!(
+            outbox_count(&conn),
+            0,
+            "post-commit flush should drain everything"
+        );
         let log_events = log.read_all().unwrap();
         // The queue-only event from phase 1 reaches peers via this
         // launch's drain.
         assert!(
-            log_events.iter().any(|e| matches!(e.body, EventBody::BookImport(_))),
+            log_events
+                .iter()
+                .any(|e| matches!(e.body, EventBody::BookImport(_))),
             "phase 1's BookImport must reach the log on phase 2's boot drain"
         );
     }
@@ -790,7 +1045,10 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(drained, "flush worker should drain the outbox after a with_tx signal");
+        assert!(
+            drained,
+            "flush worker should drain the outbox after a with_tx signal"
+        );
         assert_eq!(
             log.read_all().unwrap().len(),
             1,

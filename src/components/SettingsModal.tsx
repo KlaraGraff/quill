@@ -156,7 +156,7 @@ export default function SettingsModal({ open, onClose, initialSection = "general
                     : "text-text-muted/40 cursor-default"
                 }`}
               >
-                Save
+                {t("common.save")}
               </button>
             )}
             <button

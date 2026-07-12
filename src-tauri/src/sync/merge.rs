@@ -35,24 +35,23 @@ use super::events::{
 /// Fold `event` into `tx`. Idempotent — applying the same event twice is a
 /// no-op (LWW equality and `INSERT OR IGNORE` both short-circuit).
 pub fn apply_event(tx: &Transaction, event: &Event) -> AppResult<()> {
+    super::validation::validate_event(event, &event.device)?;
     match &event.body {
         EventBody::BookImport(p) => apply_book_import(tx, event, p),
         EventBody::BookDelete { id } => apply_book_delete(tx, event, id),
-        EventBody::BookProgressSet { book, progress, cfi } => {
-            apply_book_progress(tx, event, book, *progress, cfi.as_deref())
-        }
-        EventBody::BookStatusSet { book, status } => {
-            apply_book_status(tx, event, book, status)
-        }
+        EventBody::BookProgressSet {
+            book,
+            progress,
+            cfi,
+        } => apply_book_progress(tx, event, book, *progress, cfi.as_deref()),
+        EventBody::BookStatusSet { book, status } => apply_book_status(tx, event, book, status),
         EventBody::BookMetadataSet { book, field, value } => {
             apply_book_metadata(tx, event, book, field, value)
         }
 
         EventBody::HighlightAdd(p) => apply_highlight_add(tx, event, p),
         EventBody::HighlightDelete { id } => apply_highlight_delete(tx, event, id),
-        EventBody::HighlightColorSet { id, color } => {
-            apply_highlight_color(tx, event, id, color)
-        }
+        EventBody::HighlightColorSet { id, color } => apply_highlight_color(tx, event, id, color),
         EventBody::HighlightNoteSet { id, note } => {
             apply_highlight_note(tx, event, id, note.as_deref())
         }
@@ -66,14 +65,37 @@ pub fn apply_event(tx: &Transaction, event: &Event) -> AppResult<()> {
             mastery,
             next_review_at,
             review_count,
-        } => apply_vocab_mastery(tx, event, id, mastery, *next_review_at, *review_count),
+            review_interval_days,
+            last_reviewed_at,
+            last_review_rating,
+            fsrs_stability,
+            fsrs_difficulty,
+            fsrs_version,
+        } => apply_vocab_mastery(
+            tx,
+            event,
+            id,
+            VocabMasteryUpdate {
+                mastery,
+                next_review_at: *next_review_at,
+                review_count: *review_count,
+                review_interval_days: *review_interval_days,
+                last_reviewed_at: *last_reviewed_at,
+                last_review_rating: last_review_rating.as_deref(),
+                fsrs_stability: *fsrs_stability,
+                fsrs_difficulty: *fsrs_difficulty,
+                fsrs_version: *fsrs_version,
+            },
+        ),
         EventBody::VocabDelete { id } => apply_vocab_delete(tx, event, id),
 
         EventBody::TranslationAdd(_) | EventBody::TranslationDelete { .. } => Ok(()),
 
-        EventBody::CollectionCreate { id, name, sort_order } => {
-            apply_collection_create(tx, event, id, name, *sort_order)
-        }
+        EventBody::CollectionCreate {
+            id,
+            name,
+            sort_order,
+        } => apply_collection_create(tx, event, id, name, *sort_order),
         EventBody::CollectionRename { id, name } => apply_collection_rename(tx, event, id, name),
         EventBody::CollectionReorder { id, sort_order } => {
             apply_collection_reorder(tx, event, id, *sort_order)
@@ -86,9 +108,12 @@ pub fn apply_event(tx: &Transaction, event: &Event) -> AppResult<()> {
             apply_collection_book_remove(tx, event, collection, book)
         }
 
-        EventBody::ChatCreate { id, book, title, model } => {
-            apply_chat_create(tx, event, id, book, title, model.as_deref())
-        }
+        EventBody::ChatCreate {
+            id,
+            book,
+            title,
+            model,
+        } => apply_chat_create(tx, event, id, book, title, model.as_deref()),
         EventBody::ChatRename { id, title } => apply_chat_rename(tx, event, id, title),
         EventBody::ChatDelete { id } => apply_chat_delete(tx, event, id),
         EventBody::ChatMessageAdd(p) => apply_chat_message_add(tx, event, p),
@@ -211,6 +236,7 @@ fn cascade_delete_book(tx: &Transaction, id: &str, ts: i64) -> AppResult<()> {
     tx.execute("DELETE FROM bookmarks WHERE book_id = ?1", params![id])?;
     tx.execute("DELETE FROM highlights WHERE book_id = ?1", params![id])?;
     tx.execute("DELETE FROM vocab_words WHERE book_id = ?1", params![id])?;
+    tx.execute("DELETE FROM lookup_records WHERE book_id = ?1", params![id])?;
     tx.execute(
         "DELETE FROM collection_books WHERE book_id = ?1",
         params![id],
@@ -275,8 +301,8 @@ fn apply_book_import(tx: &Transaction, event: &Event, p: &BookImportPayload) -> 
     tx.execute(
         "INSERT OR IGNORE INTO books
          (id, title, author, description, cover_path, file_path, genre, pages,
-          format, status, progress, current_cfi, created_at, updated_at, updated_by_device)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'unread', 0, NULL, ?10, ?10, ?11)",
+          format, source_format, render_format, source_file_path, source_sha256, conversion_version, status, progress, current_cfi, created_at, updated_at, updated_by_device)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'unread', 0, NULL, ?15, ?15, ?16)",
         params![
             p.id,
             p.title,
@@ -287,6 +313,11 @@ fn apply_book_import(tx: &Transaction, event: &Event, p: &BookImportPayload) -> 
             p.genre,
             p.pages,
             p.format,
+            p.source_format.as_deref().unwrap_or(&p.format),
+            p.render_format.as_deref().unwrap_or(&p.format),
+            p.source_file_path,
+            p.source_sha256,
+            p.conversion_version,
             event.ts,
             event.device,
         ],
@@ -371,10 +402,7 @@ fn apply_book_metadata(
                 )));
             }
         };
-        tx.execute(
-            &sql,
-            params![int_val, event.ts, event.device, book],
-        )?;
+        tx.execute(&sql, params![int_val, event.ts, event.device, book])?;
     } else {
         let str_val: Option<String> = match value {
             Value::Null => None,
@@ -385,10 +413,7 @@ fn apply_book_metadata(
                 )));
             }
         };
-        tx.execute(
-            &sql,
-            params![str_val, event.ts, event.device, book],
-        )?;
+        tx.execute(&sql, params![str_val, event.ts, event.device, book])?;
     }
     Ok(())
 }
@@ -493,8 +518,10 @@ fn apply_vocab_add(tx: &Transaction, event: &Event, p: &VocabPayload) -> AppResu
         "INSERT OR IGNORE INTO vocab_words
          (id, book_id, word, definition, context_sentence, context_explanation, cfi,
           mastery, review_count, next_review_at,
+          review_interval_days, last_reviewed_at, last_review_rating,
+          fsrs_stability, fsrs_difficulty, fsrs_version,
           created_at, updated_at, updated_by_device)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             p.id,
             p.book_id,
@@ -506,6 +533,13 @@ fn apply_vocab_add(tx: &Transaction, event: &Event, p: &VocabPayload) -> AppResu
             p.mastery,
             p.review_count,
             p.next_review_at,
+            p.review_interval_days,
+            p.last_reviewed_at,
+            p.last_review_rating,
+            p.fsrs_stability,
+            p.fsrs_difficulty,
+            p.fsrs_version,
+            p.created_at.unwrap_or(event.ts),
             event.ts,
             event.device,
         ],
@@ -513,24 +547,53 @@ fn apply_vocab_add(tx: &Transaction, event: &Event, p: &VocabPayload) -> AppResu
     Ok(())
 }
 
+struct VocabMasteryUpdate<'a> {
+    mastery: &'a str,
+    next_review_at: Option<i64>,
+    review_count: i64,
+    review_interval_days: i64,
+    last_reviewed_at: Option<i64>,
+    last_review_rating: Option<&'a str>,
+    fsrs_stability: Option<f64>,
+    fsrs_difficulty: Option<f64>,
+    fsrs_version: i64,
+}
+
 fn apply_vocab_mastery(
     tx: &Transaction,
     event: &Event,
     id: &str,
-    mastery: &str,
-    next_review_at: Option<i64>,
-    review_count: i64,
+    update: VocabMasteryUpdate<'_>,
 ) -> AppResult<()> {
     tx.execute(
         "UPDATE vocab_words
          SET mastery = ?1,
              next_review_at = ?2,
              review_count = ?3,
-             updated_at = ?4,
-             updated_by_device = ?5
-         WHERE id = ?6
-           AND (updated_at < ?4 OR (updated_at = ?4 AND updated_by_device < ?5))",
-        params![mastery, next_review_at, review_count, event.ts, event.device, id],
+             review_interval_days = ?4,
+             last_reviewed_at = ?5,
+             last_review_rating = ?6,
+             fsrs_stability = ?7,
+             fsrs_difficulty = ?8,
+             fsrs_version = ?9,
+             updated_at = ?10,
+             updated_by_device = ?11
+         WHERE id = ?12
+           AND (updated_at < ?10 OR (updated_at = ?10 AND updated_by_device < ?11))",
+        params![
+            update.mastery,
+            update.next_review_at,
+            update.review_count,
+            update.review_interval_days,
+            update.last_reviewed_at,
+            update.last_review_rating,
+            update.fsrs_stability,
+            update.fsrs_difficulty,
+            update.fsrs_version,
+            event.ts,
+            event.device,
+            id
+        ],
     )?;
     Ok(())
 }
@@ -712,15 +775,7 @@ fn apply_chat_message_add(
         "INSERT OR IGNORE INTO chat_messages
          (id, chat_id, role, content, context, metadata, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-        params![
-            p.id,
-            p.chat_id,
-            p.role,
-            p.content,
-            p.context,
-            p.metadata,
-            event.ts,
-        ],
+        params![p.id, p.chat_id, p.role, p.content, p.context, p.metadata, event.ts,],
     )?;
     // Mirror the live `add_chat_message` command's side effect — the parent
     // chat's recency drives chat-list ordering, so peers must see the bump
@@ -785,6 +840,11 @@ mod tests {
             cover_path: None,
             file_path: format!("books/{id}.epub"),
             format: "epub".into(),
+            source_format: None,
+            render_format: None,
+            source_file_path: None,
+            source_sha256: None,
+            conversion_version: 0,
             genre: None,
             pages: Some(100),
         })
@@ -808,10 +868,7 @@ mod tests {
     #[test]
     fn book_import_inserts_with_event_metadata() {
         let mut db = open_db();
-        apply_all(
-            &mut db,
-            &[ev(1000, "dev-A", import_book("b1"))],
-        );
+        apply_all(&mut db, &[ev(1000, "dev-A", import_book("b1"))]);
 
         let (title, ts, dev): (String, i64, String) = db
             .query_row(
@@ -837,13 +894,16 @@ mod tests {
         );
 
         let n: i64 = db
-            .query_row("SELECT COUNT(*) FROM books WHERE id = 'b1'", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM books WHERE id = 'b1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(n, 0);
         let tomb: i64 = db
             .query_row(
                 "SELECT COUNT(*) FROM _tombstones WHERE entity = 'book' AND id = 'b1'",
-                [], |r| r.get(0),
+                [],
+                |r| r.get(0),
             )
             .unwrap();
         assert_eq!(tomb, 1);
@@ -862,7 +922,9 @@ mod tests {
             ],
         );
         let n: i64 = db
-            .query_row("SELECT COUNT(*) FROM books WHERE id = 'b1'", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM books WHERE id = 'b1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(n, 0, "tombstone should block re-import even at higher ts");
     }
@@ -959,7 +1021,8 @@ mod tests {
             let (p, cfi): (i32, String) = db
                 .query_row(
                     "SELECT progress, current_cfi FROM books WHERE id = 'b1'",
-                    [], |r| Ok((r.get(0)?, r.get(1)?)),
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .unwrap();
             assert_eq!(p, 80);
@@ -997,7 +1060,8 @@ mod tests {
         let (status, dev): (String, String) = db
             .query_row(
                 "SELECT status, updated_by_device FROM books WHERE id = 'b1'",
-                [], |r| Ok((r.get(0)?, r.get(1)?)),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
         assert_eq!(status, "finished", "dev-B > dev-A in tuple compare");
@@ -1060,7 +1124,9 @@ mod tests {
             ],
         );
         let color: String = db
-            .query_row("SELECT color FROM highlights WHERE id = 'h1'", [], |r| r.get(0))
+            .query_row("SELECT color FROM highlights WHERE id = 'h1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(color, "pink", "older color event must lose");
     }
@@ -1086,6 +1152,13 @@ mod tests {
                         mastery: "new".into(),
                         review_count: 0,
                         next_review_at: None,
+                        review_interval_days: 0,
+                        last_reviewed_at: None,
+                        last_review_rating: None,
+                        fsrs_stability: None,
+                        fsrs_difficulty: None,
+                        fsrs_version: 1,
+                        created_at: None,
                     }),
                 ),
                 ev(
@@ -1096,6 +1169,12 @@ mod tests {
                         mastery: "learning".into(),
                         next_review_at: Some(2_000_000),
                         review_count: 1,
+                        review_interval_days: 1,
+                        last_reviewed_at: Some(1200),
+                        last_review_rating: Some("hard".into()),
+                        fsrs_stability: None,
+                        fsrs_difficulty: None,
+                        fsrs_version: 1,
                     },
                 ),
                 ev(
@@ -1106,6 +1185,12 @@ mod tests {
                         mastery: "learning".into(),
                         next_review_at: Some(3_000_000),
                         review_count: 2,
+                        review_interval_days: 2,
+                        last_reviewed_at: Some(1300),
+                        last_review_rating: Some("good".into()),
+                        fsrs_stability: None,
+                        fsrs_difficulty: None,
+                        fsrs_version: 1,
                     },
                 ),
             ],
@@ -1113,7 +1198,8 @@ mod tests {
         let (m, n): (String, i64) = db
             .query_row(
                 "SELECT mastery, review_count FROM vocab_words WHERE id = 'v1'",
-                [], |r| Ok((r.get(0)?, r.get(1)?)),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
         assert_eq!(m, "learning");
@@ -1333,7 +1419,9 @@ mod tests {
         );
         // No panic, no crash; row's updated_at is unchanged from the import.
         let ts: i64 = db
-            .query_row("SELECT updated_at FROM books WHERE id = 'b1'", [], |r| r.get(0))
+            .query_row("SELECT updated_at FROM books WHERE id = 'b1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(ts, 1000);
     }
@@ -1438,7 +1526,8 @@ mod tests {
         let (chat_ts, by): (i64, String) = db
             .query_row(
                 "SELECT updated_at, updated_by_device FROM chats WHERE id = 'ch1'",
-                [], |r| Ok((r.get(0)?, r.get(1)?)),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
         assert_eq!(chat_ts, 5000, "message ts should bump parent chat");
@@ -1487,10 +1576,9 @@ mod tests {
             ],
         );
         let chat_ts: i64 = db
-            .query_row(
-                "SELECT updated_at FROM chats WHERE id = 'ch1'",
-                [], |r| r.get(0),
-            )
+            .query_row("SELECT updated_at FROM chats WHERE id = 'ch1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(chat_ts, 10_000, "older message must not drag chat backward");
     }
@@ -1528,10 +1616,9 @@ mod tests {
             ],
         );
         let (title, author): (String, String) = db
-            .query_row(
-                "SELECT title, author FROM books WHERE id = 'b1'",
-                [], |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_row("SELECT title, author FROM books WHERE id = 'b1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
         assert_eq!(title, "New Title", "first metadata.set must land");
         assert_eq!(author, "New Author", "second metadata.set must also land");
@@ -1734,14 +1821,20 @@ mod tests {
             )],
         );
         let n_chats: i64 = db
-            .query_row("SELECT COUNT(*) FROM chats WHERE id = 'ch1'", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM chats WHERE id = 'ch1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(n_chats, 0, "chat.create must be suppressed by book tombstone");
+        assert_eq!(
+            n_chats, 0,
+            "chat.create must be suppressed by book tombstone"
+        );
 
         let chat_tomb: i64 = db
             .query_row(
                 "SELECT COUNT(*) FROM _tombstones WHERE entity = 'chat' AND id = 'ch1'",
-                [], |r| r.get(0),
+                [],
+                |r| r.get(0),
             )
             .unwrap();
         assert_eq!(
@@ -1808,15 +1901,17 @@ mod tests {
                         model: None,
                     },
                 ),
-                ev(DELETE_TS, "dev-B", EventBody::BookDelete { id: "b1".into() }),
+                ev(
+                    DELETE_TS,
+                    "dev-B",
+                    EventBody::BookDelete { id: "b1".into() },
+                ),
             ],
         );
 
         let rows: Vec<(String, i64)> = {
             let mut stmt = db
-                .prepare(
-                    "SELECT id, ts FROM _tombstones WHERE entity = 'chat' ORDER BY id",
-                )
+                .prepare("SELECT id, ts FROM _tombstones WHERE entity = 'chat' ORDER BY id")
                 .unwrap();
             stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
                 .unwrap()
@@ -1825,7 +1920,10 @@ mod tests {
         };
         assert_eq!(
             rows,
-            vec![("ch1".to_string(), DELETE_TS), ("ch2".to_string(), DELETE_TS)],
+            vec![
+                ("ch1".to_string(), DELETE_TS),
+                ("ch2".to_string(), DELETE_TS)
+            ],
             "cascaded chat tombstones must use the book.delete event ts"
         );
     }
@@ -1850,14 +1948,16 @@ mod tests {
         let before: (String, i64, String) = db
             .query_row(
                 "SELECT color, updated_at, updated_by_device FROM highlights WHERE id = 'h1'",
-                [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
         apply_all(&mut db, &events);
         let after: (String, i64, String) = db
             .query_row(
                 "SELECT color, updated_at, updated_by_device FROM highlights WHERE id = 'h1'",
-                [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
         assert_eq!(before, after);

@@ -14,11 +14,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
-use crate::icloud;
 use crate::sync::device::DeviceIdentity;
 use crate::sync::log::EventLog;
 use crate::sync::peers;
@@ -81,14 +80,12 @@ pub struct SyncStatus {
     /// publishing to the log, watcher is running). Not the same as
     /// "iCloud is signed in" — see `available`.
     pub enabled: bool,
-    /// True when this Mac currently has access to an iCloud container.
-    /// `enabled` requires `available` but not the other way around —
-    /// a migrated user with iCloud temporarily down has `enabled =
-    /// false, available = false, sync_enabled = true`.
+    /// True when a user-selected sync folder is recorded and writable.
     pub available: bool,
     /// True when the user has enabled iCloud sync via the settings toggle.
     pub sync_enabled: bool,
     pub shared_dir: Option<String>,
+    pub shared_dir_configured: bool,
     pub device_uuid: String,
     pub device_name: String,
     pub peers: Vec<PeerInfo>,
@@ -173,16 +170,15 @@ pub async fn sync_status(
 
     tokio::task::spawn_blocking(move || {
         let sync_enabled = sync::migration::is_sync_enabled(&local_dir);
-        let shared_dir = sync::migration::recorded_data_dir(&local_dir)
-            .or_else(icloud::icloud_data_dir);
-        let available = icloud::icloud_data_dir().is_some_and(|p| p.exists())
-            || icloud::is_icloud_available();
+        let shared_dir = sync::migration::recorded_data_dir(&local_dir);
+        let usable_shared_dir = sync::migration::recorded_usable_icloud_dir(&local_dir);
+        let available = usable_shared_dir.is_some();
 
         // Peer list + outbox count when the user has sync enabled (even
         // if the engine hasn't booted yet — e.g. during async boot or
         // offline queue-only mode). Skip when fully disabled.
         let (peer_infos, pending_events, last_replay_at) = if sync_enabled {
-            let peers = match shared_dir.as_ref() {
+            let peers = match usable_shared_dir.as_ref() {
                 Some(dir) => peers::list_peers(dir, &device_uuid).unwrap_or_else(|e| {
                     log::warn!("sync_status: list_peers failed: {e}");
                     Vec::new()
@@ -212,6 +208,7 @@ pub async fn sync_status(
             available,
             sync_enabled,
             shared_dir: shared_dir.map(|p| p.to_string_lossy().into_owned()),
+            shared_dir_configured: sync::migration::recorded_data_dir(&local_dir).is_some(),
             device_uuid,
             device_name: peers::device_name(),
             peers: peer_infos,
@@ -221,6 +218,39 @@ pub async fn sync_status(
     })
     .await
     .map_err(|e| AppError::Other(format!("sync_status worker failed: {e}")))?
+}
+
+#[tauri::command]
+pub fn sync_set_shared_dir(
+    path: String,
+    app: AppHandle,
+    local: State<'_, LocalDir>,
+    sync_state: State<'_, SyncState>,
+) -> AppResult<()> {
+    if sync_state.engine_snapshot()?.is_some() || sync::migration::is_sync_enabled(&local.0) {
+        return Err(AppError::Other(
+            "SYNC_FOLDER_CHANGE_REQUIRES_DISABLE".to_string(),
+        ));
+    }
+    let shared_dir = PathBuf::from(path);
+    if !shared_dir.is_dir() {
+        return Err(AppError::Other("SYNC_FOLDER_NOT_FOUND".to_string()));
+    }
+    if !sync::migration::is_icloud_drive_dir(&shared_dir) {
+        return Err(AppError::Other(
+            "SYNC_FOLDER_NOT_IN_ICLOUD_DRIVE".to_string(),
+        ));
+    }
+    if !sync::migration::is_writable_dir(&shared_dir) {
+        return Err(AppError::Other("SYNC_FOLDER_NOT_WRITABLE".to_string()));
+    }
+    app.asset_protocol_scope()
+        .allow_directory(&shared_dir, true)
+        .map_err(|error| AppError::Other(format!("SYNC_FOLDER_ASSET_ACCESS_FAILED: {error}")))?;
+    sync::migration::set_shared_dir(&local.0, &shared_dir)?;
+    app.emit("sync-status-changed", ())
+        .map_err(|error| AppError::Other(error.to_string()))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -236,6 +266,7 @@ pub fn sync_enable(
     if sync_state.engine_snapshot()?.is_some() {
         return Ok(());
     }
+    let _transition = sync_writer.begin_transition()?;
 
     // ---- Phase 1: fallible preparation with no durable state writes ----
     // Everything that can fail (iCloud discovery, snapshot generation,
@@ -244,14 +275,28 @@ pub fn sync_enable(
     // step below this line fails, the durable state is still "sync
     // off" and the user can retry with a clean slate.
 
-    let icloud_dir = icloud::icloud_data_dir()
-        .filter(|p| p.parent().is_some_and(|parent| parent.exists()))
-        .ok_or_else(|| AppError::Other("iCloud is not available — sign in to iCloud and try again".into()))?;
+    let icloud_dir = sync::migration::recorded_data_dir(&local.0)
+        .ok_or_else(|| AppError::Other("SYNC_FOLDER_NOT_CONFIGURED".to_string()))?;
+    if !icloud_dir.is_dir() {
+        return Err(AppError::Other("SYNC_FOLDER_NOT_FOUND".to_string()));
+    }
+    if !sync::migration::is_icloud_drive_dir(&icloud_dir) {
+        return Err(AppError::Other(
+            "SYNC_FOLDER_NOT_IN_ICLOUD_DRIVE".to_string(),
+        ));
+    }
+    if !sync::migration::is_writable_dir(&icloud_dir) {
+        return Err(AppError::Other("SYNC_FOLDER_NOT_WRITABLE".to_string()));
+    }
+    app.asset_protocol_scope()
+        .allow_directory(&icloud_dir, true)
+        .map_err(|error| AppError::Other(format!("SYNC_FOLDER_ASSET_ACCESS_FAILED: {error}")))?;
 
     fs::create_dir_all(icloud_dir.join("logs"))?;
     fs::create_dir_all(icloud_dir.join("devices"))?;
     fs::create_dir_all(icloud_dir.join("books"))?;
     fs::create_dir_all(icloud_dir.join("covers"))?;
+    fs::create_dir_all(icloud_dir.join("sources"))?;
 
     // Open the EventLog. `EventLog::open` touches the log file with
     // `create(true).append(true)` — technically a mutation, but an
@@ -308,7 +353,7 @@ pub fn sync_enable(
         chrono::Utc::now().timestamp_millis(),
     )?;
 
-    sync::migration::write_sync_settings(&local.0, Some(&icloud_dir))?;
+    sync::migration::set_sync_enabled(&local.0, true)?;
 
     {
         let mut data_dir = db
@@ -342,6 +387,7 @@ pub fn sync_enable(
     // retry too. PR #190's seventh review pass.
     move_dir_contents(&local.0.join("books"), &icloud_dir.join("books"))?;
     move_dir_contents(&local.0.join("covers"), &icloud_dir.join("covers"))?;
+    move_dir_contents(&local.0.join("sources"), &icloud_dir.join("sources"))?;
 
     // Move succeeded — wire the log so post-commit flushes drain to
     // peers, and store the engine + watcher in app state so the rest
@@ -393,9 +439,16 @@ pub async fn sync_disable(
     sync_writer: State<'_, SyncWriter>,
     sync_state: State<'_, SyncState>,
 ) -> AppResult<()> {
+    let _transition = sync_writer.begin_transition()?;
     let engine = sync_state.engine_snapshot()?;
     let local_dir = local.0.clone();
     log::info!("sync_disable: requested");
+
+    // Validate before touching the running engine. A temporarily unavailable
+    // selected folder must leave this session in its existing queue-only or
+    // active state, so the user can retry after iCloud is reachable again.
+    let ubiquity_dir = sync::migration::recorded_usable_icloud_dir(&local_dir)
+        .ok_or_else(|| AppError::Other("SYNC_FOLDER_NOT_WRITABLE".to_string()))?;
 
     // Stop new watcher ticks first, then cancel any tick already in
     // flight before joining the watcher thread.
@@ -430,26 +483,22 @@ pub async fn sync_disable(
     // session that thought sync was off while the marker stayed on,
     // which then silently re-enabled on the next launch.
 
-    let ubiquity_dir = sync::migration::recorded_data_dir(&local_dir)
-        .or_else(icloud::icloud_data_dir);
-    let copy_result = if let Some(ub) = ubiquity_dir.as_ref() {
-        log::info!("sync_disable: copy-back starting");
-        let app = app.clone();
-        let jobs = vec![
-            (ub.join("books"), local_dir.join("books")),
-            (ub.join("covers"), local_dir.join("covers")),
-        ];
+    log::info!("sync_disable: copy-back starting");
+    let app = app.clone();
+    let jobs = vec![
+        (ubiquity_dir.join("books"), local_dir.join("books")),
+        (ubiquity_dir.join("covers"), local_dir.join("covers")),
+        (ubiquity_dir.join("sources"), local_dir.join("sources")),
+    ];
+    let copy_result =
         tokio::task::spawn_blocking(move || copy_disable_files_with_progress(&app, &jobs))
             .await
-            .map_err(|e| AppError::Other(format!("sync_disable copy worker failed: {e}")))?
-    } else {
-        log::warn!("sync_disable: no iCloud shared dir resolved; skipping copy-back");
-        Ok(())
-    };
+            .map_err(|e| AppError::Other(format!("sync_disable copy worker failed: {e}")))?;
     if let Err(e) = copy_result {
         log::warn!("sync_disable: copy-back failed; keeping sync enabled: {e}");
         if had_watcher {
-            if let (Some(ub), Some(engine)) = (ubiquity_dir.as_ref(), engine.as_ref()) {
+            if let Some(engine) = engine.as_ref() {
+                let ub = &ubiquity_dir;
                 match watcher::spawn(ub.clone(), db.inner().clone(), Arc::clone(engine)) {
                     Ok(watcher) => match sync_state.watcher.lock() {
                         Ok(mut g) => *g = Some(watcher),
@@ -504,22 +553,26 @@ pub async fn sync_disable(
     // Remove the manifest so other peers don't see a stuck "Last
     // seen" — they'll just see this device drop off the list. Best-
     // effort; failure is logged but doesn't block disable.
-    if let Some(ub) = ubiquity_dir.as_ref() {
-        if let Err(e) = peers::delete_own_manifest(ub, &device.device_uuid) {
-            log::warn!("sync_disable: failed to remove own peer manifest: {e}");
-        }
+    if let Err(e) = peers::delete_own_manifest(&ubiquity_dir, &device.device_uuid) {
+        log::warn!("sync_disable: failed to remove own peer manifest: {e}");
     }
 
-    sync::migration::remove_sync_settings(&local_dir)?;
+    // Keep the user-authorized folder after disabling. This lets a user
+    // pause sync without repeating the macOS folder permission flow.
+    sync::migration::set_sync_enabled(&local_dir, false)?;
 
     // Final sweep: if the async boot thread installed an engine/watcher
     // between our initial snapshot and the marker removal, clear it now.
     // Without this, a boot that races with disable can leave a watcher
     // thread alive after sync is "off."
     {
-        let mut eg = sync_state.engine.lock()
+        let mut eg = sync_state
+            .engine
+            .lock()
             .map_err(|e| AppError::Other(format!("engine mutex: {e}")))?;
-        let mut wg = sync_state.watcher.lock()
+        let mut wg = sync_state
+            .watcher
+            .lock()
             .map_err(|e| AppError::Other(format!("watcher mutex: {e}")))?;
         if eg.is_some() || wg.is_some() {
             log::warn!("sync_disable: boot thread installed engine during disable — clearing");
@@ -535,10 +588,7 @@ pub async fn sync_disable(
 }
 
 #[tauri::command]
-pub fn sync_cancel(
-    app: tauri::AppHandle,
-    sync_state: State<'_, SyncState>,
-) -> AppResult<()> {
+pub fn sync_cancel(app: tauri::AppHandle, sync_state: State<'_, SyncState>) -> AppResult<()> {
     if let Some(engine) = sync_state.engine_snapshot()? {
         engine.cancel();
     }
@@ -595,9 +645,8 @@ pub fn sync_remove_peer(
     local: State<'_, LocalDir>,
     device: State<'_, DeviceIdentity>,
 ) -> AppResult<()> {
-    let shared_dir = sync::migration::recorded_data_dir(&local.0)
-        .or_else(icloud::icloud_data_dir)
-        .ok_or_else(|| AppError::Other("iCloud shared folder is not available".into()))?;
+    let shared_dir = sync::migration::recorded_usable_icloud_dir(&local.0)
+        .ok_or_else(|| AppError::Other("SYNC_FOLDER_NOT_CONFIGURED".into()))?;
     peers::delete_peer(&shared_dir, &device_uuid, &device.device_uuid)
 }
 
@@ -623,11 +672,7 @@ pub fn sync_remove_peer(
 /// `snapshot.id` and apply it via `apply_peer` — idempotent under the
 /// LWW + tombstone rules in `merge.rs`, so this is safe even when
 /// peers have already seen most of the entities individually.
-fn publish_bootstrap_snapshot(
-    db: &Db,
-    shared_dir: &Path,
-    device_uuid: &str,
-) -> AppResult<()> {
+fn publish_bootstrap_snapshot(db: &Db, shared_dir: &Path, device_uuid: &str) -> AppResult<()> {
     let path = shared_dir
         .join("logs")
         .join(format!("{device_uuid}.snapshot.json"));
@@ -651,11 +696,9 @@ fn count_local_outbox(db: &Db) -> AppResult<i64> {
 fn read_last_replay_at(db: &Db) -> AppResult<Option<i64>> {
     let conn = db.reader();
     let v: Option<i64> = conn
-        .query_row(
-            "SELECT MAX(updated_at) FROM _replay_state",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT MAX(updated_at) FROM _replay_state", [], |r| {
+            r.get(0)
+        })
         .ok()
         .flatten();
     Ok(v)
@@ -696,13 +739,10 @@ impl DisableCopyProgressEmitter {
     }
 }
 
-fn copy_disable_files_with_progress(
-    app: &AppHandle,
-    jobs: &[(PathBuf, PathBuf)],
-) -> AppResult<()> {
-    let total = jobs
-        .iter()
-        .try_fold(0usize, |acc, (src, _)| count_copy_entries(src).map(|n| acc + n))?;
+fn copy_disable_files_with_progress(app: &AppHandle, jobs: &[(PathBuf, PathBuf)]) -> AppResult<()> {
+    let total = jobs.iter().try_fold(0usize, |acc, (src, _)| {
+        count_copy_entries(src).map(|n| acc + n)
+    })?;
     log::info!("sync_disable: copy-back total_files={total}");
     let mut progress = DisableCopyProgressEmitter::new(Some(app.clone()), total);
     progress.emit("preparing", None);
@@ -801,6 +841,16 @@ fn move_dir_contents(src: &Path, dst: &Path) -> AppResult<()> {
     Ok(())
 }
 
+pub(crate) fn reconcile_local_blobs_to_ubiquity(
+    local_dir: &Path,
+    shared_dir: &Path,
+) -> AppResult<()> {
+    move_dir_contents(&local_dir.join("books"), &shared_dir.join("books"))?;
+    move_dir_contents(&local_dir.join("covers"), &shared_dir.join("covers"))?;
+    move_dir_contents(&local_dir.join("sources"), &shared_dir.join("sources"))?;
+    Ok(())
+}
+
 /// Copy every entry from `src` to `dst`, skipping clashes. Skipped
 /// when `src` doesn't exist.
 ///
@@ -836,11 +886,15 @@ fn copy_dir_contents_with_progress(
         let entry = entry?;
         let name = entry.file_name();
         if is_icloud_placeholder(&name) {
-            let real = icloud_real_from_placeholder(src, name)
-                .ok_or_else(|| AppError::Other(format!("invalid iCloud placeholder under {}", src.display())))?;
-            let file_name = real
-                .file_name()
-                .ok_or_else(|| AppError::Other(format!("invalid iCloud file path: {}", real.display())))?;
+            let real = icloud_real_from_placeholder(src, name).ok_or_else(|| {
+                AppError::Other(format!(
+                    "invalid iCloud placeholder under {}",
+                    src.display()
+                ))
+            })?;
+            let file_name = real.file_name().ok_or_else(|| {
+                AppError::Other(format!("invalid iCloud file path: {}", real.display()))
+            })?;
             let target = dst.join(file_name);
             if target.exists() {
                 if let Some(p) = progress.as_deref_mut() {
@@ -851,7 +905,7 @@ fn copy_dir_contents_with_progress(
             if let Some(p) = progress.as_deref() {
                 p.emit("downloading", Some(display_file_name(&real)));
             }
-            icloud::trigger_download_file(&real);
+            crate::icloud::trigger_download_file(&real);
             wait_for_icloud_file(&real)?;
             copy_one_disable_file(&real, &target, progress.as_deref_mut())?;
             continue;
@@ -901,7 +955,7 @@ fn wait_for_icloud_file(path: &Path) -> AppResult<()> {
                 path.display(),
             )));
         }
-        icloud::trigger_download_file(path);
+        crate::icloud::trigger_download_file(path);
         thread::sleep(DISABLE_COPY_PLACEHOLDER_POLL);
     }
     log::info!(
@@ -922,7 +976,10 @@ fn icloud_placeholder_for(real: &Path) -> Option<PathBuf> {
 
 /// `<dir>/.foo.epub.icloud` → `<dir>/foo.epub`. None when the
 /// filename doesn't match the placeholder pattern.
-fn icloud_real_from_placeholder(parent: &Path, placeholder_name: std::ffi::OsString) -> Option<PathBuf> {
+fn icloud_real_from_placeholder(
+    parent: &Path,
+    placeholder_name: std::ffi::OsString,
+) -> Option<PathBuf> {
     let s = placeholder_name.to_str()?;
     if !s.starts_with('.') || !s.ends_with(".icloud") {
         return None;
@@ -942,7 +999,10 @@ mod tests {
         let src = tmp.path().join("src");
         let dst = tmp.path().join("dst");
         move_dir_contents(&src, &dst).unwrap();
-        assert!(!dst.exists(), "dst should not be created when src is missing");
+        assert!(
+            !dst.exists(),
+            "dst should not be created when src is missing"
+        );
     }
 
     #[test]
@@ -1154,11 +1214,7 @@ mod tests {
         }
         let conn = peer_db.conn.lock().unwrap();
         let title: String = conn
-            .query_row(
-                "SELECT title FROM books WHERE id = 'b1'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT title FROM books WHERE id = 'b1'", [], |r| r.get(0))
             .expect("peer should see the bootstrapped book");
         assert_eq!(title, "Existing Book");
         let n_hl: i64 = conn

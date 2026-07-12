@@ -322,7 +322,8 @@ mod tests {
             "INSERT INTO chats (id, book_id, title, pinned, created_at, updated_at)
              VALUES (?1, ?2, ?3, 0, ?4, ?4)",
             params![id, book_id, title, now],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     fn insert_msg(db: &Db, chat_id: &str, role: &str, content: &str) {
@@ -333,17 +334,20 @@ mod tests {
             "INSERT INTO chat_messages (id, chat_id, role, content, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
             params![id, chat_id, role, content, now],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     fn count_chats(db: &Db) -> i64 {
         let conn = db.conn.lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM chats", [], |r| r.get(0)).unwrap()
+        conn.query_row("SELECT COUNT(*) FROM chats", [], |r| r.get(0))
+            .unwrap()
     }
 
     fn count_messages(db: &Db) -> i64 {
         let conn = db.conn.lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM chat_messages", [], |r| r.get(0)).unwrap()
+        conn.query_row("SELECT COUNT(*) FROM chat_messages", [], |r| r.get(0))
+            .unwrap()
     }
 
     // --- create_chat ---
@@ -358,7 +362,8 @@ mod tests {
             "INSERT INTO chats (id, book_id, title, pinned, created_at, updated_at)
              VALUES (?1, 'book1', 'New chat', 0, ?2, ?2)",
             params![id, now],
-        ).unwrap();
+        )
+        .unwrap();
 
         let chat: Chat = conn.query_row(
             "SELECT id, book_id, title, model, pinned, metadata, created_at, updated_at FROM chats WHERE id = ?1",
@@ -382,7 +387,8 @@ mod tests {
             "INSERT INTO chats (id, book_id, title, model, pinned, created_at, updated_at)
              VALUES (?1, 'book1', 'My Discussion', 'gpt-4o', 0, ?2, ?2)",
             params![id, now],
-        ).unwrap();
+        )
+        .unwrap();
 
         let chat: Chat = conn.query_row(
             "SELECT id, book_id, title, model, pinned, metadata, created_at, updated_at FROM chats WHERE id = ?1",
@@ -404,13 +410,17 @@ mod tests {
         insert_chat(&db, "c3", "book2", "Chat C");
 
         let conn = db.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, book_id, title, model, pinned, metadata, created_at, updated_at
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, book_id, title, model, pinned, metadata, created_at, updated_at
              FROM chats WHERE book_id = ?1 ORDER BY updated_at DESC",
-        ).unwrap();
+            )
+            .unwrap();
         let chats: Vec<Chat> = stmt
-            .query_map(params!["book1"], row_to_chat).unwrap()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .query_map(params!["book1"], row_to_chat)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert_eq!(chats.len(), 2);
         assert!(chats.iter().all(|c| c.book_id == "book1"));
@@ -420,13 +430,17 @@ mod tests {
     fn test_list_chats_empty() {
         let (_dir, db) = setup();
         let conn = db.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, book_id, title, model, pinned, metadata, created_at, updated_at
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, book_id, title, model, pinned, metadata, created_at, updated_at
              FROM chats WHERE book_id = ?1",
-        ).unwrap();
+            )
+            .unwrap();
         let chats: Vec<Chat> = stmt
-            .query_map(params!["book1"], row_to_chat).unwrap()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .query_map(params!["book1"], row_to_chat)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert!(chats.is_empty());
     }
@@ -450,8 +464,10 @@ mod tests {
              ORDER BY c.updated_at DESC",
         ).unwrap();
         let chats: Vec<Chat> = stmt
-            .query_map([], row_to_chat_with_extras).unwrap()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .query_map([], row_to_chat_with_extras)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert_eq!(chats.len(), 1);
         assert_eq!(chats[0].book_title, Some("Test Book".to_string()));
@@ -475,8 +491,13 @@ mod tests {
         {
             let conn = db.conn.lock().unwrap();
             let tx = conn.unchecked_transaction().unwrap();
-            tx.execute("DELETE FROM chat_messages WHERE chat_id = ?1", params!["c1"]).unwrap();
-            tx.execute("DELETE FROM chats WHERE id = ?1", params!["c1"]).unwrap();
+            tx.execute(
+                "DELETE FROM chat_messages WHERE chat_id = ?1",
+                params!["c1"],
+            )
+            .unwrap();
+            tx.execute("DELETE FROM chats WHERE id = ?1", params!["c1"])
+                .unwrap();
             tx.commit().unwrap();
         }
 
@@ -495,8 +516,13 @@ mod tests {
         {
             let conn = db.conn.lock().unwrap();
             let tx = conn.unchecked_transaction().unwrap();
-            tx.execute("DELETE FROM chat_messages WHERE chat_id = ?1", params!["c1"]).unwrap();
-            tx.execute("DELETE FROM chats WHERE id = ?1", params!["c1"]).unwrap();
+            tx.execute(
+                "DELETE FROM chat_messages WHERE chat_id = ?1",
+                params!["c1"],
+            )
+            .unwrap();
+            tx.execute("DELETE FROM chats WHERE id = ?1", params!["c1"])
+                .unwrap();
             tx.commit().unwrap();
         }
 
@@ -526,8 +552,10 @@ mod tests {
                 "DELETE FROM chat_messages WHERE chat_id IN (SELECT id FROM chats WHERE book_id = ?1)",
                 params!["book1"],
             ).unwrap();
-            conn.execute("DELETE FROM chats WHERE book_id = ?1", params!["book1"]).unwrap();
-            conn.execute("DELETE FROM books WHERE id = ?1", params!["book1"]).unwrap();
+            conn.execute("DELETE FROM chats WHERE book_id = ?1", params!["book1"])
+                .unwrap();
+            conn.execute("DELETE FROM books WHERE id = ?1", params!["book1"])
+                .unwrap();
         }
 
         // book2's chat and message should remain
@@ -547,7 +575,8 @@ mod tests {
         conn.execute(
             "UPDATE chats SET title = ?1, updated_at = ?2 WHERE id = ?3",
             params!["Renamed", now, "c1"],
-        ).unwrap();
+        )
+        .unwrap();
 
         let chat: Chat = conn.query_row(
             "SELECT id, book_id, title, model, pinned, metadata, created_at, updated_at FROM chats WHERE id = ?1",
@@ -567,7 +596,10 @@ mod tests {
 
         let original_updated: i64 = {
             let conn = db.conn.lock().unwrap();
-            conn.query_row("SELECT updated_at FROM chats WHERE id = 'c1'", [], |r| r.get(0)).unwrap()
+            conn.query_row("SELECT updated_at FROM chats WHERE id = 'c1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
         };
 
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -580,16 +612,21 @@ mod tests {
                 "INSERT INTO chat_messages (id, chat_id, role, content, created_at, updated_at)
                  VALUES ('m1', 'c1', 'user', 'Hello', ?1, ?1)",
                 params![now],
-            ).unwrap();
+            )
+            .unwrap();
             conn.execute(
                 "UPDATE chats SET updated_at = ?1 WHERE id = 'c1'",
                 params![now],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         let new_updated: i64 = {
             let conn = db.conn.lock().unwrap();
-            conn.query_row("SELECT updated_at FROM chats WHERE id = 'c1'", [], |r| r.get(0)).unwrap()
+            conn.query_row("SELECT updated_at FROM chats WHERE id = 'c1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
         };
 
         assert_ne!(original_updated, new_updated);
@@ -611,7 +648,8 @@ mod tests {
                 "INSERT INTO chat_messages (id, chat_id, role, content, created_at, updated_at)
                  VALUES ('m1', 'c1', 'user', 'First', ?1, ?1)",
                 params![t1],
-            ).unwrap();
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO chat_messages (id, chat_id, role, content, context, created_at, updated_at)
                  VALUES ('m2', 'c1', 'assistant', 'Second', NULL, ?1, ?1)",
@@ -625,13 +663,17 @@ mod tests {
         }
 
         let conn = db.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, chat_id, role, content, context, metadata, created_at, updated_at
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, chat_id, role, content, context, metadata, created_at, updated_at
              FROM chat_messages WHERE chat_id = ?1 ORDER BY created_at ASC",
-        ).unwrap();
+            )
+            .unwrap();
         let msgs: Vec<ChatMsg> = stmt
-            .query_map(params!["c1"], row_to_msg).unwrap()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .query_map(params!["c1"], row_to_msg)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].content, "First");
@@ -653,7 +695,8 @@ mod tests {
             "INSERT INTO chats (id, book_id, title, pinned, metadata, created_at, updated_at)
              VALUES ('c1', 'book1', 'Chat', 0, ?1, ?2, ?2)",
             params![meta, now],
-        ).unwrap();
+        )
+        .unwrap();
 
         let chat: Chat = conn.query_row(
             "SELECT id, book_id, title, model, pinned, metadata, created_at, updated_at FROM chats WHERE id = 'c1'",

@@ -27,5 +27,6 @@ pub mod migration;
 pub mod peers;
 pub mod replay;
 pub mod snapshot;
+pub mod validation;
 pub mod watcher;
 pub mod writer;

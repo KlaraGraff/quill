@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { Check } from "lucide-react";
 import Select from "../ui/Select";
-import { fonts, FONT_SIZE_MIN, FONT_SIZE_MAX, getDefaultReaderTheme, type ReaderTheme } from "../ReaderSettings";
+import { fonts, FONT_SIZE_MIN, FONT_SIZE_MAX, getDefaultReaderTheme, type ReaderTheme } from "../reader-settings";
 import type { SettingsProps } from "./types";
 
 const READER_THEME_OPTIONS: {

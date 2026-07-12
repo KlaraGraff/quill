@@ -65,10 +65,7 @@ pub enum EventBody {
     #[serde(rename = "highlight.color.set")]
     HighlightColorSet { id: String, color: String },
     #[serde(rename = "highlight.note.set")]
-    HighlightNoteSet {
-        id: String,
-        note: Option<String>,
-    },
+    HighlightNoteSet { id: String, note: Option<String> },
 
     #[serde(rename = "bookmark.add")]
     BookmarkAdd(BookmarkPayload),
@@ -82,11 +79,23 @@ pub enum EventBody {
         id: String,
         mastery: String,
         next_review_at: Option<i64>,
-        /// Absolute review count after the writer's increment. Carrying it
-        /// as an absolute value (not a delta) keeps replay idempotent — a
-        /// snapshot rebuild that re-applies the same event lands on the
-        /// same number instead of double-counting.
+        /// Absolute completed-review count. Carrying it as an absolute value
+        /// (not a delta) keeps replay idempotent — a snapshot rebuild that
+        /// re-applies the same event lands on the same number instead of
+        /// double-counting.
         review_count: i64,
+        #[serde(default)]
+        review_interval_days: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_reviewed_at: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_review_rating: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fsrs_stability: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fsrs_difficulty: Option<f64>,
+        #[serde(default = "default_fsrs_version")]
+        fsrs_version: i64,
     },
     #[serde(rename = "vocab.delete")]
     VocabDelete { id: String },
@@ -130,6 +139,10 @@ pub enum EventBody {
     ChatMessageAdd(ChatMessagePayload),
 }
 
+fn default_fsrs_version() -> i64 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BookImportPayload {
     pub id: String,
@@ -139,6 +152,16 @@ pub struct BookImportPayload {
     pub cover_path: Option<String>,
     pub file_path: String,
     pub format: String,
+    #[serde(default)]
+    pub source_format: Option<String>,
+    #[serde(default)]
+    pub render_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sha256: Option<String>,
+    #[serde(default)]
+    pub conversion_version: i32,
     pub genre: Option<String>,
     pub pages: Option<i32>,
 }
@@ -172,6 +195,26 @@ pub struct VocabPayload {
     pub mastery: String,
     pub review_count: i64,
     pub next_review_at: Option<i64>,
+    /// Full review state is carried by add events as well. This matters for
+    /// imported backups: an add and a mastery update emitted with the same
+    /// logical timestamp would otherwise make the latter lose its LWW tie.
+    /// Defaults retain compatibility with logs written before SRS support.
+    #[serde(default)]
+    pub review_interval_days: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reviewed_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_review_rating: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fsrs_stability: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fsrs_difficulty: Option<f64>,
+    #[serde(default = "default_fsrs_version")]
+    pub fsrs_version: i64,
+    /// Normally identical to the event timestamp. Backup import retains the
+    /// original creation time while keeping `updated_at` on the import event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
     // Added in #214: AI's in-context analysis, persisted separately from the
     // dictionary-style definition. `default` lets older-client payloads decode;
     // `skip_serializing_if` keeps the wire form compact for senders that never
@@ -232,6 +275,11 @@ mod tests {
             cover_path: Some("covers/b1.png".into()),
             file_path: "books/b1.epub".into(),
             format: "epub".into(),
+            source_format: None,
+            render_format: None,
+            source_file_path: None,
+            source_sha256: None,
+            conversion_version: 0,
             genre: None,
             pages: Some(1225),
         })));
@@ -296,6 +344,13 @@ mod tests {
             mastery: "new".into(),
             review_count: 0,
             next_review_at: Some(1_714_856_400_000),
+            review_interval_days: 0,
+            last_reviewed_at: None,
+            last_review_rating: None,
+            fsrs_stability: None,
+            fsrs_difficulty: None,
+            fsrs_version: 1,
+            created_at: None,
             context_explanation: Some("Used to mean an unexpectedly happy turn.".into()),
         })));
         roundtrip(&mk(EventBody::VocabMasterySet {
@@ -303,6 +358,12 @@ mod tests {
             mastery: "learning".into(),
             next_review_at: Some(1_714_942_800_000),
             review_count: 3,
+            review_interval_days: 7,
+            last_reviewed_at: Some(1_714_770_000_000),
+            last_review_rating: Some("good".into()),
+            fsrs_stability: None,
+            fsrs_difficulty: None,
+            fsrs_version: 1,
         }));
         roundtrip(&mk(EventBody::VocabDelete { id: "v1".into() }));
     }
@@ -334,6 +395,9 @@ mod tests {
             panic!("expected VocabAdd");
         };
         assert_eq!(p.context_explanation, None);
+        assert_eq!(p.review_interval_days, 0);
+        assert_eq!(p.fsrs_version, 1);
+        assert_eq!(p.created_at, None);
         let wire: Value = serde_json::to_value(&ev).unwrap();
         assert!(
             wire["payload"].get("context_explanation").is_none(),
@@ -445,9 +509,14 @@ mod tests {
         let v: Value = serde_json::from_str(&json).unwrap();
         let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
         let expected: std::collections::HashSet<&str> =
-            ["id", "ts", "device", "v", "type", "payload"].into_iter().collect();
+            ["id", "ts", "device", "v", "type", "payload"]
+                .into_iter()
+                .collect();
         for k in keys {
-            assert!(expected.contains(k.as_str()), "unexpected key in wire form: {k}");
+            assert!(
+                expected.contains(k.as_str()),
+                "unexpected key in wire form: {k}"
+            );
         }
     }
 }

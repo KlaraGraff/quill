@@ -176,15 +176,15 @@ pub fn delete_peer(shared_dir: &Path, device_uuid: &str, own_uuid: &str) -> AppR
     // self-guard on case-insensitive filesystems. own_uuid is owned
     // by us and always parses; if it ever doesn't, we still refuse.
     let own = Uuid::parse_str(own_uuid).map_err(|_| {
-        AppError::Other(format!("refusing to delete peer: own_uuid {own_uuid:?} is not a valid UUID"))
+        AppError::Other(format!(
+            "refusing to delete peer: own_uuid {own_uuid:?} is not a valid UUID"
+        ))
     })?;
     if target == own {
         return Ok(());
     }
 
-    let log = shared_dir
-        .join("logs")
-        .join(format!("{device_uuid}.jsonl"));
+    let log = shared_dir.join("logs").join(format!("{device_uuid}.jsonl"));
     let snapshot = shared_dir
         .join("logs")
         .join(format!("{device_uuid}.snapshot.json"));
@@ -460,7 +460,9 @@ mod tests {
 
         assert!(!manifest_path(shared, PEER_A_UUID).exists());
         assert!(!shared.join(format!("logs/{PEER_A_UUID}.jsonl")).exists());
-        assert!(!shared.join(format!("logs/{PEER_A_UUID}.snapshot.json")).exists());
+        assert!(!shared
+            .join(format!("logs/{PEER_A_UUID}.snapshot.json"))
+            .exists());
     }
 
     #[test]
@@ -491,7 +493,9 @@ mod tests {
         // All three self artifacts must remain — guard refuses the call.
         assert!(manifest_path(shared, SELF_UUID).exists());
         assert!(shared.join(format!("logs/{SELF_UUID}.jsonl")).exists());
-        assert!(shared.join(format!("logs/{SELF_UUID}.snapshot.json")).exists());
+        assert!(shared
+            .join(format!("logs/{SELF_UUID}.snapshot.json"))
+            .exists());
     }
 
     #[test]
@@ -531,7 +535,9 @@ mod tests {
 
         assert!(manifest_path(shared, SELF_UUID).exists());
         assert!(shared.join(format!("logs/{SELF_UUID}.jsonl")).exists());
-        assert!(shared.join(format!("logs/{SELF_UUID}.snapshot.json")).exists());
+        assert!(shared
+            .join(format!("logs/{SELF_UUID}.snapshot.json"))
+            .exists());
     }
 
     /// Same hazard at the discovery layer: list_peers must filter

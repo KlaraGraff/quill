@@ -18,19 +18,15 @@ pub fn spawn_watcher(sentinel_path: PathBuf, app_handle: AppHandle) {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf();
-    let sentinel_name = sentinel_path
-        .file_name()
-        .unwrap_or_default()
-        .to_os_string();
+    let sentinel_name = sentinel_path.file_name().unwrap_or_default().to_os_string();
 
     let handle = app_handle.clone();
     let mut watcher = match recommended_watcher(move |res: notify::Result<notify::Event>| {
         let Ok(event) = res else { return };
-        let dominated = event.paths.iter().any(|p| {
-            p.file_name()
-                .map(|n| n == sentinel_name)
-                .unwrap_or(false)
-        });
+        let dominated = event
+            .paths
+            .iter()
+            .any(|p| p.file_name().map(|n| n == sentinel_name).unwrap_or(false));
         if !dominated {
             return;
         }

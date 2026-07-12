@@ -3,6 +3,7 @@ import { useParams, useNavigate, useLocation } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { emit } from "@tauri-apps/api/event";
 import {
   ArrowLeft,
   BookOpen,
@@ -17,7 +18,8 @@ import {
 import Button from "../components/ui/Button";
 import AiPanel from "../components/AiPanel";
 import BookmarksPanel from "../components/BookmarksPanel";
-import ReaderSettings, { type ReaderSettingsState, getFontFamily, getThemeStyles, getDefaultReaderTheme } from "../components/ReaderSettings";
+import ReaderSettings, { type ReaderSettingsState } from "../components/ReaderSettings";
+import { getFontFamily, getThemeStyles, getDefaultReaderTheme, getReaderCapabilities } from "../components/reader-settings";
 import ReaderContextMenu from "../components/ReaderContextMenu";
 import HighlightToolbar from "../components/HighlightToolbar";
 import LookupPopover from "../components/LookupPopover";
@@ -49,6 +51,9 @@ interface FoliateView extends HTMLElement {
 }
 
 interface LookupRecord {
+  lookup_text: string;
+  context_sentence: string | null;
+  chapter: string | null;
   cfi: string | null;
 }
 
@@ -56,6 +61,16 @@ interface VocabMarker {
   cfi: string | null;
   mastery: string;
 }
+
+type MarkerKind = "lookup" | "vocab";
+type Marker = { color: string; kind: MarkerKind };
+type ReaderNavigation = {
+  navigationId?: string;
+  cfi?: string;
+  openVocab?: boolean;
+  openChat?: boolean;
+  chatId?: string;
+};
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
 type PdfOverlay = { layers: React.CSSProperties[] } | null;
@@ -249,6 +264,11 @@ export default function Reader() {
   const location = useLocation();
   const { t } = useTranslation();
   const [book, setBook] = useState<Book | null>(null);
+  const capabilities = useMemo(() => getReaderCapabilities(book?.format), [book?.format]);
+  const supportsSelection = capabilities.supportsSelection;
+  const supportsManualAnnotations = capabilities.supportsManualAnnotations;
+  const supportsWordMarkers = capabilities.supportsWordMarkers;
+  const supportsCfiNavigation = capabilities.supportsCfiNavigation;
   const [loading, setLoading] = useState(true);
   const [sidePanel, setSidePanel] = useState<SidePanel>(null);
   const [panelWidth, setPanelWidth] = useState(PANEL_DEFAULT_WIDTH);
@@ -274,6 +294,7 @@ export default function Reader() {
   } | null>(null);
   const [aiContext, setAiContext] = useState<{ text: string; cfi?: string } | undefined>();
   const [initialChatId, setInitialChatId] = useState<string | undefined>();
+  const [activeVocabCfi, setActiveVocabCfi] = useState<string | null>(null);
   const [lookup, setLookup] = useState<{
     x: number;
     y: number;
@@ -323,14 +344,46 @@ export default function Reader() {
     showMasteredMarkers: false,
   }));
   const readerSettingsRef = useRef(readerSettings);
-  readerSettingsRef.current = readerSettings;
 
   const settingsAnchorRef = useRef<HTMLButtonElement>(null);
   const viewerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<FoliateView | null>(null);
+  const zoomRef = useRef<number | "fit">(zoom);
+  const fitPctRef = useRef(100);
+  const autoMarkersRef = useRef(new Map<string, Marker>());
+  const appliedAnnotationsRef = useRef(new Map<string, string>());
+  const navigationFlashRef = useRef(new Map<string, number>());
+  const pendingNavigationRef = useRef<ReaderNavigation | null>(null);
+  const markerSnapshotRef = useRef<{
+    highlights: Highlight[];
+    lookups: LookupRecord[];
+    vocab: VocabMarker[];
+  } | null>(null);
   const isDragging = useRef(false);
   const chaptersRef = useRef<TocChapter[]>([]);
   const selectedTextRef = useRef<{ text: string; cfi: string } | null>(null);
+
+  useEffect(() => {
+    readerSettingsRef.current = readerSettings;
+  }, [readerSettings]);
+
+  useEffect(() => {
+    zoomRef.current = zoom;
+  }, [zoom]);
+
+  const applyZoom = useCallback((value: number | "fit") => {
+    const renderer = viewRef.current?.renderer;
+    if (!renderer) return;
+    renderer.setAttribute("zoom", value === "fit" ? "fit-width" : String(value / 100));
+  }, []);
+
+  const handleZoom = useCallback((delta: number) => {
+    const base = zoomRef.current === "fit" ? fitPctRef.current : zoomRef.current;
+    const next = Math.min(300, Math.max(50, Math.round((base + delta) / 10) * 10));
+    applyZoom(next);
+    setZoom(next);
+  }, [applyZoom]);
+
   const tocChapters = useMemo(() => chapters.map((chapter, i) => ({
     title: chapter.title,
     page: i + 1,
@@ -338,9 +391,85 @@ export default function Reader() {
     disabled: !chapter.targetHref,
   })), [chapters]);
 
+  const applyAnnotations = useCallback(async (reapplyVisible = false) => {
+    const view = viewRef.current;
+    if (!view || !supportsManualAnnotations) return;
+
+    const snapshot = markerSnapshotRef.current;
+    if (!snapshot) return;
+    const { highlights, lookups, vocab } = snapshot;
+    const manual = new Set(highlights.map((highlight) => highlight.cfi_range));
+    const settings = readerSettingsRef.current;
+    const next = new Map<string, Marker>();
+    if (supportsWordMarkers) {
+      for (const lookup of lookups) {
+        if (settings.showLookupMarkers && lookup.cfi && !manual.has(lookup.cfi)) {
+          next.set(lookup.cfi, { color: wordMarkerColor.lookup, kind: "lookup" });
+        }
+      }
+      for (const word of vocab) {
+        if (!word.cfi || manual.has(word.cfi)) continue;
+        if (word.mastery === "mastered" && settings.showMasteredMarkers) {
+          next.set(word.cfi, { color: wordMarkerColor.mastered, kind: "vocab" });
+        } else if (word.mastery === "learning" && settings.showLearningMarkers) {
+          next.set(word.cfi, { color: wordMarkerColor.learning, kind: "vocab" });
+        } else if (word.mastery !== "mastered" && word.mastery !== "learning" && settings.showNewVocabMarkers) {
+          next.set(word.cfi, { color: wordMarkerColor.vocabNew, kind: "vocab" });
+        }
+      }
+    }
+
+    autoMarkersRef.current = next;
+    const desired = new Map([...next.entries()].map(([cfi, marker]) => [cfi, marker.color]));
+    for (const highlight of highlights) desired.set(highlight.cfi_range, highlight.color);
+    const previous = appliedAnnotationsRef.current;
+    const cfis = new Set([...previous.keys(), ...desired.keys()]);
+    await Promise.all([...cfis].map(async (cfi) => {
+      const oldColor = previous.get(cfi);
+      const newColor = desired.get(cfi);
+      if (!reapplyVisible && oldColor === newColor) return;
+      if (oldColor !== undefined) await view.deleteAnnotation({ value: cfi }).catch(() => {});
+      if (newColor !== undefined) await view.addAnnotation({ value: cfi, color: newColor }).catch(() => {});
+    }));
+    appliedAnnotationsRef.current = desired;
+  }, [supportsManualAnnotations, supportsWordMarkers]);
+
+  const flashNavigationTarget = useCallback(async (cfi: string) => {
+    const view = viewRef.current;
+    if (!view || !supportsCfiNavigation) return;
+    await view.goTo(cfi);
+    await view.addAnnotation({ value: cfi, color: "#c27aff" }).catch(() => {});
+    const token = Date.now() + Math.random();
+    navigationFlashRef.current.set(cfi, token);
+    window.setTimeout(async () => {
+      if (navigationFlashRef.current.get(cfi) !== token || viewRef.current !== view) return;
+      navigationFlashRef.current.delete(cfi);
+      await view.deleteAnnotation({ value: cfi }).catch(() => {});
+      const color = appliedAnnotationsRef.current.get(cfi);
+      if (color) await view.addAnnotation({ value: cfi, color }).catch(() => {});
+    }, 3000);
+  }, [supportsCfiNavigation]);
+
+  const refreshAnnotations = useCallback(async (reapplyVisible = false) => {
+    if (!bookId || !viewRef.current || !supportsManualAnnotations) return;
+    const highlights = await invoke<Highlight[]>("list_highlights", { bookId });
+    const [lookups, vocab] = supportsWordMarkers
+      ? await Promise.all([
+        invoke<LookupRecord[]>("list_lookup_records", { bookId }),
+        invoke<VocabMarker[]>("list_vocab_words", { bookId }),
+      ])
+      : [[], []] as [LookupRecord[], VocabMarker[]];
+    markerSnapshotRef.current = { highlights, lookups, vocab };
+    await applyAnnotations(reapplyVisible);
+  }, [applyAnnotations, bookId, supportsManualAnnotations, supportsWordMarkers]);
+
   // Load book metadata and default settings from DB
   useEffect(() => {
     if (!bookId) return;
+    autoMarkersRef.current.clear();
+    appliedAnnotationsRef.current.clear();
+    navigationFlashRef.current.clear();
+    markerSnapshotRef.current = null;
     getBook(bookId)
       .then((b) => {
         setBook(b);
@@ -391,7 +520,7 @@ export default function Reader() {
   useEffect(() => {
     if (!dbSettingsLoaded.current) return;
     localStorage.setItem(`reader-settings-${bookId}`, JSON.stringify(readerSettings));
-  }, [readerSettings]);
+  }, [bookId, readerSettings]);
 
   // Persist per-book PDF zoom after load. Debounce to avoid thrashing during
   // rapid zoom-button clicks; only write once the user settles.
@@ -458,7 +587,7 @@ export default function Reader() {
 
     poll();
     return () => { cancelled = true; };
-  }, [book?.id, book?.available]);
+  }, [book]);
 
   // Initialize foliate-js when book data is loaded
   useEffect(() => {
@@ -499,24 +628,41 @@ export default function Reader() {
       container.appendChild(view);
       viewRef.current = view;
 
-      // Fetch EPUB as blob for foliate-js
+      // Preserve the stored source extension so Foliate selects its native parser.
       const fileUrl = convertFileSrc(book.file_path);
       const response = await fetch(fileUrl);
-      const ext = book.format === "pdf" ? "pdf" : "epub";
-      const blob = new File([await response.blob()], `book.${ext}`);
+      const extension = book.source_format || book.format;
+      const mime = {
+        epub: "application/epub+zip",
+        pdf: "application/pdf",
+        mobi: "application/x-mobipocket-ebook",
+        azw: "application/x-mobipocket-ebook",
+        azw3: "application/x-mobipocket-ebook",
+        fb2: "application/x-fictionbook+xml",
+        fbz: "application/x-zip-compressed-fb2",
+        cbz: "application/vnd.comicbook+zip",
+      }[extension] || "application/octet-stream";
+      const blob = new File([await response.blob()], `book.${extension}`, { type: mime });
       await view.open(blob);
 
       if (cancelled) return;
 
-      // Set reading mode and layout
-      const isScrolling = readerSettings.readingMode === "scrolling";
-      view.renderer.setAttribute("flow", isScrolling ? "scrolled" : "paginated");
-      view.renderer.setAttribute("gap", "5%");
-      view.renderer.setAttribute("max-inline-size", "1000px");
-      view.renderer.setAttribute("max-column-count", String(readerSettings.pageColumns));
-      // Spread mode for fixed-layout (PDF) — 'none' = single page, default = two pages
-      if (book.format === "pdf") {
+      // Only apply layout attributes the current renderer supports. In
+      // particular, fixed/comic renderers must not receive EPUB flow, column,
+      // or typography settings merely because they share a Foliate view.
+      if (capabilities.supportsReflowSettings) {
+        const isScrolling = readerSettings.readingMode === "scrolling";
+        view.renderer.setAttribute("flow", isScrolling ? "scrolled" : "paginated");
+        view.renderer.setAttribute("gap", "5%");
+        view.renderer.setAttribute("max-inline-size", "1000px");
+      }
+      if (capabilities.supportsSpread) {
+        view.renderer.setAttribute("max-column-count", String(readerSettings.pageColumns));
+      }
+      if (capabilities.supportsSpread && book.format === "pdf") {
         view.renderer.setAttribute("spread", readerSettings.pageColumns === 1 ? "none" : "auto");
+      }
+      if (capabilities.supportsZoom && book.format === "pdf") {
         // Seed zoom from localStorage BEFORE view.init so CFI restore lands on
         // the right scroll offset. Re-applying after init would trigger a
         // #layoutAll() that invalidates the pixel position for the restored CFI.
@@ -529,8 +675,9 @@ export default function Reader() {
         view.renderer.setAttribute("zoom", zoomAttr);
       }
 
-      // Apply styles
-      view.renderer.setStyles?.(getReaderCSS(readerSettings));
+      if (capabilities.supportsReflowSettings) {
+        view.renderer.setStyles?.(getReaderCSS(readerSettings));
+      }
 
       // PDF theming is handled by the overlay div in the JSX
 
@@ -609,6 +756,7 @@ export default function Reader() {
 
         // Text selection tracking
         doc.addEventListener("mouseup", () => {
+          if (!supportsSelection) return;
           const sel = doc.getSelection?.();
           const text = sel?.toString().trim();
           if (text && sel.rangeCount > 0) {
@@ -623,6 +771,7 @@ export default function Reader() {
         // iframe viewport. Use frameElement to get the iframe's offset.
         doc.addEventListener("contextmenu", (ev: MouseEvent) => {
           ev.preventDefault();
+          if (!supportsSelection) return;
           const sel = doc.getSelection?.();
           const text = sel?.toString().trim();
           if (text) {
@@ -704,38 +853,16 @@ export default function Reader() {
         });
       }) as EventListener);
 
-      // Highlight and word-marker overlay system. Markers are keyed by the
-      // exact CFI selected by the reader, so no EPUB text is rewritten or
-      // globally scanned. Manual highlights always win when ranges coincide.
-      view.addEventListener("create-overlay", ((e: CustomEvent) => {
-        const { index: _sectionIndex } = e.detail; // eslint-disable-line @typescript-eslint/no-unused-vars
+      // Highlights and automatic word markers use CFI anchors. Manual
+      // highlights always take precedence at the same location.
+      view.addEventListener("create-overlay", (() => {
         if (bookId) {
-          Promise.all([
-            invoke<Highlight[]>("list_highlights", { bookId }),
-            invoke<LookupRecord[]>("list_lookup_records", { bookId }),
-            invoke<VocabMarker[]>("list_vocab_words", { bookId }),
-          ]).then(([highlights, lookups, vocab]) => {
-            const manual = new Set(highlights.map((hl) => hl.cfi_range));
-            const markers = new Map<string, string>();
-            const markerSettings = readerSettingsRef.current;
-            for (const lookupRecord of lookups) {
-              if (markerSettings.showLookupMarkers && lookupRecord.cfi && !manual.has(lookupRecord.cfi)) {
-                markers.set(lookupRecord.cfi, wordMarkerColor.lookup);
-              }
-            }
-            for (const word of vocab) {
-              if (!word.cfi || manual.has(word.cfi)) continue;
-              if (word.mastery === "mastered") {
-                if (markerSettings.showMasteredMarkers) markers.set(word.cfi, wordMarkerColor.mastered);
-              } else if (word.mastery === "learning") {
-                if (markerSettings.showLearningMarkers) markers.set(word.cfi, wordMarkerColor.learning);
-              } else if (markerSettings.showNewVocabMarkers) {
-                markers.set(word.cfi, wordMarkerColor.vocabNew);
-              }
-            }
-            for (const hl of highlights) view.addAnnotation({ value: hl.cfi_range, color: hl.color }).catch(() => {});
-            for (const [cfi, color] of markers) view.addAnnotation({ value: cfi, color }).catch(() => {});
-          }).catch(() => {});
+          // Foliate recreates overlays during pagination and resizing. The
+          // snapshot was refreshed when the reader became ready or when data
+          // changed; reapply it without fetching every record in the book.
+          if (supportsManualAnnotations) {
+            applyAnnotations(true).catch(() => {});
+          }
         }
       }) as EventListener);
 
@@ -786,6 +913,31 @@ export default function Reader() {
 
       view.addEventListener("show-annotation", ((e: CustomEvent) => {
         const { value, range } = e.detail;
+        const marker = autoMarkersRef.current.get(value);
+        if (marker) {
+          if (marker.kind === "vocab") {
+            setActiveVocabCfi(value);
+            setSidePanel("vocab");
+          } else if (range && bookId) {
+            invoke<LookupRecord[]>("list_lookup_records", { bookId }).then((records) => {
+              const record = records.find((item) => item.cfi === value);
+              if (!record) return;
+              const rect = range.getBoundingClientRect();
+              const iframe = range.startContainer?.ownerDocument?.defaultView?.frameElement as HTMLElement | null;
+              const iframeRect = iframe?.getBoundingClientRect();
+              setLookup({
+                x: rect.left + (iframeRect?.left ?? 0) + rect.width / 2,
+                y: rect.top + (iframeRect?.top ?? 0),
+                word: record.lookup_text,
+                sentence: record.context_sentence || record.lookup_text,
+                bookTitle: book?.title,
+                chapter: record.chapter || undefined,
+                cfi: record.cfi || undefined,
+              });
+            }).catch(() => {});
+          }
+          return;
+        }
         // Find the highlight in the DB to get its id and color
         if (bookId) {
           invoke<Highlight[]>("list_highlights", { bookId }).then((hls) => {
@@ -858,32 +1010,29 @@ export default function Reader() {
     // below, so the derived dep stays `null` for them and the effect won't
     // re-run.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [book, book?.format === "pdf" ? readerSettings.readingMode : null]);
+  }, [book, book?.format === "pdf" ? readerSettings.readingMode : null, applyAnnotations, capabilities, supportsManualAnnotations, supportsSelection]);
 
   // Apply reader settings reactively
   useEffect(() => {
     const view = viewRef.current;
     if (!view?.renderer) return;
 
-    // Update styles (theme, font, spacing)
-    view.renderer.setStyles?.(getReaderCSS(readerSettings));
-
-    // Update reading mode — foliate-js supports instant switching
-    view.renderer.setAttribute("flow",
-      readerSettings.readingMode === "scrolling" ? "scrolled" : "paginated"
-    );
-
-    // Update page columns (single page vs two pages)
-    view.renderer.setAttribute("max-column-count", String(readerSettings.pageColumns));
-    // Spread mode for fixed-layout (PDF)
-    if (book?.format === "pdf") {
-      view.renderer.setAttribute("spread", readerSettings.pageColumns === 1 ? "none" : "auto");
+    if (capabilities.supportsReflowSettings) {
+      view.renderer.setStyles?.(getReaderCSS(readerSettings));
+      view.renderer.setAttribute("flow",
+        readerSettings.readingMode === "scrolling" ? "scrolled" : "paginated",
+      );
+      const baseWidth = 1000;
+      const marginOffset = readerSettings.margins * 2;
+      view.renderer.setAttribute("max-inline-size", `${Math.max(400, baseWidth - marginOffset)}px`);
     }
 
-    // Update max-inline-size for margins (narrower content = more margin)
-    const baseWidth = 1000;
-    const marginOffset = readerSettings.margins * 2;
-    view.renderer.setAttribute("max-inline-size", `${Math.max(400, baseWidth - marginOffset)}px`);
+    if (capabilities.supportsSpread) {
+      view.renderer.setAttribute("max-column-count", String(readerSettings.pageColumns));
+    }
+    if (capabilities.supportsSpread && book?.format === "pdf") {
+      view.renderer.setAttribute("spread", readerSettings.pageColumns === 1 ? "none" : "auto");
+    }
 
     // Update brightness
     if (viewerRef.current) {
@@ -892,11 +1041,10 @@ export default function Reader() {
     // PDF theming is handled by the overlay div in the JSX
     // bookReady is in deps so this re-runs once foliate finishes init —
     // fixes a race where DB-loaded settings arrive before view.renderer exists.
-  }, [readerSettings, book?.format, bookReady]);
+  }, [readerSettings, book?.format, bookReady, capabilities]);
 
-  // Foliate rebuilds the overlay whenever a section is re-rendered. Trigger
-  // that lightweight redraw when marker visibility changes, so toggles take
-  // effect on the current chapter without reopening the book.
+  // Re-layout alone does not remove stale annotation DOM, so marker changes
+  // update the mounted annotations directly.
   const markerVisibility = [
     readerSettings.showLookupMarkers,
     readerSettings.showNewVocabMarkers,
@@ -904,31 +1052,61 @@ export default function Reader() {
     readerSettings.showMasteredMarkers,
   ].join(":");
   useEffect(() => {
-    if (book?.format === "pdf") return;
-    const renderer = viewRef.current?.renderer as { render?: () => void } | undefined;
-    renderer?.render?.();
-  }, [book?.format, markerVisibility]);
+    refreshAnnotations().catch(() => {});
+  }, [bookReady, markerVisibility, refreshAnnotations]);
 
-  const zoomRef = useRef<number | "fit">(zoom);
-  zoomRef.current = zoom;
+  useEffect(() => {
+    const refreshForCurrentBook = (event: Event) => {
+      const detail = (event as CustomEvent<{ bookId?: string }>).detail;
+      if (!detail?.bookId || detail.bookId === bookId) refreshAnnotations().catch(() => {});
+    };
+    window.addEventListener("lookup-record-changed", refreshForCurrentBook);
+    window.addEventListener("vocab-changed", refreshForCurrentBook);
+    window.addEventListener("highlight-changed", refreshForCurrentBook);
+    window.addEventListener("focus", refreshForCurrentBook);
+    return () => {
+      window.removeEventListener("lookup-record-changed", refreshForCurrentBook);
+      window.removeEventListener("vocab-changed", refreshForCurrentBook);
+      window.removeEventListener("highlight-changed", refreshForCurrentBook);
+      window.removeEventListener("focus", refreshForCurrentBook);
+    };
+  }, [bookId, refreshAnnotations]);
 
-  // Effective fit-width percentage, updated as the viewer resizes. Used to
-  // seed the numeric zoom when the user clicks +/- from fit mode so the
-  // transition is smooth (e.g. fit≈1.47 → tap + → 150%, not 110%).
-  const fitPctRef = useRef(100);
-
-  const applyZoom = useCallback((value: number | "fit") => {
-    const renderer = viewRef.current?.renderer;
-    if (!renderer) return;
-    renderer.setAttribute("zoom", value === "fit" ? "fit-width" : String(value / 100));
-  }, []);
-
-  const handleZoom = useCallback((delta: number) => {
-    const base = zoomRef.current === "fit" ? fitPctRef.current : zoomRef.current;
-    const next = Math.min(300, Math.max(50, Math.round((base + delta) / 10) * 10));
-    applyZoom(next);
-    setZoom(next);
-  }, [applyZoom]);
+  useEffect(() => {
+    const applyNavigation = async (target: ReaderNavigation) => {
+      if (!bookReady || !viewRef.current) {
+        pendingNavigationRef.current = target;
+        return;
+      }
+      pendingNavigationRef.current = null;
+      if (target.cfi && supportsCfiNavigation) await viewRef.current.goTo(target.cfi);
+      if (target.openVocab && supportsCfiNavigation) setSidePanel("vocab");
+      if (target.openChat) {
+        setSidePanel("ai");
+        if (target.chatId) setInitialChatId(target.chatId);
+      }
+      if (target.navigationId) {
+        await emit("reader:navigate:ack", { navigationId: target.navigationId, bookId });
+      }
+    };
+    const unlisten = Promise.all([
+      appWindow.listen<{ bookId?: string }>("lookup-record-changed", (event) => {
+        if (!event.payload.bookId || event.payload.bookId === bookId) refreshAnnotations().catch(() => {});
+      }),
+      appWindow.listen<{ bookId?: string }>("vocab-changed", (event) => {
+        if (!event.payload.bookId || event.payload.bookId === bookId) refreshAnnotations().catch(() => {});
+      }),
+      appWindow.listen<ReaderNavigation>(
+        "reader:navigate",
+        (event) => {
+          applyNavigation(event.payload).catch(() => {});
+        },
+      ),
+    ]);
+    const pending = pendingNavigationRef.current;
+    if (pending) applyNavigation(pending).catch(() => {});
+    return () => { unlisten.then((fns) => fns.forEach((fn) => fn())).catch(() => {}); };
+  }, [bookId, bookReady, refreshAnnotations, supportsCfiNavigation]);
 
   // Track the current fit-width scale so +/- from fit mode lands near the
   // visible size. Observes the renderer and sums the natural widths of the
@@ -1038,7 +1216,10 @@ export default function Reader() {
 
   const panelRef = useRef<HTMLDivElement>(null);
   const panelWidthRef = useRef(panelWidth);
-  panelWidthRef.current = panelWidth;
+
+  useEffect(() => {
+    panelWidthRef.current = panelWidth;
+  }, [panelWidth]);
 
   const handlePanelResizePointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
@@ -1170,18 +1351,13 @@ export default function Reader() {
     const openVocab = state?.openVocab || searchParams.get("openVocab") === "true";
     const cfi = state?.cfi || searchParams.get("cfi") || undefined;
     if (!openVocab || !bookReady) return;
-    setSidePanel("vocab");
-    if (cfi) {
-      viewRef.current?.goTo(cfi).then(() => {
-        viewRef.current?.addAnnotation({ value: cfi, color: "#c27aff" });
-        setTimeout(() => {
-          viewRef.current?.deleteAnnotation({ value: cfi });
-        }, 3000);
-      });
+    if (supportsCfiNavigation) {
+      setSidePanel("vocab");
+      if (cfi) flashNavigationTarget(cfi).catch(() => {});
     }
     // Clear the state so it doesn't re-trigger
     if (!isStandaloneWindow) navigate(location.pathname, { replace: true });
-  }, [bookReady, location.state, location.pathname, navigate]);
+  }, [bookReady, flashNavigationTarget, location.state, location.pathname, navigate, supportsCfiNavigation]);
 
   if (loading) {
     return (
@@ -1351,26 +1527,28 @@ export default function Reader() {
             anchorRef={settingsAnchorRef}
             settings={readerSettings}
             onSettingsChange={setReaderSettings}
-            bookFormat={book.format}
+            capabilities={capabilities}
           />
 
-          <Button
-            variant="icon"
-            size="md"
-            active={sidePanel === "bookmarks"}
-            onClick={() => togglePanel("bookmarks")}
-          >
-            <Bookmark size={16} />
-          </Button>
+          {supportsCfiNavigation && <>
+            <Button
+              variant="icon"
+              size="md"
+              active={sidePanel === "bookmarks"}
+              onClick={() => togglePanel("bookmarks")}
+            >
+              <Bookmark size={16} />
+            </Button>
 
-          <Button
-            variant="icon"
-            size="md"
-            active={sidePanel === "vocab"}
-            onClick={() => togglePanel("vocab")}
-          >
-            <Languages size={16} />
-          </Button>
+            <Button
+              variant="icon"
+              size="md"
+              active={sidePanel === "vocab"}
+              onClick={() => togglePanel("vocab")}
+            >
+              <Languages size={16} />
+            </Button>
+          </>}
 
           <div className="w-px h-6 bg-border mx-1" />
 
@@ -1516,16 +1694,11 @@ export default function Reader() {
               initialChatId={initialChatId}
               onContextConsumed={() => setAiContext(undefined)}
               onNavigateToCfi={(cfi) => {
-                viewRef.current?.goTo(cfi).then(() => {
-                  viewRef.current?.addAnnotation({ value: cfi, color: "#c27aff" });
-                  setTimeout(() => {
-                    viewRef.current?.deleteAnnotation({ value: cfi });
-                  }, 3000);
-                });
+                flashNavigationTarget(cfi).catch(() => {});
               }}
             />
           </div>
-          {sidePanel === "bookmarks" && bookId && (
+          {supportsCfiNavigation && sidePanel === "bookmarks" && bookId && (
             <BookmarksPanel
               bookId={bookId}
               onNavigate={navigateToCfi}
@@ -1543,19 +1716,16 @@ export default function Reader() {
               }}
             />
           )}
-          {sidePanel === "vocab" && bookId && (
+          {supportsCfiNavigation && sidePanel === "vocab" && bookId && (
             <DictionaryPanel
               bookId={bookId}
               bookTitle={book.title}
               onNavigate={(cfi) => {
-                viewRef.current?.goTo(cfi).then(() => {
-                  viewRef.current?.addAnnotation({ value: cfi, color: "#c27aff" });
-                  setTimeout(() => {
-                    viewRef.current?.deleteAnnotation({ value: cfi });
-                  }, 3000);
-                });
+                flashNavigationTarget(cfi).catch(() => {});
               }}
               getPageFromCfi={() => pageInfo?.current ?? null}
+              initialWordCfi={activeVocabCfi}
+              onWordDetailClosed={() => setActiveVocabCfi(null)}
             />
           )}
         </div>
@@ -1620,7 +1790,7 @@ export default function Reader() {
             });
             setContextMenu(null);
           }}
-          onHighlight={(color) => {
+          onHighlight={supportsManualAnnotations ? ((color) => {
             const cfiRange = contextMenu.cfiRange;
             if (cfiRange && bookId) {
               invoke<Highlight>("add_highlight", {
@@ -1628,12 +1798,12 @@ export default function Reader() {
                 cfiRange,
                 color,
                 textContent: contextMenu.text,
-              }).then((hl) => {
-                viewRef.current?.addAnnotation({ value: hl.cfi_range, color: hl.color });
+              }).then(async () => {
+                await refreshAnnotations();
               }).catch((err) => console.error("Failed to add highlight:", err));
             }
             setContextMenu(null);
-          }}
+          }) : undefined}
         />
       )}
 
@@ -1688,18 +1858,16 @@ export default function Reader() {
           currentColor={highlightToolbar.color}
           onChangeColor={(color) => {
             invoke("update_highlight_color", { id: highlightToolbar.highlightId, color })
-              .then(() => {
-                // Remove old annotation and add with new color
-                viewRef.current?.deleteAnnotation({ value: highlightToolbar.cfiRange });
-                viewRef.current?.addAnnotation({ value: highlightToolbar.cfiRange, color });
+              .then(async () => {
+                await refreshAnnotations();
                 setHighlightToolbar((prev) => prev ? { ...prev, color } : null);
               })
               .catch((err) => console.error("Failed to update highlight color:", err));
           }}
           onDelete={() => {
             invoke("remove_highlight", { id: highlightToolbar.highlightId })
-              .then(() => {
-                viewRef.current?.deleteAnnotation({ value: highlightToolbar.cfiRange });
+              .then(async () => {
+                await refreshAnnotations();
                 setHighlightToolbar(null);
               })
               .catch((err) => console.error("Failed to remove highlight:", err));

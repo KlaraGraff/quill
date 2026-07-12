@@ -1,11 +1,12 @@
-import { useState, useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { KeyRound, Shield } from "lucide-react";
+import { ArrowDown, ArrowUp, KeyRound, Loader2, Plus, RotateCw, Shield, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import Button from "../ui/Button";
 import Select from "../ui/Select";
 import Input from "../ui/Input";
 import Slider from "../ui/Slider";
+import Toggle from "../ui/Toggle";
 import type { SettingsProps } from "./types";
 
 interface AiSettingsProps extends SettingsProps {
@@ -13,344 +14,252 @@ interface AiSettingsProps extends SettingsProps {
   onDirtyChange?: (dirty: boolean) => void;
 }
 
-export default function AiSettings({ settings, loading, saveBulk, showSavedToast, onSaveRef, onDirtyChange }: AiSettingsProps) {
+interface AiProfile {
+  id: string;
+  label: string;
+  provider: string;
+  auth_mode: "api_key" | "oauth";
+  base_url: string | null;
+  model: string;
+  temperature: number;
+  keep_alive: string | null;
+}
+
+interface AiCredential {
+  id: string;
+  profile_id: string;
+  label: string;
+  masked_suffix: string;
+  enabled: boolean;
+  priority: number;
+  state: string;
+  cooldown_until: number | null;
+  last_error_kind: string | null;
+}
+
+export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }: AiSettingsProps) {
   const { t } = useTranslation();
-  const [aiDirty, setAiDirty] = useState(false);
-
-  // AI config
-  const [provider, setProvider] = useState("openai");
-  const [providerLabel, setProviderLabel] = useState("");
-  const [apiKey, setApiKey] = useState("");
-  const [apiKeyConfigured, setApiKeyConfigured] = useState(false);
-  const [model, setModel] = useState("gpt-4o-mini");
-  const [baseUrl, setBaseUrl] = useState("https://api.openai.com");
-  const [temperature, setTemperature] = useState(0.3);
-  const [keepAlive, setKeepAlive] = useState("30m");
-
-  // OAuth
-  const [authMode, setAuthMode] = useState<"api_key" | "oauth">("api_key");
+  const [profile, setProfile] = useState<AiProfile | null>(null);
+  const [credentials, setCredentials] = useState<AiCredential[]>([]);
+  const [dirty, setDirty] = useState(false);
+  const [newKey, setNewKey] = useState("");
+  const [newLabel, setNewLabel] = useState("");
+  const [replaceId, setReplaceId] = useState<string | null>(null);
+  const [replaceValue, setReplaceValue] = useState("");
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [oauthStatus, setOauthStatus] = useState<{ connected: boolean; account_id: string | null }>({ connected: false, account_id: null });
   const [oauthLoading, setOauthLoading] = useState(false);
-  const [oauthError, setOauthError] = useState<string | null>(null);
 
-  // Load saved settings
-  useEffect(() => {
-    if (loading) return;
-    if (settings.ai_provider) setProvider(settings.ai_provider);
-    setApiKeyConfigured(settings.ai_api_key_configured === "true");
-    if (settings.ai_model) setModel(settings.ai_model);
-    if (settings.ai_base_url) setBaseUrl(settings.ai_base_url);
-    if (settings.ai_provider_label) setProviderLabel(settings.ai_provider_label);
-    if (settings.ai_temperature) setTemperature(parseFloat(settings.ai_temperature));
-    if (settings.ai_keep_alive) setKeepAlive(settings.ai_keep_alive);
-    if (settings.ai_auth_mode) setAuthMode(settings.ai_auth_mode as "api_key" | "oauth");
-  }, [settings, loading]);
-
-  useEffect(() => {
-    invoke<boolean>("ai_api_key_configured").then(setApiKeyConfigured).catch(() => {});
+  const load = useCallback(async () => {
+    try {
+      const nextProfile = await invoke<AiProfile>("ai_active_profile");
+      const nextCredentials = await invoke<AiCredential[]>("ai_list_credentials", { profileId: nextProfile.id });
+      setProfile(nextProfile);
+      setCredentials(nextCredentials);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
   }, []);
 
-  // Fetch OAuth status when provider is OpenAI
-  useEffect(() => {
-    if (provider === "openai") {
-      invoke<{ connected: boolean; account_id: string | null }>("openai_oauth_status")
-        .then(setOauthStatus)
-        .catch(() => setOauthStatus({ connected: false, account_id: null }));
-    }
-  }, [provider]);
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
 
-  // Expose dirty state and save handler to parent
-  useEffect(() => {
-    onDirtyChange?.(aiDirty);
-  }, [aiDirty, onDirtyChange]);
-
-  useEffect(() => {
-    onSaveRef?.(handleSaveAI);
-    return () => onSaveRef?.(null);
-  });
-
-  const handleSaveAI = async () => {
+  const refreshOAuthStatus = useCallback(async () => {
     try {
-      const nextSettings: Record<string, string> = {
-        ai_provider: provider,
-        ai_provider_label: providerLabel,
-        ai_model: model,
-        ai_base_url: baseUrl,
-        ai_temperature: String(temperature),
-        ai_keep_alive: keepAlive,
-        ai_auth_mode: authMode,
-      };
-      // Blank means "keep the securely stored key", not "erase it".
-      if (apiKey.trim()) nextSettings.ai_api_key = apiKey.trim();
-      await saveBulk(nextSettings);
-      if (apiKey.trim()) {
-        setApiKey("");
-        setApiKeyConfigured(true);
-      }
-      setAiDirty(false);
+      setOauthStatus(await invoke<{ connected: boolean; account_id: string | null }>("openai_oauth_status"));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (profile?.provider === "openai" && profile.auth_mode === "oauth") {
+      refreshOAuthStatus();
+    }
+  }, [profile?.auth_mode, profile?.provider, refreshOAuthStatus]);
+
+  const updateProfile = (patch: Partial<AiProfile>) => {
+    setProfile((current) => current ? { ...current, ...patch } : current);
+    setDirty(true);
+  };
+
+  const saveProfile = useCallback(async () => {
+    if (!profile) return;
+    try {
+      const saved = await invoke<AiProfile>("ai_save_profile", {
+        id: profile.id,
+        label: profile.label,
+        provider: profile.provider,
+        authMode: profile.auth_mode,
+        baseUrl: profile.base_url || null,
+        model: profile.model,
+        temperature: profile.temperature,
+        keepAlive: profile.keep_alive || null,
+      });
+      setProfile(saved);
+      setDirty(false);
       showSavedToast(t("settings.ai.savedToast"));
     } catch (err) {
-      console.error("Failed to save AI settings:", err);
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, [profile, showSavedToast, t]);
+
+  useEffect(() => {
+    onSaveRef?.(saveProfile);
+    return () => onSaveRef?.(null);
+  }, [onSaveRef, saveProfile]);
+
+  const addCredential = async () => {
+    if (!profile || !newKey.trim()) return;
+    setBusyId("new");
+    setError(null);
+    try {
+      await invoke("ai_add_credential", {
+        profileId: profile.id,
+        label: newLabel.trim() || t("settings.ai.defaultKeyLabel"),
+        value: newKey.trim(),
+      });
+      setNewKey("");
+      setNewLabel("");
+      await load();
+      showSavedToast(t("settings.ai.keyAdded"));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyId(null);
     }
   };
 
-  const handleOAuthLogin = async () => {
-    setOauthLoading(true);
-    setOauthError(null);
+  const replaceCredential = async () => {
+    if (!replaceId || !replaceValue.trim()) return;
+    setBusyId(replaceId);
     try {
-      const result = await invoke<{ connected: boolean; account_id: string | null }>("openai_oauth_login");
-      setOauthStatus(result);
-      // Auto-save AI configuration after successful OAuth login
-      await saveBulk({
-        ai_provider: provider,
-        ai_provider_label: providerLabel,
-        ai_model: model,
-        ai_base_url: baseUrl,
-        ai_temperature: String(temperature),
-        ai_keep_alive: keepAlive,
-        ai_auth_mode: authMode,
+      await invoke("ai_replace_credential", { id: replaceId, value: replaceValue.trim() });
+      setReplaceId(null);
+      setReplaceValue("");
+      await load();
+      showSavedToast(t("settings.ai.keyReplaced"));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const mutateCredential = async (id: string, action: "toggle" | "delete" | "test", enabled?: boolean) => {
+    setBusyId(id);
+    setError(null);
+    try {
+      if (action === "toggle") await invoke("ai_set_credential_enabled", { id, enabled });
+      if (action === "delete") await invoke("ai_delete_credential", { id });
+      if (action === "test") await invoke("ai_test_credential", { id });
+      await load();
+      if (action === "test") showSavedToast(t("settings.ai.keyTested"));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const reorder = async (index: number, direction: -1 | 1) => {
+    const next = [...credentials];
+    const target = index + direction;
+    if (target < 0 || target >= next.length) return;
+    [next[index], next[target]] = [next[target], next[index]];
+    setCredentials(next);
+    try {
+      await invoke("ai_reorder_credentials", { ids: next.map((credential) => credential.id) });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      load();
+    }
+  };
+
+  const loginWithOpenAi = async () => {
+    if (!profile) return;
+    setOauthLoading(true);
+    setError(null);
+    try {
+      // OAuth must use the persisted profile. Saving here prevents the
+      // browser flow from authenticating an API-key profile by accident.
+      const saved = await invoke<AiProfile>("ai_save_profile", {
+        id: profile.id,
+        label: profile.label,
+        provider: profile.provider,
+        authMode: "oauth",
+        baseUrl: null,
+        model: profile.model,
+        temperature: profile.temperature,
+        keepAlive: profile.keep_alive || null,
       });
-      setAiDirty(false);
+      setProfile(saved);
+      setDirty(false);
+      const status = await invoke<{ connected: boolean; account_id: string | null }>("openai_oauth_login");
+      setOauthStatus(status);
       showSavedToast(t("settings.ai.oauthSuccess"));
     } catch (err) {
-      setOauthError(err instanceof Error ? err.message : String(err));
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
       setOauthLoading(false);
     }
   };
 
-  const handleOAuthLogout = async () => {
+  const logoutFromOpenAi = async () => {
+    setOauthLoading(true);
+    setError(null);
     try {
       await invoke("openai_oauth_logout");
       setOauthStatus({ connected: false, account_id: null });
     } catch (err) {
-      console.error("Failed to logout:", err);
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setOauthLoading(false);
     }
   };
 
+  if (!profile) {
+    return <div className="flex items-center gap-2 py-6 text-[13px] text-text-muted"><Loader2 size={16} className="animate-spin" />{t("settings.librarySync.working")}</div>;
+  }
+
+  const usesApiKeys = profile.auth_mode === "api_key" && profile.provider !== "ollama";
   return (
     <div className="space-y-0">
-      {/* Provider */}
-      <div className="py-3 border-b border-border">
-        <div className="flex items-center justify-between">
-          <div>
-            <p className="text-[14px] font-medium text-text-primary">{t("settings.ai.provider")}</p>
-            <p className="text-[12px] text-text-muted mt-0.5">{t("settings.ai.providerHint")}</p>
-          </div>
-          <Select
-            className="w-[160px] shrink-0"
-            value={provider}
-            onChange={(p) => {
-              setProvider(p);
-              setApiKey("");
-              setAiDirty(true);
-              if (p === "ollama") {
-                setBaseUrl("http://localhost:11434"); setModel("qwen3.5");
-              } else if (p === "openai") {
-                setBaseUrl("https://api.openai.com"); setModel("gpt-4o-mini"); setAuthMode("api_key");
-              } else if (p === "anthropic") {
-                setBaseUrl(""); setModel("claude-sonnet-4-20250514");
-              } else {
-                setBaseUrl(""); setModel(""); setAuthMode("api_key");
-              }
-            }}
-            options={[
-              { value: "openai", label: "OpenAI" },
-              { value: "custom", label: t("settings.ai.customCompatible") },
-              { value: "anthropic", label: "Anthropic" },
-              { value: "ollama", label: "Ollama (Local)" },
-            ]}
-          />
-        </div>
+      <div className="py-3 border-b border-border flex items-center justify-between gap-4">
+        <div><p className="text-[14px] font-medium text-text-primary">{t("settings.ai.provider")}</p><p className="text-[12px] text-text-muted mt-0.5">{t("settings.ai.providerHint")}</p></div>
+        <Select className="w-[160px] shrink-0" value={profile.provider} onChange={(provider) => {
+          const defaults: Record<string, Partial<AiProfile>> = {
+            ollama: { base_url: "http://localhost:11434", model: "qwen3.5", auth_mode: "api_key" },
+            openai: { base_url: "https://api.openai.com", model: "gpt-4o-mini", auth_mode: "api_key" },
+            anthropic: { base_url: "https://api.anthropic.com", model: "claude-sonnet-4-20250514", auth_mode: "api_key" },
+            custom: { base_url: "", model: "", auth_mode: "api_key" },
+          };
+          updateProfile({ provider, ...defaults[provider] });
+        }} options={[
+          { value: "openai", label: "OpenAI" }, { value: "custom", label: t("settings.ai.customCompatible") },
+          { value: "anthropic", label: "Anthropic" }, { value: "ollama", label: "Ollama (Local)" },
+        ]} />
       </div>
 
-      {/* Authentication Method (OpenAI only) */}
-      {provider === "openai" && (
-        <div className="py-3 border-b border-border">
-          <p className="text-[14px] font-medium text-text-primary mb-1.5">
-            {t("settings.ai.authMethod")}
-          </p>
-          <div className="flex rounded-lg border border-border overflow-hidden">
-            <button
-              type="button"
-              className={`flex-1 flex items-center justify-center gap-2 h-9 text-[13px] font-medium transition-colors ${
-                authMode === "api_key"
-                  ? "bg-accent text-white"
-                  : "bg-bg-page text-text-secondary hover:bg-bg-input"
-              }`}
-              onClick={() => { setAuthMode("api_key"); setModel("gpt-4o"); setAiDirty(true); }}
-            >
-              <KeyRound size={14} />
-              {t("settings.ai.apiKey")}
-            </button>
-            <button
-              type="button"
-              className={`flex-1 flex items-center justify-center gap-2 h-9 text-[13px] font-medium transition-colors ${
-                authMode === "oauth"
-                  ? "bg-accent text-white"
-                  : "bg-bg-page text-text-secondary hover:bg-bg-input"
-              }`}
-              onClick={() => { setAuthMode("oauth"); setModel("gpt-5.3-codex"); setAiDirty(true); }}
-            >
-              <Shield size={14} />
-              {t("settings.ai.oauthLogin")}
-            </button>
-          </div>
-          <p className="text-[12px] text-text-muted mt-1.5">{t("settings.ai.authMethodHint")}</p>
+      {profile.provider === "openai" && <div className="py-3 border-b border-border"><p className="text-[14px] font-medium text-text-primary mb-1.5">{t("settings.ai.authMethod")}</p><div className="flex border border-border rounded-lg overflow-hidden"><button type="button" onClick={() => updateProfile({ auth_mode: "api_key" })} className={`flex-1 h-9 text-[13px] ${profile.auth_mode === "api_key" ? "bg-accent text-white" : "bg-bg-page text-text-secondary"}`}><KeyRound size={14} className="inline mr-1.5" />{t("settings.ai.apiKey")}</button><button type="button" onClick={() => updateProfile({ auth_mode: "oauth", model: "gpt-5.3-codex" })} className={`flex-1 h-9 text-[13px] ${profile.auth_mode === "oauth" ? "bg-accent text-white" : "bg-bg-page text-text-secondary"}`}><Shield size={14} className="inline mr-1.5" />{t("settings.ai.oauthLogin")}</button></div></div>}
+
+      {profile.provider !== "openai" || profile.auth_mode === "api_key" ? <div className="py-3 border-b border-border"><p className="text-[14px] font-medium text-text-primary mb-1.5">{t("settings.ai.baseUrl")}</p><Input value={profile.base_url ?? ""} onChange={(event) => updateProfile({ base_url: event.target.value })} placeholder="https://api.example.com" /></div> : <div className="py-3 border-b border-border space-y-3"><p className="text-[12px] text-text-muted">{t("settings.ai.oauthUsesAccount")}</p><p className="text-[12px] text-text-muted">{t("settings.ai.oauthHint")}</p>{oauthStatus.connected ? <div className="flex items-center justify-between gap-3"><span className="min-w-0 truncate text-[13px] text-text-primary">{t("settings.ai.connected", { account: oauthStatus.account_id || "OpenAI" })}</span><Button variant="ghost" size="sm" onClick={logoutFromOpenAi} disabled={oauthLoading}>{oauthLoading ? <Loader2 size={14} className="animate-spin" /> : null}{t("settings.ai.logout")}</Button></div> : <Button variant="primary" size="sm" onClick={loginWithOpenAi} disabled={oauthLoading}>{oauthLoading ? <Loader2 size={14} className="animate-spin" /> : <Shield size={14} />}{oauthLoading ? t("settings.ai.waitingAuth") : t("settings.ai.loginWithOpenAI")}</Button>}</div>}
+      <div className="py-3 border-b border-border"><p className="text-[14px] font-medium text-text-primary mb-1.5">{t("settings.ai.model")}</p><Input value={profile.model} onChange={(event) => updateProfile({ model: event.target.value })} /></div>
+      <div className="py-3 border-b border-border"><Slider label={t("settings.ai.temperature")} min={0} max={100} value={Math.round(profile.temperature * 100)} onChange={(value) => updateProfile({ temperature: value / 100 })} displayValue={profile.temperature.toFixed(1)} hint={t("settings.ai.temperatureHint")} /></div>
+
+      {usesApiKeys && <div className="py-4 border-b border-border">
+        <div className="flex items-center justify-between mb-3"><div><p className="text-[14px] font-medium text-text-primary">{t("settings.ai.apiKeys")}</p><p className="text-[12px] text-text-muted mt-0.5">{t("settings.ai.apiKeysHint")}</p></div><span className="text-[12px] text-text-muted">{credentials.filter((credential) => credential.enabled).length}</span></div>
+        <div className="space-y-2">
+          {credentials.map((credential, index) => <div key={credential.id} className="border border-border rounded-lg px-3 py-2.5">
+            <div className="flex items-center gap-2"><Toggle checked={credential.enabled} onChange={(enabled) => mutateCredential(credential.id, "toggle", enabled)} /><div className="flex-1 min-w-0"><p className="text-[13px] font-medium text-text-primary truncate">{credential.label} <span className="font-mono text-text-muted">••••{credential.masked_suffix}</span></p><p className="text-[11px] text-text-muted">{credential.state === "active" ? t("settings.ai.keyActive") : t("settings.ai.keyState", { state: credential.state })}</p></div><button type="button" title={t("settings.ai.moveUp")} disabled={index === 0} onClick={() => reorder(index, -1)} className="p-1 text-text-muted disabled:opacity-30"><ArrowUp size={14} /></button><button type="button" title={t("settings.ai.moveDown")} disabled={index === credentials.length - 1} onClick={() => reorder(index, 1)} className="p-1 text-text-muted disabled:opacity-30"><ArrowDown size={14} /></button><button type="button" title={t("settings.ai.testKey")} onClick={() => mutateCredential(credential.id, "test")} className="p-1 text-text-muted hover:text-accent-text"><RotateCw size={14} /></button><button type="button" title={t("settings.ai.deleteKey")} onClick={() => mutateCredential(credential.id, "delete")} className="p-1 text-text-muted hover:text-danger-text"><Trash2 size={14} /></button></div>
+            {replaceId === credential.id ? <div className="flex gap-2 mt-2"><Input type="password" value={replaceValue} onChange={(event) => setReplaceValue(event.target.value)} placeholder="sk-..." /><Button size="sm" variant="primary" onClick={replaceCredential} disabled={busyId === credential.id}>{t("settings.ai.replaceKey")}</Button></div> : <button type="button" onClick={() => setReplaceId(credential.id)} className="text-[12px] text-accent-text mt-2">{t("settings.ai.replaceKey")}</button>}
+          </div>)}
         </div>
-      )}
+        <div className="mt-3 grid grid-cols-[1fr_1.4fr_auto] gap-2"><Input value={newLabel} onChange={(event) => setNewLabel(event.target.value)} placeholder={t("settings.ai.keyLabel")} /><Input type="password" value={newKey} onChange={(event) => setNewKey(event.target.value)} placeholder="sk-..." /><Button variant="primary" size="sm" onClick={addCredential} disabled={!newKey.trim() || busyId === "new"}><Plus size={14} />{t("settings.ai.addKey")}</Button></div>
+      </div>}
 
-      {provider === "custom" && (
-        <div className="py-3 border-b border-border">
-          <p className="text-[14px] font-medium text-text-primary mb-1.5">
-            {t("settings.ai.providerName")}
-          </p>
-          <Input
-            value={providerLabel}
-            onChange={(e) => { setProviderLabel(e.target.value); setAiDirty(true); }}
-            placeholder={t("settings.ai.providerNamePlaceholder")}
-          />
-        </div>
-      )}
-
-      {/* OAuth Login Panel (OpenAI + OAuth mode) */}
-      {provider === "openai" && authMode === "oauth" && (
-        <div className="py-3 border-b border-border">
-          {oauthStatus.connected ? (
-            <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2.5">
-              <div className="flex items-center gap-2">
-                <span className="size-2 rounded-full bg-accent" />
-                <span className="size-2 rounded-full bg-green-500" />
-                <span className="text-[13px] text-text-primary font-medium">
-                  {t("settings.ai.connected", { account: oauthStatus.account_id ?? "Unknown" })}
-                </span>
-              </div>
-              <button
-                type="button"
-                className="text-[13px] font-medium text-text-muted hover:text-text-primary transition-colors"
-                onClick={handleOAuthLogout}
-              >
-                {t("settings.ai.logout")}
-              </button>
-            </div>
-          ) : (
-            <>
-              <Button
-                variant="primary"
-                size="lg"
-                className="w-full justify-center"
-                disabled={oauthLoading}
-                onClick={handleOAuthLogin}
-              >
-                {oauthLoading ? t("settings.ai.waitingAuth") : t("settings.ai.loginWithOpenAI")}
-              </Button>
-              {oauthError ? (
-                <div className="flex items-center justify-between mt-2 px-3 py-2 rounded-lg bg-red-50 dark:bg-red-950/30">
-                  <span className="text-[12px] text-red-600 dark:text-red-400">
-                    {t("settings.ai.authFailed")}
-                  </span>
-                  <button
-                    type="button"
-                    className="text-[12px] font-medium text-red-600 dark:text-red-400 hover:underline"
-                    onClick={handleOAuthLogin}
-                  >
-                    {t("settings.ai.retry")}
-                  </button>
-                </div>
-              ) : (
-                <p className="text-[12px] text-text-muted mt-1.5">
-                  {t("settings.ai.oauthHint")}
-                </p>
-              )}
-            </>
-          )}
-        </div>
-      )}
-
-      {/* API Key (for Anthropic / OpenAI Compatible -- hidden when OpenAI + OAuth) */}
-      {(provider === "anthropic" || provider === "custom" || (provider === "openai" && authMode === "api_key")) && (
-        <div className="py-3 border-b border-border">
-          <p className="text-[14px] font-medium text-text-primary mb-1.5">
-            {t("settings.ai.apiKey")}
-          </p>
-          <Input
-            type="password"
-            value={apiKey}
-            onChange={(e) => { setApiKey(e.target.value); setAiDirty(true); }}
-            placeholder={apiKeyConfigured ? t("settings.ai.apiKeyStored") : provider === "anthropic" ? "sk-ant-..." : "sk-..."}
-          />
-          <p className="text-[12px] text-text-muted mt-1.5">
-            {t("settings.ai.apiKeyHint")}
-          </p>
-        </div>
-      )}
-
-      {/* Base URL (for Ollama / OpenAI Compatible / Anthropic) */}
-      {(provider === "ollama" || provider === "custom" || (provider === "openai" && authMode === "api_key") || provider === "anthropic") && (
-        <div className="py-3 border-b border-border">
-          <p className="text-[14px] font-medium text-text-primary mb-1.5">
-            {t("settings.ai.baseUrl")}
-          </p>
-          <Input
-            value={baseUrl}
-            onChange={(e) => { setBaseUrl(e.target.value); setAiDirty(true); }}
-            placeholder={provider === "ollama" ? "http://localhost:11434" : "https://api.openai.com"}
-          />
-          <p className="text-[12px] text-text-muted mt-1.5">
-            {provider === "ollama" ? t("settings.ai.baseUrlOllama") : t("settings.ai.baseUrlGeneric")}
-          </p>
-        </div>
-      )}
-
-      {/* Model */}
-      <div className="py-3 border-b border-border">
-        <p className="text-[14px] font-medium text-text-primary mb-1.5">
-          {t("settings.ai.model")}
-        </p>
-        <Input
-          value={model}
-          onChange={(e) => { setModel(e.target.value); setAiDirty(true); }}
-          placeholder={
-            provider === "ollama" ? "qwen3.5" :
-            provider === "anthropic" ? "claude-sonnet-4-20250514" :
-            (provider === "openai" && authMode === "oauth") ? "gpt-5.3-codex" :
-            "gpt-4o"
-          }
-        />
-        <p className="text-[12px] text-text-muted mt-1.5">
-          {t("settings.ai.modelHint")}
-        </p>
-      </div>
-
-      {/* Temperature */}
-      <div className="py-3 border-b border-border">
-        <Slider
-          label={t("settings.ai.temperature")}
-          min={0}
-          max={100}
-          value={Math.round(temperature * 100)}
-          onChange={(v) => { setTemperature(v / 100); setAiDirty(true); }}
-          displayValue={temperature.toFixed(1)}
-          hint={t("settings.ai.temperatureHint")}
-        />
-      </div>
-
-      {/* Keep Alive (Ollama only) */}
-      {provider === "ollama" && (
-        <div className="py-3 border-b border-border">
-          <p className="text-[14px] font-medium text-text-primary mb-1.5">
-            {t("settings.ai.keepAlive")}
-          </p>
-          <Input
-            value={keepAlive}
-            onChange={(e) => { setKeepAlive(e.target.value); setAiDirty(true); }}
-            placeholder="30m"
-          />
-          <p className="text-[12px] text-text-muted mt-1.5">
-            {t("settings.ai.keepAliveHint")}
-          </p>
-        </div>
-      )}
+      {error && <p className="mt-3 text-[12px] text-danger-text">{error}</p>}
     </div>
   );
 }

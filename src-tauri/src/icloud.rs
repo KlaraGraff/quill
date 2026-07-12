@@ -1,7 +1,5 @@
-//! iCloud helpers — container-path resolution + file-presence checks.
+//! iCloud Drive helpers — file-presence checks for a user-selected folder.
 //!
-//! - **Path helper** (`icloud_data_dir`) resolves the ubiquity
-//!   Documents directory using a deterministic path — no daemon query.
 //! - **Eviction handling** (`is_file_downloaded`,
 //!   `icloud_placeholder_path`, `has_icloud_placeholder`,
 //!   `trigger_download_file`) for book and cover binaries that live in
@@ -11,47 +9,6 @@ use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSFileManager, NSString};
-
-#[cfg(target_os = "macos")]
-const ICLOUD_CONTAINER_ID: &str = "iCloud.com.wycstudios.quill";
-
-/// Returns the iCloud Documents directory using the deterministic path
-/// `~/Library/Mobile Documents/<container>/Documents`. No daemon query.
-///
-/// Returns `None` if `$HOME` is unset (non-macOS always returns None).
-/// Does NOT check whether the directory exists — callers that need an
-/// existence gate should check `path.exists()` themselves.
-#[cfg(target_os = "macos")]
-pub fn icloud_data_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let folder_name = ICLOUD_CONTAINER_ID.replace('.', "~");
-    Some(
-        PathBuf::from(home)
-            .join("Library/Mobile Documents")
-            .join(folder_name)
-            .join("Documents"),
-    )
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn icloud_data_dir() -> Option<PathBuf> {
-    None
-}
-
-/// Fast check for whether this Mac has iCloud set up. Looks for
-/// `~/Library/Mobile Documents` — present on any Mac signed into
-/// iCloud, absent otherwise. No daemon query.
-#[cfg(target_os = "macos")]
-pub fn is_icloud_available() -> bool {
-    std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join("Library/Mobile Documents").is_dir())
-        .unwrap_or(false)
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn is_icloud_available() -> bool {
-    false
-}
 
 /// Check whether a file is locally available (not an iCloud placeholder).
 ///
@@ -126,24 +83,6 @@ mod tests {
         assert!(!is_file_downloaded(&file));
     }
 
-    // --- icloud_data_dir ---
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_icloud_data_dir_returns_deterministic_path() {
-        let tmp = TempDir::new().unwrap();
-        let prev = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
-        let result = icloud_data_dir();
-        if let Some(home) = prev {
-            std::env::set_var("HOME", home);
-        }
-        let expected = tmp
-            .path()
-            .join("Library/Mobile Documents/iCloud~com~wycstudios~quill/Documents");
-        assert_eq!(result, Some(expected));
-    }
-
     // --- icloud_placeholder_path ---
 
     #[test]
@@ -173,5 +112,4 @@ mod tests {
         let file = dir.path().join("book.epub");
         assert!(!has_icloud_placeholder(&file));
     }
-
 }

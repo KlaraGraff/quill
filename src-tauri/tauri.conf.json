@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Quill",
-  "version": "1.2.10",
-  "identifier": "com.wycstudios.quill",
+  "productName": "Quill Personal",
+  "version": "1.3.0",
+  "identifier": "com.klaragraff.quill",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1430",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Quill",
+        "title": "Quill Personal",
         "width": 1440,
         "height": 960,
         "titleBarStyle": "Overlay",
@@ -21,24 +21,16 @@
       }
     ],
     "security": {
-      "csp": null,
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' blob:; img-src 'self' asset: http://asset.localhost data: blob:; font-src 'self' data: blob:; connect-src 'self' asset: http://asset.localhost ipc: http://ipc.localhost http://localhost:1430 ws://localhost:1430; media-src 'self' asset: http://asset.localhost data: blob:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-src 'self' blob:; frame-ancestors 'none'",
       "assetProtocol": {
         "enable": true,
-        "scope": ["$APPDATA/**", "$HOME/Library/Mobile Documents/iCloud~com~wycstudios~quill/Documents/**"]
+        "scope": ["$APPDATA/**"]
       }
-    }
-  },
-  "plugins": {
-    "updater": {
-      "endpoints": [
-        "https://github.com/yicheng47/quill/releases/latest/download/latest.json"
-      ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY3QjYzODMyNDFGNTY5Q0YKUldUUGFmVkJNamkyWnhoejBQb2hMYnhmcUZaSGxva2FZT1Q0OTJveWV0U25vVkRDeEtMY3hwenYK"
     }
   },
   "bundle": {
     "active": true,
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "targets": ["dmg", "app", "nsis"],
     "icon": [
       "icons/32x32.png",
@@ -57,14 +49,41 @@
         "ext": ["pdf"],
         "mimeType": "application/pdf",
         "description": "PDF Document"
+      },
+      {
+        "ext": ["txt"],
+        "mimeType": "text/plain",
+        "description": "Plain Text Document"
+      },
+      {
+        "ext": ["md", "markdown"],
+        "mimeType": "text/markdown",
+        "description": "Markdown Document"
+      },
+      {
+        "ext": ["html", "htm"],
+        "mimeType": "text/html",
+        "description": "HTML Document"
+      },
+      {
+        "ext": ["mobi", "azw", "azw3"],
+        "mimeType": "application/x-mobipocket-ebook",
+        "description": "MOBI Ebook"
+      },
+      {
+        "ext": ["fb2", "fbz"],
+        "mimeType": "application/x-fictionbook+xml",
+        "description": "FictionBook Ebook"
+      },
+      {
+        "ext": ["cbz"],
+        "mimeType": "application/vnd.comicbook+zip",
+        "description": "Comic Book Archive"
       }
     ],
     "macOS": {
       "signingIdentity": null,
-      "entitlements": "Entitlements.plist",
-      "files": {
-        "embedded.provisionprofile": "embedded.provisionprofile"
-      }
+      "entitlements": null
     },
     "windows": {
       "certificateThumbprint": null,

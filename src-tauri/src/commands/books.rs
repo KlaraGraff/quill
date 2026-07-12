@@ -1,13 +1,21 @@
 use std::fs;
 use std::io::Cursor;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use image::ImageFormat;
 use pdfium_render::prelude::*;
+use pulldown_cmark::{
+    Event as MarkdownEvent, Options as MarkdownOptions, Parser as MarkdownParser,
+};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::State;
+use zip::read::ZipArchive;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipWriter};
 
 use crate::db::Db;
 use crate::epub;
@@ -41,6 +49,319 @@ struct PdfExtracted {
     cover: Option<Vec<u8>>,
 }
 
+const TEXT_CONVERSION_VERSION: i32 = 2;
+const MAX_TEXT_IMPORT_BYTES: u64 = 25 * 1024 * 1024;
+const TXT_CHAPTER_TARGET_CHARS: usize = 24_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportFormat {
+    Epub,
+    Pdf,
+    Txt,
+    Markdown,
+    Html,
+    Mobi,
+    Fb2,
+    Fbz,
+    Cbz,
+}
+
+impl ImportFormat {
+    fn source_name(self) -> &'static str {
+        match self {
+            Self::Epub => "epub",
+            Self::Pdf => "pdf",
+            Self::Txt => "txt",
+            Self::Markdown => "markdown",
+            Self::Html => "html",
+            Self::Mobi => "mobi",
+            Self::Fb2 => "fb2",
+            Self::Fbz => "fbz",
+            Self::Cbz => "cbz",
+        }
+    }
+
+    fn native_extension(self, path: &Path) -> Option<String> {
+        match self {
+            Self::Mobi => path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.to_ascii_lowercase()),
+            Self::Fb2 => Some("fb2".to_string()),
+            Self::Fbz => Some("fbz".to_string()),
+            Self::Cbz => Some("cbz".to_string()),
+            Self::Epub | Self::Pdf | Self::Txt | Self::Markdown | Self::Html => None,
+        }
+    }
+}
+
+fn unsupported_format() -> AppError {
+    AppError::Other("UNSUPPORTED_FORMAT".to_string())
+}
+
+fn detect_import_format(path: &Path) -> AppResult<ImportFormat> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file()
+        || metadata.len() > MAX_TEXT_IMPORT_BYTES
+            && matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some(ext) if ext.eq_ignore_ascii_case("txt")
+                    || ext.eq_ignore_ascii_case("md")
+                    || ext.eq_ignore_ascii_case("markdown")
+                    || ext.eq_ignore_ascii_case("html")
+                    || ext.eq_ignore_ascii_case("htm")
+            )
+    {
+        return Err(unsupported_format());
+    }
+    let mut file = fs::File::open(path)?;
+    let mut header = [0_u8; 8 * 1024];
+    let read = file.read(&mut header)?;
+    let header = &header[..read];
+    if header.starts_with(b"%PDF-") {
+        return Ok(ImportFormat::Pdf);
+    }
+    if header.starts_with(b"PK\x03\x04") {
+        let file = fs::File::open(path)?;
+        let mut archive =
+            ZipArchive::new(file).map_err(|_| AppError::Other("INVALID_CONTAINER".to_string()))?;
+        let has_epub_mimetype = if let Ok(mut mimetype) = archive.by_name("mimetype") {
+            let mut content = String::new();
+            let _ = mimetype.read_to_string(&mut content);
+            content.trim() == "application/epub+zip"
+        } else {
+            false
+        };
+        if has_epub_mimetype && archive.by_name("META-INF/container.xml").is_ok() {
+            return Ok(ImportFormat::Epub);
+        }
+        let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+        let entries = archive
+            .file_names()
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        if ext.eq_ignore_ascii_case("fbz") && entries.iter().any(|name| name.ends_with(".fb2")) {
+            return Ok(ImportFormat::Fbz);
+        }
+        if ext.eq_ignore_ascii_case("cbz")
+            && entries.iter().any(|name| {
+                name.ends_with(".jpg")
+                    || name.ends_with(".jpeg")
+                    || name.ends_with(".png")
+                    || name.ends_with(".gif")
+                    || name.ends_with(".webp")
+            })
+        {
+            return Ok(ImportFormat::Cbz);
+        }
+        return Err(AppError::Other("INVALID_CONTAINER".to_string()));
+    }
+
+    let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    if matches!(ext.to_ascii_lowercase().as_str(), "mobi" | "azw" | "azw3")
+        && header.len() >= 68
+        && &header[60..68] == b"BOOKMOBI"
+    {
+        return Ok(ImportFormat::Mobi);
+    }
+    if ext.eq_ignore_ascii_case("fb2")
+        && std::str::from_utf8(header)
+            .ok()
+            .is_some_and(|text| text.to_ascii_lowercase().contains("<fictionbook"))
+    {
+        return Ok(ImportFormat::Fb2);
+    }
+    if !header.contains(&0) {
+        if ext.eq_ignore_ascii_case("txt") {
+            return Ok(ImportFormat::Txt);
+        }
+        if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown") {
+            return Ok(ImportFormat::Markdown);
+        }
+        if ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm") {
+            return Ok(ImportFormat::Html);
+        }
+    }
+    Err(unsupported_format())
+}
+
+fn decode_txt(bytes: &[u8]) -> AppResult<String> {
+    if bytes.len() as u64 > MAX_TEXT_IMPORT_BYTES {
+        return Err(AppError::Other("TEXT_FILE_TOO_LARGE".to_string()));
+    }
+    if let Some((encoding, bom_len)) = encoding_rs::Encoding::for_bom(bytes) {
+        let (text, _, had_errors) = encoding.decode(&bytes[bom_len..]);
+        if had_errors {
+            return Err(AppError::Other("ENCODING_UNCERTAIN".to_string()));
+        }
+        return Ok(text.into_owned());
+    }
+    let mut detector = chardetng::EncodingDetector::new();
+    detector.feed(bytes, true);
+    let encoding = detector.guess(None, true);
+    let (text, _, had_errors) = encoding.decode(bytes);
+    if had_errors {
+        return Err(AppError::Other("ENCODING_UNCERTAIN".to_string()));
+    }
+    Ok(text.into_owned())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn source_sha256(path: &Path) -> AppResult<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn markdown_to_text(markdown: &str) -> String {
+    let options = MarkdownOptions::ENABLE_STRIKETHROUGH
+        | MarkdownOptions::ENABLE_TABLES
+        | MarkdownOptions::ENABLE_TASKLISTS;
+    let mut text = String::new();
+    for event in MarkdownParser::new_ext(markdown, options) {
+        match event {
+            MarkdownEvent::Text(value) | MarkdownEvent::Code(value) => text.push_str(&value),
+            MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => text.push('\n'),
+            _ => {}
+        }
+    }
+    text
+}
+
+fn html_to_text(html: &str) -> String {
+    let cleaned = ammonia::clean(html);
+    scraper::Html::parse_fragment(&cleaned)
+        .root_element()
+        .text()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn text_chapters(text: &str) -> Vec<(String, Vec<String>)> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut chapters = Vec::<(String, Vec<String>)>::new();
+    let mut current_title = "Reading".to_string();
+    let mut current = Vec::<String>::new();
+    let flush = |chapters: &mut Vec<(String, Vec<String>)>,
+                 title: &mut String,
+                 current: &mut Vec<String>| {
+        if !current.is_empty() {
+            chapters.push((std::mem::take(title), std::mem::take(current)));
+        }
+    };
+    for line in normalized.lines() {
+        let line = line.trim();
+        let chapter_title = line.len() < 100
+            && (line.to_ascii_lowercase().starts_with("chapter ")
+                || line.to_ascii_lowercase().starts_with("chapter\t")
+                || (line.starts_with('第') && (line.contains('章') || line.contains('节'))));
+        if chapter_title {
+            flush(&mut chapters, &mut current_title, &mut current);
+            current_title = line.to_string();
+        } else if !line.is_empty() {
+            current.push(line.to_string());
+            if current.iter().map(String::len).sum::<usize>() >= TXT_CHAPTER_TARGET_CHARS {
+                flush(&mut chapters, &mut current_title, &mut current);
+                current_title = format!("Part {}", chapters.len() + 1);
+            }
+        }
+    }
+    flush(&mut chapters, &mut current_title, &mut current);
+    if chapters.is_empty() {
+        chapters.push(("Reading".to_string(), vec!["".to_string()]));
+    }
+    chapters
+}
+
+fn write_internal_epub(path: &Path, title: &str, text: &str, source_sha256: &str) -> AppResult<()> {
+    let file = fs::File::create(path)?;
+    let mut zip = ZipWriter::new(file);
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let chapters = text_chapters(text);
+    zip.start_file("mimetype", stored)
+        .map_err(|error| AppError::Other(format!("CONVERSION_FAILED: {error}")))?;
+    zip.write_all(b"application/epub+zip")?;
+    zip.start_file("META-INF/container.xml", deflated)
+        .map_err(|error| AppError::Other(format!("CONVERSION_FAILED: {error}")))?;
+    zip.write_all(br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#)?;
+    for (index, (chapter_title, paragraphs)) in chapters.iter().enumerate() {
+        zip.start_file(format!("OEBPS/chapter-{:04}.xhtml", index + 1), deflated)
+            .map_err(|error| AppError::Other(format!("CONVERSION_FAILED: {error}")))?;
+        let body = paragraphs
+            .iter()
+            .map(|paragraph| format!("<p>{}</p>", xml_escape(paragraph)))
+            .collect::<String>();
+        let html = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{}</title><link rel="stylesheet" type="text/css" href="style.css"/></head><body><h1>{}</h1>{}</body></html>"#,
+            xml_escape(chapter_title),
+            xml_escape(chapter_title),
+            body
+        );
+        zip.write_all(html.as_bytes())?;
+    }
+    zip.start_file("OEBPS/style.css", deflated)
+        .map_err(|error| AppError::Other(format!("CONVERSION_FAILED: {error}")))?;
+    zip.write_all(
+        b"body { line-height: 1.65; } p { margin: 0 0 1em; } h1 { page-break-before: always; }",
+    )?;
+    zip.start_file("OEBPS/nav.xhtml", deflated)
+        .map_err(|error| AppError::Other(format!("CONVERSION_FAILED: {error}")))?;
+    let nav_items = chapters
+        .iter()
+        .enumerate()
+        .map(|(index, (chapter_title, _))| {
+            format!(
+                r#"<li><a href="chapter-{:04}.xhtml">{}</a></li>"#,
+                index + 1,
+                xml_escape(chapter_title)
+            )
+        })
+        .collect::<String>();
+    zip.write_all(format!(r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>Contents</title></head><body><nav epub:type="toc"><ol>{}</ol></nav></body></html>"#, nav_items).as_bytes())?;
+    zip.start_file("OEBPS/content.opf", deflated)
+        .map_err(|error| AppError::Other(format!("CONVERSION_FAILED: {error}")))?;
+    let manifest = chapters.iter().enumerate().map(|(index, _)| format!(r#"<item id="chapter-{}" href="chapter-{:04}.xhtml" media-type="application/xhtml+xml"/>"#, index + 1, index + 1)).collect::<String>();
+    let spine = chapters
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!(r#"<itemref idref="chapter-{}"/>"#, index + 1))
+        .collect::<String>();
+    let opf = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="book-id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="book-id">urn:uuid:{}</dc:identifier><dc:title>{}</dc:title><dc:creator>Unknown Author</dc:creator><dc:language>en</dc:language></metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="style" href="style.css" media-type="text/css"/>{}</manifest><spine>{}</spine></package>"#,
+        source_sha256,
+        xml_escape(title),
+        manifest,
+        spine
+    );
+    zip.write_all(opf.as_bytes())?;
+    zip.finish()
+        .map_err(|error| AppError::Other(format!("CONVERSION_FAILED: {error}")))?;
+    Ok(())
+}
+
 /// Single pdfium pass: load the doc once (streaming via `Read + Seek`
 /// internally — bounded memory regardless of PDF size), pull
 /// title/author/page-count from its metadata, and render page 1 to JPEG.
@@ -59,8 +380,8 @@ fn extract_pdf(path: &Path, fallback_title: &str) -> PdfExtracted {
         cover: None,
     };
 
-    let Ok(pdfium) = pdfium::pdfium()
-        .inspect_err(|e| log::warn!("extract_pdf: pdfium unavailable: {e}"))
+    let Ok(pdfium) =
+        pdfium::pdfium().inspect_err(|e| log::warn!("extract_pdf: pdfium unavailable: {e}"))
     else {
         return fallback();
     };
@@ -87,15 +408,21 @@ fn extract_pdf(path: &Path, fallback_title: &str) -> PdfExtracted {
             .filter(|s| !s.trim().is_empty())
     };
 
-    let title = info(PdfDocumentMetadataTagType::Title)
-        .unwrap_or_else(|| fallback_title.to_string());
-    let author = info(PdfDocumentMetadataTagType::Author)
-        .unwrap_or_else(|| "Unknown Author".into());
+    let title =
+        info(PdfDocumentMetadataTagType::Title).unwrap_or_else(|| fallback_title.to_string());
+    let author =
+        info(PdfDocumentMetadataTagType::Author).unwrap_or_else(|| "Unknown Author".into());
     let description = info(PdfDocumentMetadataTagType::Subject);
     let pages = doc.pages().len();
     let cover = render_first_page(&doc);
 
-    PdfExtracted { title, author, description, pages, cover }
+    PdfExtracted {
+        title,
+        author,
+        description,
+        pages,
+        cover,
+    }
 }
 
 /// Render page 1 of an already-loaded PDF to JPEG bytes.
@@ -120,13 +447,18 @@ fn render_first_page(doc: &PdfDocument) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-
 /// Sanitize a book title into a safe filename slug.
 /// Keeps alphanumeric, spaces (→ hyphens), and common punctuation, then truncates.
 fn slugify(title: &str) -> String {
     let slug: String = title
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { ' ' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -179,6 +511,16 @@ pub struct Book {
     pub cover_path: Option<String>,
     pub file_path: String,
     pub format: String,
+    #[serde(default)]
+    pub source_format: Option<String>,
+    #[serde(default)]
+    pub render_format: Option<String>,
+    #[serde(default)]
+    pub source_file_path: Option<String>,
+    #[serde(default)]
+    pub source_sha256: Option<String>,
+    #[serde(default)]
+    pub conversion_version: i32,
     pub genre: Option<String>,
     pub pages: Option<i32>,
     pub status: String,
@@ -198,32 +540,59 @@ fn default_true() -> bool {
     true
 }
 
+struct ImportFileCleanup {
+    paths: Vec<PathBuf>,
+    committed: bool,
+}
+
+impl ImportFileCleanup {
+    fn new(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self {
+            paths: paths.into_iter().collect(),
+            committed: false,
+        }
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ImportFileCleanup {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for path in &self.paths {
+            match fs::remove_file(path) {
+                Ok(()) => log::info!("import_book: rolled back file {}", path.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => log::warn!(
+                    "import_book: failed to roll back file {}: {error}",
+                    path.display()
+                ),
+            }
+        }
+    }
+}
+
 /// Resolve relative paths in a Book to absolute using data_dir,
 /// and check whether the book file is locally available.
-fn resolve_book_paths(book: &mut Book, db: &Db) {
-    if !std::path::Path::new(&book.file_path).is_absolute() {
-        book.file_path = db
-            .resolve_path(&book.file_path)
-            .to_string_lossy()
-            .to_string();
-    }
+fn resolve_book_paths(book: &mut Book, db: &Db) -> AppResult<()> {
+    book.file_path = db
+        .resolve_path(&book.file_path)?
+        .to_string_lossy()
+        .to_string();
     if let Some(ref cover) = book.cover_path {
-        if cover != "none" && !std::path::Path::new(cover).is_absolute() {
-            book.cover_path = Some(
-                db.resolve_path(cover)
-                    .to_string_lossy()
-                    .to_string(),
-            );
+        if cover != "none" {
+            book.cover_path = Some(db.resolve_path(cover)?.to_string_lossy().to_string());
         }
     }
     book.available = icloud::is_file_downloaded(std::path::Path::new(&book.file_path));
+    Ok(())
 }
 
-pub(crate) fn do_import_epub(
-    file_path: &str,
-    db: &Db,
-    sync: &SyncWriter,
-) -> AppResult<Book> {
+pub(crate) fn do_import_epub(file_path: &str, db: &Db, sync: &SyncWriter) -> AppResult<Book> {
     let data_dir = db
         .data_dir
         .lock()
@@ -233,14 +602,18 @@ pub(crate) fn do_import_epub(
 
     let book_id = uuid::Uuid::new_v4().to_string();
     let src = std::path::Path::new(file_path);
+    let source_sha256 = source_sha256(src)?;
 
-    let metadata = epub::extract_metadata(src)
-        .inspect_err(|e| log::error!("import_book: extract_metadata failed for {file_path}: {e}"))?;
+    let metadata = epub::extract_metadata(src).inspect_err(|e| {
+        log::error!("import_book: extract_metadata failed for {file_path}: {e}")
+    })?;
     let pages = epub::count_chapters(src)
-        .inspect_err(|e| log::error!("import_book: count_chapters failed for {file_path}: {e}"))? as i32;
+        .inspect_err(|e| log::error!("import_book: count_chapters failed for {file_path}: {e}"))?
+        as i32;
 
     let filename = book_filename(&metadata.title, &book_id, "epub");
     let dest = books_dir.join(&filename);
+    let cleanup = ImportFileCleanup::new([dest.clone()]);
     fs::copy(src, &dest)?;
 
     let now = chrono::Utc::now().timestamp_millis();
@@ -253,8 +626,13 @@ pub(crate) fn do_import_epub(
         author: metadata.author,
         description: metadata.description,
         cover_path: None,
-        file_path: rel_file_path,
+        file_path: rel_file_path.clone(),
         format: "epub".to_string(),
+        source_format: Some("epub".to_string()),
+        render_format: Some("epub".to_string()),
+        source_file_path: Some(rel_file_path.clone()),
+        source_sha256: Some(source_sha256),
+        conversion_version: 0,
         genre: None,
         pages: Some(pages),
         status: "unread".to_string(),
@@ -267,16 +645,161 @@ pub(crate) fn do_import_epub(
     };
 
     do_insert_book(&book, metadata.cover_data.as_deref(), db, sync, now)?;
+    cleanup.commit();
 
-    log::info!("import_book: complete id={} title={:?}", book.id, book.title);
+    log::info!(
+        "import_book: complete id={} title={:?}",
+        book.id,
+        book.title
+    );
     Ok(book)
 }
 
-pub(crate) fn do_import_pdf(
+pub(crate) fn do_import_text(
     file_path: &str,
+    source_format: &str,
     db: &Db,
     sync: &SyncWriter,
 ) -> AppResult<Book> {
+    let source = Path::new(file_path);
+    let bytes = fs::read(source)?;
+    let source_hash = sha256_hex(&bytes);
+    let decoded = decode_txt(&bytes)?;
+    let text = match source_format {
+        "markdown" => markdown_to_text(&decoded),
+        "html" => html_to_text(&decoded),
+        _ => decoded,
+    };
+    let title = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Untitled")
+        .trim();
+    let title = if title.is_empty() { "Untitled" } else { title };
+    let data_dir = db
+        .data_dir
+        .lock()
+        .map_err(|e| AppError::Other(e.to_string()))?
+        .clone();
+    let books_dir = data_dir.join("books");
+    let sources_dir = data_dir.join("sources");
+    fs::create_dir_all(&books_dir)?;
+    fs::create_dir_all(&sources_dir)?;
+    let book_id = uuid::Uuid::new_v4().to_string();
+    let filename = book_filename(title, &book_id, "epub");
+    let final_path = books_dir.join(&filename);
+    let temporary_path = books_dir.join(format!(".{filename}.tmp"));
+    let source_extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("txt")
+        .to_ascii_lowercase();
+    let source_filename = book_filename(title, &book_id, &source_extension);
+    let source_path = sources_dir.join(&source_filename);
+    let cleanup = ImportFileCleanup::new([
+        temporary_path.clone(),
+        final_path.clone(),
+        source_path.clone(),
+    ]);
+    fs::copy(source, &source_path)?;
+    write_internal_epub(&temporary_path, title, &text, &source_hash)?;
+    epub::extract_metadata(&temporary_path)?;
+    fs::rename(&temporary_path, &final_path)?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let book = Book {
+        id: book_id,
+        title: title.to_string(),
+        author: "Unknown Author".to_string(),
+        description: None,
+        cover_path: None,
+        file_path: format!("books/{filename}"),
+        format: "epub".to_string(),
+        source_format: Some(source_format.to_string()),
+        render_format: Some("epub".to_string()),
+        source_file_path: Some(format!("sources/{source_filename}")),
+        source_sha256: Some(source_hash),
+        conversion_version: TEXT_CONVERSION_VERSION,
+        genre: None,
+        pages: Some(text_chapters(&text).len() as i32),
+        status: "unread".to_string(),
+        progress: 0,
+        current_cfi: None,
+        created_at: now,
+        updated_at: now,
+        available: true,
+        cover_data: None,
+    };
+    do_insert_book(&book, None, db, sync, now)?;
+    cleanup.commit();
+    Ok(book)
+}
+
+fn do_import_native(
+    file_path: &str,
+    format: ImportFormat,
+    db: &Db,
+    sync: &SyncWriter,
+) -> AppResult<Book> {
+    let source = Path::new(file_path);
+    let source_sha256 = source_sha256(source)?;
+    let extension = format
+        .native_extension(source)
+        .ok_or_else(unsupported_format)?;
+    // AZW/AZW3 share Foliate's MOBI parser but keep their source extension so
+    // the stored filename and the File handed to the reader remain faithful.
+    let source_format = if format == ImportFormat::Mobi {
+        extension.clone()
+    } else {
+        format.source_name().to_string()
+    };
+    let title = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Untitled")
+        .trim();
+    let title = if title.is_empty() { "Untitled" } else { title };
+    let data_dir = db
+        .data_dir
+        .lock()
+        .map_err(|error| AppError::Other(error.to_string()))?
+        .clone();
+    let books_dir = data_dir.join("books");
+    fs::create_dir_all(&books_dir)?;
+    let book_id = uuid::Uuid::new_v4().to_string();
+    let filename = book_filename(title, &book_id, &extension);
+    let final_path = books_dir.join(&filename);
+    let cleanup = ImportFileCleanup::new([final_path.clone()]);
+    fs::copy(source, &final_path)?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let book = Book {
+        id: book_id,
+        title: title.to_string(),
+        author: "Unknown Author".to_string(),
+        description: None,
+        cover_path: None,
+        file_path: format!("books/{filename}"),
+        format: source_format.clone(),
+        source_format: Some(source_format.clone()),
+        render_format: Some(source_format),
+        source_file_path: Some(format!("books/{filename}")),
+        source_sha256: Some(source_sha256),
+        conversion_version: 0,
+        genre: None,
+        pages: None,
+        status: "unread".to_string(),
+        progress: 0,
+        current_cfi: None,
+        created_at: now,
+        updated_at: now,
+        available: true,
+        cover_data: None,
+    };
+    do_insert_book(&book, None, db, sync, now)?;
+    cleanup.commit();
+    Ok(book)
+}
+
+pub(crate) fn do_import_pdf(file_path: &str, db: &Db, sync: &SyncWriter) -> AppResult<Book> {
     let data_dir = db
         .data_dir
         .lock()
@@ -287,6 +810,7 @@ pub(crate) fn do_import_pdf(
 
     let book_id = uuid::Uuid::new_v4().to_string();
     let src = Path::new(file_path);
+    let source_sha256 = source_sha256(src)?;
 
     let fallback_title = src
         .file_stem()
@@ -303,6 +827,7 @@ pub(crate) fn do_import_pdf(
 
     let filename = book_filename(&extracted.title, &book_id, "pdf");
     let dest = books_dir.join(&filename);
+    let cleanup = ImportFileCleanup::new([dest.clone()]);
     let t2 = std::time::Instant::now();
     fs::copy(src, &dest)?;
     let t_copy = t2.elapsed();
@@ -317,8 +842,13 @@ pub(crate) fn do_import_pdf(
         author: extracted.author,
         description: extracted.description,
         cover_path: None,
-        file_path: rel_file_path,
+        file_path: rel_file_path.clone(),
         format: "pdf".to_string(),
+        source_format: Some("pdf".to_string()),
+        render_format: Some("pdf".to_string()),
+        source_file_path: Some(rel_file_path.clone()),
+        source_sha256: Some(source_sha256),
+        conversion_version: 0,
         genre: None,
         pages: Some(extracted.pages),
         status: "unread".to_string(),
@@ -331,6 +861,7 @@ pub(crate) fn do_import_pdf(
     };
 
     do_insert_book(&book, extracted.cover.as_deref(), db, sync, now)?;
+    cleanup.commit();
 
     log::info!(
         "import_book: complete id={} title={:?} format=pdf cover={} | extract={:?} copy={:?}",
@@ -343,12 +874,18 @@ pub(crate) fn do_import_pdf(
     Ok(book)
 }
 
-fn do_insert_book(book: &Book, cover_bytes: Option<&[u8]>, db: &Db, sync: &SyncWriter, now: i64) -> AppResult<()> {
+fn do_insert_book(
+    book: &Book,
+    cover_bytes: Option<&[u8]>,
+    db: &Db,
+    sync: &SyncWriter,
+    now: i64,
+) -> AppResult<()> {
     let device = sync.self_device().to_string();
     sync.with_tx(db, now, |tx, events| {
         tx.execute(
-            "INSERT INTO books (id, title, author, description, cover_path, file_path, format, genre, pages, status, progress, current_cfi, created_at, updated_at, updated_by_device, cover_data)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            "INSERT INTO books (id, title, author, description, cover_path, file_path, format, source_format, render_format, source_file_path, source_sha256, conversion_version, genre, pages, status, progress, current_cfi, created_at, updated_at, updated_by_device, cover_data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 book.id,
                 book.title,
@@ -357,6 +894,11 @@ fn do_insert_book(book: &Book, cover_bytes: Option<&[u8]>, db: &Db, sync: &SyncW
                 book.cover_path,
                 book.file_path,
                 book.format,
+                book.source_format.as_deref().unwrap_or(&book.format),
+                book.render_format.as_deref().unwrap_or(&book.format),
+                book.source_file_path,
+                book.source_sha256,
+                book.conversion_version,
                 book.genre,
                 book.pages,
                 book.status,
@@ -376,6 +918,11 @@ fn do_insert_book(book: &Book, cover_bytes: Option<&[u8]>, db: &Db, sync: &SyncW
             cover_path: book.cover_path.clone(),
             file_path: book.file_path.clone(),
             format: book.format.clone(),
+            source_format: book.source_format.clone(),
+            render_format: book.render_format.clone(),
+            source_file_path: book.source_file_path.clone(),
+            source_sha256: book.source_sha256.clone(),
+            conversion_version: book.conversion_version,
             genre: book.genre.clone(),
             pages: book.pages,
         }));
@@ -393,20 +940,29 @@ pub async fn import_book(
     db: State<'_, Db>,
     sync: State<'_, SyncWriter>,
 ) -> AppResult<Book> {
-    let ext = file_path
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
-    log::info!("import_book: start file={file_path} format={ext}");
-    let mut book = match ext.as_str() {
-        "pdf" => do_import_pdf(&file_path, &db, &sync)?,
-        _ => do_import_epub(&file_path, &db, &sync)?,
-    };
-    resolve_book_paths(&mut book, &db);
+    let mut book = do_import_from_path(&file_path, &db, &sync)?;
+    resolve_book_paths(&mut book, &db)?;
     Ok(book)
 }
 
+pub(crate) fn do_import_from_path(file_path: &str, db: &Db, sync: &SyncWriter) -> AppResult<Book> {
+    let _mutation = sync.mutation_guard()?;
+    let format = detect_import_format(Path::new(&file_path))?;
+    log::info!(
+        "import_book: start file={file_path} format={}",
+        format.source_name()
+    );
+    match format {
+        ImportFormat::Pdf => do_import_pdf(file_path, db, sync),
+        ImportFormat::Epub => do_import_epub(file_path, db, sync),
+        ImportFormat::Txt => do_import_text(file_path, "txt", db, sync),
+        ImportFormat::Markdown => do_import_text(file_path, "markdown", db, sync),
+        ImportFormat::Html => do_import_text(file_path, "html", db, sync),
+        ImportFormat::Mobi | ImportFormat::Fb2 | ImportFormat::Fbz | ImportFormat::Cbz => {
+            do_import_native(file_path, format, db, sync)
+        }
+    }
+}
 
 /// Shared query helper. Returns books with the **relative** `file_path`
 /// and `cover_path` as stored in SQLite (`books/<slug>.epub`,
@@ -463,7 +1019,8 @@ pub(crate) fn query_books(
 
     if let Some(q) = search {
         if !q.is_empty() {
-            conditions.push("(LOWER(books.title) LIKE ? OR LOWER(books.author) LIKE ?)".to_string());
+            conditions
+                .push("(LOWER(books.title) LIKE ? OR LOWER(books.author) LIKE ?)".to_string());
             let pattern = format!("%{}%", q.to_lowercase());
             param_values.push(Box::new(pattern.clone()));
             param_values.push(Box::new(pattern));
@@ -507,7 +1064,11 @@ pub(crate) fn query_books(
         if search.is_some_and(|q| !q.is_empty()) {
             cc.push("(LOWER(books.title) LIKE ? OR LOWER(books.author) LIKE ?)".to_string());
         }
-        if cc.is_empty() { String::new() } else { format!(" WHERE {}", cc.join(" AND ")) }
+        if cc.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", cc.join(" AND "))
+        }
     };
     let count_sql = format!("SELECT COUNT(*) FROM {from_clause}{count_where}");
     let mut count_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -517,9 +1078,13 @@ pub(crate) fn query_books(
     if let Some(f) = filter {
         match f {
             "reading" | "finished" | "unread" | "all" => {
-                if f != "all" { count_params.push(Box::new(f.to_string())); }
+                if f != "all" {
+                    count_params.push(Box::new(f.to_string()));
+                }
             }
-            _ => { count_params.push(Box::new(f.to_string())); }
+            _ => {
+                count_params.push(Box::new(f.to_string()));
+            }
         }
     }
     if let Some(q) = search {
@@ -529,40 +1094,50 @@ pub(crate) fn query_books(
             count_params.push(Box::new(pattern));
         }
     }
-    let count_refs: Vec<&dyn rusqlite::types::ToSql> = count_params.iter().map(|p| p.as_ref()).collect();
+    let count_refs: Vec<&dyn rusqlite::types::ToSql> =
+        count_params.iter().map(|p| p.as_ref()).collect();
     let total: usize = conn.query_row(&count_sql, count_refs.as_slice(), |r| r.get(0))?;
 
     // Main query with cursor + limit.
     let sql = format!(
-        "SELECT books.id, books.title, books.author, books.description, books.cover_path, books.file_path, books.format, books.genre, books.pages, books.status, books.progress, books.current_cfi, books.created_at, books.updated_at, books.cover_data FROM {from_clause}{where_clause} ORDER BY books.updated_at DESC, books.id ASC LIMIT ?",
+        "SELECT books.id, books.title, books.author, books.description, books.cover_path, books.file_path, books.format, books.source_format, books.render_format, books.source_file_path, books.source_sha256, books.conversion_version, books.genre, books.pages, books.status, books.progress, books.current_cfi, books.created_at, books.updated_at, books.cover_data FROM {from_clause}{where_clause} ORDER BY books.updated_at DESC, books.id ASC LIMIT ?",
     );
     param_values.push(Box::new((limit + 1) as i64));
 
-    let params_refs: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+        param_values.iter().map(|p| p.as_ref()).collect();
 
     let mut stmt = conn.prepare(&sql)?;
-    let mut books: Vec<Book> = stmt.query_map(params_refs.as_slice(), |row| {
-        let cover_blob: Option<Vec<u8>> = row.get(14)?;
-        Ok(Book {
-            id: row.get(0)?,
-            title: row.get(1)?,
-            author: row.get(2)?,
-            description: row.get(3)?,
-            cover_path: row.get(4)?,
-            file_path: row.get(5)?,
-            format: row.get(6)?,
-            genre: row.get(7)?,
-            pages: row.get(8)?,
-            status: row.get(9)?,
-            progress: row.get(10)?,
-            current_cfi: row.get(11)?,
-            created_at: row.get(12)?,
-            updated_at: row.get(13)?,
-            available: true,
-            cover_data: cover_blob.filter(|b| !b.is_empty()).map(|b| cover_blob_to_data_uri(&b)),
-        })
-    })?
-    .collect::<Result<Vec<_>, _>>()?;
+    let mut books: Vec<Book> = stmt
+        .query_map(params_refs.as_slice(), |row| {
+            let cover_blob: Option<Vec<u8>> = row.get(19)?;
+            Ok(Book {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                author: row.get(2)?,
+                description: row.get(3)?,
+                cover_path: row.get(4)?,
+                file_path: row.get(5)?,
+                format: row.get(6)?,
+                source_format: row.get(7)?,
+                render_format: row.get(8)?,
+                source_file_path: row.get(9)?,
+                source_sha256: row.get(10)?,
+                conversion_version: row.get::<_, Option<i32>>(11)?.unwrap_or(0),
+                genre: row.get(12)?,
+                pages: row.get(13)?,
+                status: row.get(14)?,
+                progress: row.get(15)?,
+                current_cfi: row.get(16)?,
+                created_at: row.get(17)?,
+                updated_at: row.get(18)?,
+                available: true,
+                cover_data: cover_blob
+                    .filter(|b| !b.is_empty())
+                    .map(|b| cover_blob_to_data_uri(&b)),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
 
     let next_cursor = if books.len() > limit {
         books.truncate(limit);
@@ -572,7 +1147,11 @@ pub(crate) fn query_books(
         None
     };
 
-    Ok(BookPage { books, next_cursor, total })
+    Ok(BookPage {
+        books,
+        next_cursor,
+        total,
+    })
 }
 
 /// Shared query helper for the single-book lookup. Same relative-path
@@ -580,10 +1159,10 @@ pub(crate) fn query_books(
 pub(crate) fn query_book(db: &Db, id: &str) -> AppResult<Book> {
     let conn = db.reader();
     let book = conn.query_row(
-        "SELECT id, title, author, description, cover_path, file_path, format, genre, pages, status, progress, current_cfi, created_at, updated_at, cover_data FROM books WHERE id = ?1",
+        "SELECT id, title, author, description, cover_path, file_path, format, source_format, render_format, source_file_path, source_sha256, conversion_version, genre, pages, status, progress, current_cfi, created_at, updated_at, cover_data FROM books WHERE id = ?1",
         params![id],
         |row| {
-            let cover_blob: Option<Vec<u8>> = row.get(14)?;
+            let cover_blob: Option<Vec<u8>> = row.get(19)?;
             Ok(Book {
                 id: row.get(0)?,
                 title: row.get(1)?,
@@ -592,13 +1171,18 @@ pub(crate) fn query_book(db: &Db, id: &str) -> AppResult<Book> {
                 cover_path: row.get(4)?,
                 file_path: row.get(5)?,
                 format: row.get(6)?,
-                genre: row.get(7)?,
-                pages: row.get(8)?,
-                status: row.get(9)?,
-                progress: row.get(10)?,
-                current_cfi: row.get(11)?,
-                created_at: row.get(12)?,
-                updated_at: row.get(13)?,
+                source_format: row.get(7)?,
+                render_format: row.get(8)?,
+                source_file_path: row.get(9)?,
+                source_sha256: row.get(10)?,
+                conversion_version: row.get::<_, Option<i32>>(11)?.unwrap_or(0),
+                genre: row.get(12)?,
+                pages: row.get(13)?,
+                status: row.get(14)?,
+                progress: row.get(15)?,
+                current_cfi: row.get(16)?,
+                created_at: row.get(17)?,
+                updated_at: row.get(18)?,
                 available: true,
                 cover_data: cover_blob.filter(|b| !b.is_empty()).map(|b| cover_blob_to_data_uri(&b)),
             })
@@ -649,15 +1233,16 @@ pub(crate) fn query_books_lite(
     };
 
     let sql = format!(
-        "SELECT id, title, author, description, cover_path, file_path, format, genre, pages, status, progress, current_cfi, created_at, updated_at, (cover_data IS NOT NULL AND LENGTH(cover_data) > 0) AS has_cover FROM books{where_clause} ORDER BY updated_at DESC LIMIT ?",
+        "SELECT id, title, author, description, cover_path, file_path, format, source_format, render_format, source_file_path, source_sha256, conversion_version, genre, pages, status, progress, current_cfi, created_at, updated_at, (cover_data IS NOT NULL AND LENGTH(cover_data) > 0) AS has_cover FROM books{where_clause} ORDER BY updated_at DESC LIMIT ?",
     );
     param_values.push(Box::new(limit as i64));
-    let params_refs: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+        param_values.iter().map(|p| p.as_ref()).collect();
 
     let mut stmt = conn.prepare(&sql)?;
     let books = stmt
         .query_map(params_refs.as_slice(), |row| {
-            let has_cover: bool = row.get(14)?;
+            let has_cover: bool = row.get(19)?;
             Ok(Book {
                 id: row.get(0)?,
                 title: row.get(1)?,
@@ -666,15 +1251,24 @@ pub(crate) fn query_books_lite(
                 cover_path: row.get(4)?,
                 file_path: row.get(5)?,
                 format: row.get(6)?,
-                genre: row.get(7)?,
-                pages: row.get(8)?,
-                status: row.get(9)?,
-                progress: row.get(10)?,
-                current_cfi: row.get(11)?,
-                created_at: row.get(12)?,
-                updated_at: row.get(13)?,
+                source_format: row.get(7)?,
+                render_format: row.get(8)?,
+                source_file_path: row.get(9)?,
+                source_sha256: row.get(10)?,
+                conversion_version: row.get::<_, Option<i32>>(11)?.unwrap_or(0),
+                genre: row.get(12)?,
+                pages: row.get(13)?,
+                status: row.get(14)?,
+                progress: row.get(15)?,
+                current_cfi: row.get(16)?,
+                created_at: row.get(17)?,
+                updated_at: row.get(18)?,
                 available: true,
-                cover_data: if has_cover { Some("has_cover".to_string()) } else { None },
+                cover_data: if has_cover {
+                    Some("has_cover".to_string())
+                } else {
+                    None
+                },
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -702,7 +1296,7 @@ pub fn list_books(
         page_size,
     )?;
     for book in &mut page.books {
-        resolve_book_paths(book, &db);
+        resolve_book_paths(book, &db)?;
     }
     Ok(page)
 }
@@ -719,18 +1313,26 @@ pub fn get_book_counts(db: State<'_, Db>) -> AppResult<BookCounts> {
     let conn = db.reader();
     let all: usize = conn.query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0))?;
     let reading: usize = conn.query_row(
-        "SELECT COUNT(*) FROM books WHERE status = 'reading'", [], |r| r.get(0),
+        "SELECT COUNT(*) FROM books WHERE status = 'reading'",
+        [],
+        |r| r.get(0),
     )?;
     let finished: usize = conn.query_row(
-        "SELECT COUNT(*) FROM books WHERE status = 'finished'", [], |r| r.get(0),
+        "SELECT COUNT(*) FROM books WHERE status = 'finished'",
+        [],
+        |r| r.get(0),
     )?;
-    Ok(BookCounts { all, reading, finished })
+    Ok(BookCounts {
+        all,
+        reading,
+        finished,
+    })
 }
 
 #[tauri::command]
 pub fn get_book(id: String, db: State<'_, Db>) -> AppResult<Book> {
     let mut book = query_book(&db, &id)?;
-    resolve_book_paths(&mut book, &db);
+    resolve_book_paths(&mut book, &db)?;
     Ok(book)
 }
 
@@ -744,7 +1346,7 @@ pub fn check_book_available(id: String, db: State<'_, Db>) -> AppResult<bool> {
         |row| row.get(0),
     )?;
 
-    let abs_path = db.resolve_path(&file_path);
+    let abs_path = db.resolve_path(&file_path)?;
     let available = icloud::is_file_downloaded(&abs_path);
 
     if !available {
@@ -755,12 +1357,13 @@ pub fn check_book_available(id: String, db: State<'_, Db>) -> AppResult<bool> {
 }
 
 pub(crate) fn do_delete_book(id: &str, db: &Db, sync: &SyncWriter) -> AppResult<()> {
-    let file_path: String = {
+    crate::sync::validation::validate_entity_id(id)?;
+    let (file_path, source_file_path): (String, Option<String>) = {
         let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
         conn.query_row(
-            "SELECT file_path FROM books WHERE id = ?1",
+            "SELECT file_path, source_file_path FROM books WHERE id = ?1",
             params![id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?
     };
 
@@ -771,32 +1374,34 @@ pub(crate) fn do_delete_book(id: &str, db: &Db, sync: &SyncWriter) -> AppResult<
             params![id],
         )?;
         tx.execute("DELETE FROM chats WHERE book_id = ?1", params![id])?;
-        tx.execute("DELETE FROM collection_books WHERE book_id = ?1", params![id])?;
+        tx.execute(
+            "DELETE FROM collection_books WHERE book_id = ?1",
+            params![id],
+        )?;
         tx.execute("DELETE FROM highlights WHERE book_id = ?1", params![id])?;
         tx.execute("DELETE FROM bookmarks WHERE book_id = ?1", params![id])?;
         tx.execute("DELETE FROM vocab_words WHERE book_id = ?1", params![id])?;
+        tx.execute("DELETE FROM lookup_records WHERE book_id = ?1", params![id])?;
         tx.execute("DELETE FROM book_settings WHERE book_id = ?1", params![id])?;
         tx.execute("DELETE FROM books WHERE id = ?1", params![id])?;
-        events.push(EventBody::BookDelete {
-            id: id.to_string(),
-        });
+        events.push(EventBody::BookDelete { id: id.to_string() });
         Ok(())
     })?;
 
-    let abs_file = db.resolve_path(&file_path);
+    let abs_file = db.resolve_path(&file_path)?;
     let _ = fs::remove_file(&abs_file);
-    let cover_file = db.resolve_path(&format!("covers/{id}.img"));
+    if let Some(source_path) = source_file_path.filter(|path| path != &file_path) {
+        let abs_source = db.resolve_path(&source_path)?;
+        let _ = fs::remove_file(abs_source);
+    }
+    let cover_file = db.resolve_path(&format!("covers/{id}.img"))?;
     let _ = fs::remove_file(&cover_file);
 
     Ok(())
 }
 
 #[tauri::command]
-pub fn delete_book(
-    id: String,
-    db: State<'_, Db>,
-    sync: State<'_, SyncWriter>,
-) -> AppResult<()> {
+pub fn delete_book(id: String, db: State<'_, Db>, sync: State<'_, SyncWriter>) -> AppResult<()> {
     do_delete_book(&id, &db, &sync)
 }
 
@@ -845,11 +1450,7 @@ pub fn update_book_pages(id: String, pages: i32, db: State<'_, Db>) -> AppResult
 }
 
 #[tauri::command]
-pub fn mark_finished(
-    id: String,
-    db: State<'_, Db>,
-    sync: State<'_, SyncWriter>,
-) -> AppResult<()> {
+pub fn mark_finished(id: String, db: State<'_, Db>, sync: State<'_, SyncWriter>) -> AppResult<()> {
     let now = chrono::Utc::now().timestamp_millis();
     let device = sync.self_device().to_string();
     sync.with_tx(&db, now, |tx, events| {
@@ -1035,9 +1636,9 @@ mod tests {
             params![now],
         ).unwrap();
 
-        let format: String = conn.query_row(
-            "SELECT format FROM books WHERE id = 'b1'", [], |r| r.get(0),
-        ).unwrap();
+        let format: String = conn
+            .query_row("SELECT format FROM books WHERE id = 'b1'", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(format, "epub");
     }
 
@@ -1047,9 +1648,9 @@ mod tests {
         insert_book(&db, "b1", "pdf");
 
         let conn = db.conn.lock().unwrap();
-        let format: String = conn.query_row(
-            "SELECT format FROM books WHERE id = 'b1'", [], |r| r.get(0),
-        ).unwrap();
+        let format: String = conn
+            .query_row("SELECT format FROM books WHERE id = 'b1'", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(format, "pdf");
     }
 
@@ -1074,11 +1675,13 @@ mod tests {
             params![book_id, rel_file_path, now],
         ).unwrap();
 
-        let (title, format, pages): (String, String, i32) = conn.query_row(
-            "SELECT title, format, pages FROM books WHERE id = ?1",
-            params![book_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).unwrap();
+        let (title, format, pages): (String, String, i32) = conn
+            .query_row(
+                "SELECT title, format, pages FROM books WHERE id = ?1",
+                params![book_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
 
         assert_eq!(title, "My PDF");
         assert_eq!(format, "pdf");
@@ -1101,11 +1704,13 @@ mod tests {
             params![book_id, cover_bytes.as_slice(), now],
         ).unwrap();
 
-        let db_cover: Option<Vec<u8>> = conn.query_row(
-            "SELECT cover_data FROM books WHERE id = ?1",
-            params![book_id],
-            |r| r.get(0),
-        ).unwrap();
+        let db_cover: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT cover_data FROM books WHERE id = ?1",
+                params![book_id],
+                |r| r.get(0),
+            )
+            .unwrap();
 
         assert_eq!(db_cover.as_deref(), Some(cover_bytes.as_slice()));
     }
@@ -1118,28 +1723,37 @@ mod tests {
 
         let conn = db.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, title, author, description, cover_path, file_path, format, genre, pages, status, progress, current_cfi, created_at, updated_at FROM books ORDER BY id",
+        "SELECT id, title, author, description, cover_path, file_path, format, source_format, render_format, source_file_path, source_sha256, conversion_version, genre, pages, status, progress, current_cfi, created_at, updated_at FROM books ORDER BY id",
         ).unwrap();
-        let books: Vec<Book> = stmt.query_map([], |row| {
-            Ok(Book {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                author: row.get(2)?,
-                description: row.get(3)?,
-                cover_path: row.get(4)?,
-                file_path: row.get(5)?,
-                format: row.get(6)?,
-                genre: row.get(7)?,
-                pages: row.get(8)?,
-                status: row.get(9)?,
-                progress: row.get(10)?,
-                current_cfi: row.get(11)?,
-                created_at: row.get(12)?,
-                updated_at: row.get(13)?,
-                available: true,
-                cover_data: None,
+        let books: Vec<Book> = stmt
+            .query_map([], |row| {
+                Ok(Book {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    author: row.get(2)?,
+                    description: row.get(3)?,
+                    cover_path: row.get(4)?,
+                    file_path: row.get(5)?,
+                    format: row.get(6)?,
+                    source_format: row.get(7)?,
+                    render_format: row.get(8)?,
+                    source_file_path: row.get(9)?,
+                    source_sha256: row.get(10)?,
+                    conversion_version: row.get::<_, Option<i32>>(11)?.unwrap_or(0),
+                    genre: row.get(12)?,
+                    pages: row.get(13)?,
+                    status: row.get(14)?,
+                    progress: row.get(15)?,
+                    current_cfi: row.get(16)?,
+                    created_at: row.get(17)?,
+                    updated_at: row.get(18)?,
+                    available: true,
+                    cover_data: None,
+                })
             })
-        }).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert_eq!(books.len(), 2);
         assert_eq!(books[0].format, "epub");
@@ -1166,9 +1780,9 @@ mod tests {
             params![resolved_author, now],
         ).unwrap();
 
-        let author_val: String = conn.query_row(
-            "SELECT author FROM books WHERE id = 'b1'", [], |r| r.get(0),
-        ).unwrap();
+        let author_val: String = conn
+            .query_row("SELECT author FROM books WHERE id = 'b1'", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(author_val, "Unknown Author");
     }
 
@@ -1219,11 +1833,14 @@ mod tests {
         conn.execute(
             "UPDATE books SET title = ?1, author = ?2, updated_at = ?3 WHERE id = ?4",
             params!["New Title", "New Author", now, "b1"],
-        ).unwrap();
+        )
+        .unwrap();
 
-        let (title, author): (String, String) = conn.query_row(
-            "SELECT title, author FROM books WHERE id = 'b1'", [], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (title, author): (String, String) = conn
+            .query_row("SELECT title, author FROM books WHERE id = 'b1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
         assert_eq!(title, "New Title");
         assert_eq!(author, "New Author");
     }
@@ -1238,11 +1855,14 @@ mod tests {
         conn.execute(
             "UPDATE books SET title = ?1, author = ?2, updated_at = ?3 WHERE id = ?4",
             params!["Changed Title", "Author", now, "b1"],
-        ).unwrap();
+        )
+        .unwrap();
 
-        let (title, author): (String, String) = conn.query_row(
-            "SELECT title, author FROM books WHERE id = 'b1'", [], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (title, author): (String, String) = conn
+            .query_row("SELECT title, author FROM books WHERE id = 'b1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
         assert_eq!(title, "Changed Title");
         assert_eq!(author, "Author"); // unchanged (same value passed)
     }
@@ -1253,20 +1873,25 @@ mod tests {
         insert_book(&db, "b1", "epub");
 
         let conn = db.conn.lock().unwrap();
-        let before: i64 = conn.query_row(
-            "SELECT updated_at FROM books WHERE id = 'b1'", [], |r| r.get(0),
-        ).unwrap();
+        let before: i64 = conn
+            .query_row("SELECT updated_at FROM books WHERE id = 'b1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(10));
         let now = chrono::Utc::now().timestamp_millis();
         conn.execute(
             "UPDATE books SET title = ?1, author = ?2, updated_at = ?3 WHERE id = ?4",
             params!["New", "New", now, "b1"],
-        ).unwrap();
+        )
+        .unwrap();
 
-        let after: i64 = conn.query_row(
-            "SELECT updated_at FROM books WHERE id = 'b1'", [], |r| r.get(0),
-        ).unwrap();
+        let after: i64 = conn
+            .query_row("SELECT updated_at FROM books WHERE id = 'b1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_ne!(before, after);
     }
 
@@ -1276,10 +1901,12 @@ mod tests {
 
         let conn = db.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp_millis();
-        let rows = conn.execute(
-            "UPDATE books SET title = ?1, author = ?2, updated_at = ?3 WHERE id = ?4",
-            params!["Title", "Author", now, "nonexistent"],
-        ).unwrap();
+        let rows = conn
+            .execute(
+                "UPDATE books SET title = ?1, author = ?2, updated_at = ?3 WHERE id = ?4",
+                params!["Title", "Author", now, "nonexistent"],
+            )
+            .unwrap();
         assert_eq!(rows, 0); // no rows affected
     }
 
@@ -1290,14 +1917,15 @@ mod tests {
 
         let conn = db.conn.lock().unwrap();
         let book: Book = conn.query_row(
-            "SELECT id, title, author, description, cover_path, file_path, format, genre, pages, status, progress, current_cfi, created_at, updated_at FROM books WHERE id = 'b1'",
+            "SELECT id, title, author, description, cover_path, file_path, format, source_format, render_format, source_file_path, source_sha256, conversion_version, genre, pages, status, progress, current_cfi, created_at, updated_at FROM books WHERE id = 'b1'",
             [],
             |row| Ok(Book {
                 id: row.get(0)?, title: row.get(1)?, author: row.get(2)?,
                 description: row.get(3)?, cover_path: row.get(4)?, file_path: row.get(5)?,
-                format: row.get(6)?, genre: row.get(7)?, pages: row.get(8)?,
-                status: row.get(9)?, progress: row.get(10)?, current_cfi: row.get(11)?,
-                created_at: row.get(12)?, updated_at: row.get(13)?, available: true, cover_data: None,
+                format: row.get(6)?, source_format: row.get(7)?, render_format: row.get(8)?,
+                source_file_path: row.get(9)?, source_sha256: row.get(10)?, conversion_version: row.get::<_, Option<i32>>(11)?.unwrap_or(0),
+                genre: row.get(12)?, pages: row.get(13)?, status: row.get(14)?, progress: row.get(15)?, current_cfi: row.get(16)?,
+                created_at: row.get(17)?, updated_at: row.get(18)?, available: true, cover_data: None,
             }),
         ).unwrap();
 
@@ -1429,7 +2057,8 @@ mod tests {
         assert_eq!(page1.books.len(), 3);
         assert_eq!(page1.total, 5);
         assert!(page1.next_cursor.is_some());
-        let page2 = query_books(&db, None, None, Some("c1"), page1.next_cursor.as_deref(), 3).unwrap();
+        let page2 =
+            query_books(&db, None, None, Some("c1"), page1.next_cursor.as_deref(), 3).unwrap();
         assert_eq!(page2.books.len(), 2);
         assert!(page2.next_cursor.is_none());
     }
@@ -1441,7 +2070,7 @@ mod tests {
     /// semantics we don't want to depend on.
     fn write_fixture_pdf(path: &std::path::Path) {
         use lopdf::content::{Content, Operation};
-        use lopdf::{Document, Object, Stream, dictionary};
+        use lopdf::{dictionary, Document, Object, Stream};
 
         let mut doc = Document::with_version("1.5");
         let pages_id = doc.new_object_id();

@@ -6,15 +6,58 @@ use std::process::Command;
 const PDFIUM_VERSION: &str = "chromium/7857";
 
 fn main() {
+    emit_build_metadata();
     // Must run before `tauri_build::build()` — Tauri validates that any
     // `bundle.macOS.frameworks` / `bundle.resources` paths exist at config
     // load time, and `tauri.<platform>.conf.json` overlays point at the
     // active-target binary `ensure_pdfium` publishes to `binaries/<os>/`.
     if let Err(e) = ensure_pdfium() {
         println!("cargo:warning=pdfium download failed: {e}");
-        println!("cargo:warning=PDF cover rendering will fail at runtime until the dylib is present");
+        println!(
+            "cargo:warning=PDF cover rendering will fail at runtime until the dylib is present"
+        );
     }
     tauri_build::build();
+}
+
+fn emit_build_metadata() {
+    for key in [
+        "QUILL_BUILD_COMMIT",
+        "QUILL_BUILD_DATE",
+        "QUILL_BUILD_CHANNEL",
+        "QUILL_UPSTREAM_BASELINE",
+    ] {
+        println!("cargo:rerun-if-env-changed={key}");
+    }
+
+    let commit = env::var("QUILL_BUILD_COMMIT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| git_value(["rev-parse", "--short=12", "HEAD"]))
+        .unwrap_or_else(|| "local".to_string());
+    let date = env::var("QUILL_BUILD_DATE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| git_value(["show", "-s", "--format=%cI", "HEAD"]))
+        .unwrap_or_else(|| "local".to_string());
+    let channel = env::var("QUILL_BUILD_CHANNEL").unwrap_or_else(|_| "development".to_string());
+    let upstream = env::var("QUILL_UPSTREAM_BASELINE").unwrap_or_else(|_| "1.2.10".to_string());
+
+    println!("cargo:rustc-env=QUILL_BUILD_COMMIT={commit}");
+    println!("cargo:rustc-env=QUILL_BUILD_DATE={date}");
+    println!("cargo:rustc-env=QUILL_BUILD_CHANNEL={channel}");
+    println!("cargo:rustc-env=QUILL_UPSTREAM_BASELINE={upstream}");
+}
+
+fn git_value<const N: usize>(args: [&str; N]) -> Option<String> {
+    Command::new("git")
+        .args(args)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn ensure_pdfium() -> Result<(), String> {
@@ -82,7 +125,11 @@ fn ensure_pdfium() -> Result<(), String> {
 /// `binaries/macos/libpdfium.dylib`; the file is the right architecture
 /// for whichever target is currently being built.
 fn publish_active_target(manifest_dir: &Path, src: &Path, spec: &PdfiumSpec) -> Result<(), String> {
-    let platform = spec.subdir.split_once('-').map(|(p, _)| p).unwrap_or(spec.subdir);
+    let platform = spec
+        .subdir
+        .split_once('-')
+        .map(|(p, _)| p)
+        .unwrap_or(spec.subdir);
     let active_dir = manifest_dir.join("binaries").join(platform);
     fs::create_dir_all(&active_dir).map_err(|e| e.to_string())?;
     let active = active_dir.join(spec.lib_name);

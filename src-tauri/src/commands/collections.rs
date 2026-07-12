@@ -132,9 +132,7 @@ pub(crate) fn do_delete_collection(id: &str, db: &Db, sync: &SyncWriter) -> AppR
             params![id],
         )?;
         tx.execute("DELETE FROM collections WHERE id = ?1", params![id])?;
-        events.push(EventBody::CollectionDelete {
-            id: id.to_string(),
-        });
+        events.push(EventBody::CollectionDelete { id: id.to_string() });
         Ok(())
     })
 }
@@ -239,9 +237,7 @@ pub fn list_books_in_collection(
     db: State<'_, Db>,
 ) -> AppResult<Vec<String>> {
     let conn = db.reader();
-    let mut stmt = conn.prepare(
-        "SELECT book_id FROM collection_books WHERE collection_id = ?1",
-    )?;
+    let mut stmt = conn.prepare("SELECT book_id FROM collection_books WHERE collection_id = ?1")?;
     let book_ids = stmt
         .query_map(params![collection_id], |row| row.get(0))?
         .collect::<Result<Vec<String>, _>>()?;

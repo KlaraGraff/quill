@@ -246,9 +246,8 @@ pub fn clear_tokens(secrets: &Secrets) -> AppResult<()> {
 /// This is the main entry point called by AI commands.
 /// Returns (access_token, account_id).
 pub async fn get_valid_token(secrets: &Secrets) -> AppResult<(String, Option<String>)> {
-    let tokens = load_tokens(secrets).ok_or_else(|| {
-        AppError::Other("AI_NOT_CONFIGURED".to_string())
-    })?;
+    let tokens =
+        load_tokens(secrets).ok_or_else(|| AppError::Other("AI_NOT_CONFIGURED".to_string()))?;
 
     if tokens.expires_at > now_epoch() + 60 {
         return Ok((tokens.access_token, tokens.account_id));
@@ -443,9 +442,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let state = "expected_state_123";
 
-        let handle = tokio::spawn(async move {
-            handle_callback(listener, state).await
-        });
+        let handle = tokio::spawn(async move { handle_callback(listener, state).await });
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
             .await
@@ -465,14 +462,13 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        let handle = tokio::spawn(async move {
-            handle_callback(listener, "correct_state").await
-        });
+        let handle = tokio::spawn(async move { handle_callback(listener, "correct_state").await });
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
             .await
             .unwrap();
-        let request = "GET /auth/callback?code=code&state=wrong_state HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let request =
+            "GET /auth/callback?code=code&state=wrong_state HTTP/1.1\r\nHost: localhost\r\n\r\n";
         stream.write_all(request.as_bytes()).await.unwrap();
 
         let result = handle.await.unwrap();

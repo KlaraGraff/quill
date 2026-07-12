@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Loader2, Monitor, Smartphone, Laptop, Trash2 } from "lucide-react";
+import { open } from "@tauri-apps/plugin-dialog";
+import { FolderOpen, Loader2, Monitor, Smartphone, Laptop, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import Button from "../ui/Button";
 import Toggle from "../ui/Toggle";
@@ -71,6 +72,22 @@ function progressPercent(progress: SyncDisableProgress): number {
   return Math.min(100, Math.round((progress.copied / progress.total) * 100));
 }
 
+function syncErrorMessage(error: unknown, t: (key: string) => string): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = Object.keys({
+    SYNC_FOLDER_NOT_CONFIGURED: true,
+    SYNC_FOLDER_NOT_FOUND: true,
+    SYNC_FOLDER_NOT_IN_ICLOUD_DRIVE: true,
+    SYNC_FOLDER_NOT_WRITABLE: true,
+    SYNC_FOLDER_CHANGE_REQUIRES_DISABLE: true,
+  }).find((candidate) => message.includes(candidate));
+  return code ? t(`settings.librarySync.error.${code}`) : t("settings.librarySync.error.unknown");
+}
+
+function isRetryableSyncError(error: string | null): boolean {
+  return error?.includes("SYNC_FOLDER_NOT_FOUND") || error?.includes("SYNC_FOLDER_NOT_WRITABLE") || false;
+}
+
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 export default function LibrarySyncSettings(_props: SettingsProps) {
   const { t } = useTranslation();
@@ -90,7 +107,7 @@ export default function LibrarySyncSettings(_props: SettingsProps) {
   const [pendingRemoval, setPendingRemoval] = useState<PeerInfo | null>(null);
   // Tick once a minute so "Last seen 2m ago" stays fresh while the modal
   // is open. Cheap; the component re-renders are bounded.
-  const [now, setNow] = useState(Date.now());
+  const [now, setNow] = useState(0);
   const [syncing, setSyncing] = useState(false);
   const [disableProgress, setDisableProgress] = useState<SyncDisableProgress | null>(null);
 
@@ -126,6 +143,7 @@ export default function LibrarySyncSettings(_props: SettingsProps) {
 
   useEffect(() => {
     refresh();
+    setNow(Date.now());
     const interval = setInterval(() => setNow(Date.now()), 60_000);
     return () => clearInterval(interval);
   }, [refresh]);
@@ -137,6 +155,27 @@ export default function LibrarySyncSettings(_props: SettingsProps) {
     // Using `enabled` here meant a queue-only/offline session showed
     // the toggle as on but opened the Enable flow on click.
     setConfirm(status.sync_enabled ? "disable" : "enable");
+  };
+
+  const chooseSharedDirectory = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        recursive: true,
+        fileAccessMode: "scoped",
+      });
+      if (typeof selected === "string") {
+        await invoke("sync_set_shared_dir", { path: selected });
+        await refresh();
+      }
+    } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
   };
 
   const runToggle = async (action: "enable" | "disable") => {
@@ -255,6 +294,27 @@ export default function LibrarySyncSettings(_props: SettingsProps) {
   return (
     <>
       <div>
+        <div className="flex items-center justify-between min-h-[73px] gap-4">
+          <div className="min-w-0">
+            <p className="text-[14px] font-medium text-text-primary tracking-[-0.15px]">
+              {t("settings.librarySync.folder")}
+            </p>
+            <p className="text-[12px] text-text-muted mt-0.5 truncate" title={status?.shared_dir ?? undefined}>
+              {status?.shared_dir ?? t("settings.librarySync.folderNotSelected")}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={chooseSharedDirectory}
+            disabled={busy || syncOn}
+            title={syncOn ? t("settings.librarySync.changeFolderDisabled") : undefined}
+            className="shrink-0 flex items-center gap-1.5 text-[13px] font-medium text-accent-text hover:bg-accent-bg rounded-md px-2.5 py-1.5 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+          >
+            <FolderOpen size={14} />
+            {status?.shared_dir ? t("settings.librarySync.changeFolder") : t("settings.librarySync.chooseFolder")}
+          </button>
+        </div>
+        <div className="h-px bg-border-light" />
         {/* Sync toggle */}
         <div className="flex items-center justify-between h-[73px]">
           {busy || initialStatusLoading ? (
@@ -272,7 +332,7 @@ export default function LibrarySyncSettings(_props: SettingsProps) {
                 </p>
                 <p className="text-[12px] text-text-muted mt-0.5">
                   {!available
-                    ? t("settings.librarySync.signIn")
+                    ? t("settings.librarySync.chooseFolderHint")
                     : syncOn && !engineRunning
                       ? t("settings.librarySync.paused")
                       : t("settings.librarySync.toggleSub")}
@@ -394,17 +454,19 @@ export default function LibrarySyncSettings(_props: SettingsProps) {
         {/* Error */}
         {error && (
           <div className="flex items-center justify-between bg-danger-bg border border-danger-border rounded-lg px-3.5 py-2 mt-3">
-            <span className="text-[12px] text-danger-text truncate">
-              {error}
+            <span className="text-[12px] text-danger-text leading-[1.45]">
+              {syncErrorMessage(error, t)}
             </span>
-            <button
-              type="button"
-              disabled={busy}
-              className="text-[12px] font-medium text-danger-text underline cursor-pointer ml-2 shrink-0 disabled:opacity-50 disabled:cursor-not-allowed"
-              onClick={onRetry}
-            >
-              {t("settings.ai.retry")}
-            </button>
+            {isRetryableSyncError(error) && (
+              <button
+                type="button"
+                disabled={busy}
+                className="text-[12px] font-medium text-danger-text underline cursor-pointer ml-2 shrink-0 disabled:opacity-50 disabled:cursor-not-allowed"
+                onClick={onRetry}
+              >
+                {t("settings.ai.retry")}
+              </button>
+            )}
           </div>
         )}
       </div>

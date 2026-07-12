@@ -2,37 +2,58 @@ use rusqlite::params;
 use std::collections::HashMap;
 use tauri::{AppHandle, Emitter, State};
 
+use crate::ai::router::{self, AiCredentialView, AiProfileView};
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
 use crate::secrets::Secrets;
 
 #[tauri::command]
-pub fn get_all_settings(db: State<'_, Db>, secrets: State<'_, Secrets>) -> AppResult<HashMap<String, String>> {
+pub fn get_all_settings(
+    db: State<'_, Db>,
+    secrets: State<'_, Secrets>,
+) -> AppResult<HashMap<String, String>> {
     let conn = db.reader();
     let mut stmt = conn.prepare("SELECT key, value FROM settings")?;
     let mut settings = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(|row| match row {
+            Ok((key, value)) if !Secrets::is_sensitive_key(&key) => Some(Ok((key, value))),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
         .collect::<Result<HashMap<_, _>, _>>()?;
 
     // Never expose secret values to the webview. The UI only needs to know
     // whether a key exists so it can preserve it when unrelated settings save.
-    settings.insert(
-        "ai_api_key_configured".to_string(),
-        secrets.get("ai_api_key").is_some().to_string(),
-    );
+    let configured = router::list_credentials(&db, None)
+        .map(|credentials| credentials.iter().any(|credential| credential.enabled))
+        .unwrap_or_else(|_| {
+            secrets
+                .get("ai_api_key")
+                .is_some_and(|value| !value.trim().is_empty())
+        });
+    settings.insert("ai_api_key_configured".to_string(), configured.to_string());
 
     Ok(settings)
 }
 
 #[tauri::command]
-pub fn ai_api_key_configured(secrets: State<'_, Secrets>) -> bool {
-    secrets.get("ai_api_key").is_some()
+pub fn ai_api_key_configured(db: State<'_, Db>, secrets: State<'_, Secrets>) -> bool {
+    router::list_credentials(&db, None)
+        .map(|credentials| credentials.iter().any(|credential| credential.enabled))
+        .unwrap_or_else(|_| {
+            secrets
+                .get("ai_api_key")
+                .is_some_and(|value| !value.trim().is_empty())
+        })
 }
 
 #[tauri::command]
-pub fn get_setting(key: String, db: State<'_, Db>, secrets: State<'_, Secrets>) -> AppResult<Option<String>> {
+pub fn get_setting(key: String, db: State<'_, Db>) -> AppResult<Option<String>> {
     if Secrets::is_sensitive_key(&key) {
-        return Ok(secrets.get(&key));
+        return Err(AppError::Other("SECRET_READ_FORBIDDEN".to_string()));
     }
 
     let conn = db.reader();
@@ -49,9 +70,11 @@ pub fn get_setting(key: String, db: State<'_, Db>, secrets: State<'_, Secrets>) 
 }
 
 #[tauri::command]
-pub fn set_setting(key: String, value: String, db: State<'_, Db>, secrets: State<'_, Secrets>) -> AppResult<()> {
+pub fn set_setting(key: String, value: String, db: State<'_, Db>) -> AppResult<()> {
     if Secrets::is_sensitive_key(&key) {
-        return secrets.set(&key, &value);
+        return Err(AppError::Other(
+            "SECRET_WRITE_REQUIRES_DEDICATED_COMMAND".to_string(),
+        ));
     }
 
     let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
@@ -63,19 +86,125 @@ pub fn set_setting(key: String, value: String, db: State<'_, Db>, secrets: State
 }
 
 #[tauri::command]
-pub fn set_settings_bulk(settings: HashMap<String, String>, db: State<'_, Db>, secrets: State<'_, Secrets>) -> AppResult<()> {
+pub fn set_settings_bulk(settings: HashMap<String, String>, db: State<'_, Db>) -> AppResult<()> {
     let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
     for (key, value) in settings {
         if Secrets::is_sensitive_key(&key) {
-            secrets.set(&key, &value)?;
-        } else {
-            conn.execute(
-                "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
-                params![key, value],
-            )?;
+            return Err(AppError::Other(
+                "SECRET_WRITE_REQUIRES_DEDICATED_COMMAND".to_string(),
+            ));
         }
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![key, value],
+        )?;
     }
     Ok(())
+}
+
+#[tauri::command]
+pub fn set_ai_api_key(
+    value: String,
+    db: State<'_, Db>,
+    secrets: State<'_, Secrets>,
+) -> AppResult<()> {
+    let profile = router::active_profile_view(&db)?;
+    let existing = router::list_credentials(&db, Some(&profile.id))?;
+    if let Some(credential) = existing.first() {
+        router::replace_credential(&db, &secrets, &credential.id, &value)
+    } else {
+        router::add_credential(&db, &secrets, profile.id, "Primary key".to_string(), value)
+            .map(|_| ())
+    }
+}
+
+#[tauri::command]
+pub fn ai_active_profile(db: State<'_, Db>) -> AppResult<AiProfileView> {
+    router::active_profile_view(&db)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn ai_save_profile(
+    id: String,
+    label: String,
+    provider: String,
+    auth_mode: String,
+    base_url: Option<String>,
+    model: String,
+    temperature: f64,
+    keep_alive: Option<String>,
+    db: State<'_, Db>,
+) -> AppResult<AiProfileView> {
+    router::save_profile(
+        &db,
+        id,
+        label,
+        provider,
+        auth_mode,
+        base_url,
+        model,
+        temperature,
+        keep_alive,
+    )
+}
+
+#[tauri::command]
+pub fn ai_list_credentials(
+    profile_id: Option<String>,
+    db: State<'_, Db>,
+) -> AppResult<Vec<AiCredentialView>> {
+    router::list_credentials(&db, profile_id.as_deref())
+}
+
+#[tauri::command]
+pub fn ai_add_credential(
+    profile_id: String,
+    label: String,
+    value: String,
+    db: State<'_, Db>,
+    secrets: State<'_, Secrets>,
+) -> AppResult<AiCredentialView> {
+    router::add_credential(&db, &secrets, profile_id, label, value)
+}
+
+#[tauri::command]
+pub fn ai_replace_credential(
+    id: String,
+    value: String,
+    db: State<'_, Db>,
+    secrets: State<'_, Secrets>,
+) -> AppResult<()> {
+    router::replace_credential(&db, &secrets, &id, &value)
+}
+
+#[tauri::command]
+pub fn ai_set_credential_enabled(id: String, enabled: bool, db: State<'_, Db>) -> AppResult<()> {
+    router::set_credential_enabled(&db, &id, enabled)
+}
+
+#[tauri::command]
+pub fn ai_reorder_credentials(ids: Vec<String>, db: State<'_, Db>) -> AppResult<()> {
+    router::reorder_credentials(&db, &ids)
+}
+
+#[tauri::command]
+pub fn ai_delete_credential(
+    id: String,
+    db: State<'_, Db>,
+    secrets: State<'_, Secrets>,
+) -> AppResult<()> {
+    router::delete_credential(&db, &secrets, &id)
+}
+
+#[tauri::command]
+pub async fn ai_test_credential(
+    id: String,
+    app: AppHandle,
+    db: State<'_, Db>,
+    secrets: State<'_, Secrets>,
+) -> AppResult<()> {
+    router::test_credential(&app, &db, &secrets, &id).await
 }
 
 #[tauri::command]
@@ -83,13 +212,19 @@ pub fn get_book_settings(book_id: String, db: State<'_, Db>) -> AppResult<HashMa
     let conn = db.reader();
     let mut stmt = conn.prepare("SELECT key, value FROM book_settings WHERE book_id = ?1")?;
     let settings = stmt
-        .query_map(params![book_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .query_map(params![book_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
         .collect::<Result<HashMap<_, _>, _>>()?;
     Ok(settings)
 }
 
 #[tauri::command]
-pub fn set_book_settings_bulk(book_id: String, settings: HashMap<String, String>, db: State<'_, Db>) -> AppResult<()> {
+pub fn set_book_settings_bulk(
+    book_id: String,
+    settings: HashMap<String, String>,
+    db: State<'_, Db>,
+) -> AppResult<()> {
     let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
     for (key, value) in settings {
         conn.execute(
@@ -127,11 +262,15 @@ mod tests {
 
     fn get_book_settings(db: &Db, book_id: &str) -> HashMap<String, String> {
         let conn = db.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT key, value FROM book_settings WHERE book_id = ?1").unwrap();
-        stmt.query_map(params![book_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-            .unwrap()
-            .collect::<Result<HashMap<_, _>, _>>()
-            .unwrap()
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM book_settings WHERE book_id = ?1")
+            .unwrap();
+        stmt.query_map(params![book_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<HashMap<_, _>, _>>()
+        .unwrap()
     }
 
     fn set_book_settings_bulk(db: &Db, book_id: &str, settings: HashMap<String, String>) {
@@ -170,8 +309,14 @@ mod tests {
         s2.insert("font_family".to_string(), "georgia".to_string());
         set_book_settings_bulk(&db, "book2", s2);
 
-        assert_eq!(get_book_settings(&db, "book1").get("font_family").unwrap(), "inter");
-        assert_eq!(get_book_settings(&db, "book2").get("font_family").unwrap(), "georgia");
+        assert_eq!(
+            get_book_settings(&db, "book1").get("font_family").unwrap(),
+            "inter"
+        );
+        assert_eq!(
+            get_book_settings(&db, "book2").get("font_family").unwrap(),
+            "georgia"
+        );
     }
 
     #[test]
@@ -185,8 +330,10 @@ mod tests {
         assert_eq!(get_book_settings(&db, "book1").len(), 1);
 
         let conn = db.conn.lock().unwrap();
-        conn.execute("DELETE FROM book_settings WHERE book_id = 'book1'", []).unwrap();
-        conn.execute("DELETE FROM books WHERE id = 'book1'", []).unwrap();
+        conn.execute("DELETE FROM book_settings WHERE book_id = 'book1'", [])
+            .unwrap();
+        conn.execute("DELETE FROM books WHERE id = 'book1'", [])
+            .unwrap();
         drop(conn);
 
         assert!(get_book_settings(&db, "book1").is_empty());
@@ -204,7 +351,10 @@ mod tests {
         s2.insert("font_size".to_string(), "30".to_string());
         set_book_settings_bulk(&db, "book1", s2);
 
-        assert_eq!(get_book_settings(&db, "book1").get("font_size").unwrap(), "30");
+        assert_eq!(
+            get_book_settings(&db, "book1").get("font_size").unwrap(),
+            "30"
+        );
     }
 }
 

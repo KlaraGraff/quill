@@ -26,4 +26,3 @@ dist-ssr
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 .nvmrc
-src-tauri/embedded.provisionprofile

@@ -3,30 +3,18 @@ import { useTranslation } from "react-i18next";
 import { Sun, Check, ScrollText, BookOpen, File, Files } from "lucide-react";
 import Toggle from "./ui/Toggle";
 import Select from "./ui/Select";
+import {
+  FONT_SIZE_MAX,
+  FONT_SIZE_MIN,
+  fonts,
+  getReaderThemes,
+  type ReaderCapabilities,
+  type ReaderFont,
+  type ReaderTheme,
+} from "./reader-settings";
 
 const sliderClass =
   "w-full h-1 cursor-pointer appearance-none rounded-full bg-border [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-bg-surface [&::-webkit-slider-thumb]:border [&::-webkit-slider-thumb]:border-border [&::-webkit-slider-thumb]:shadow-sm";
-
-const themes = [
-  { id: "original", label: "Original", color: "bg-reader-original-bg border border-reader-original-border", pdf: true },
-  { id: "paper", label: "Reading Paper", color: "bg-reader-paper-bg border border-reader-original-border", pdf: true },
-  { id: "quiet", label: "Gray", color: "bg-reader-quiet-bg", pdf: true },
-  { id: "dark", label: "Dark", color: "bg-reader-dark-bg border border-reader-dark-border", pdf: true },
-] as const;
-
-export const FONT_SIZE_MIN = 12;
-export const FONT_SIZE_MAX = 48;
-
-export const fonts = [
-  { id: "system", label: "System", family: "system-ui, -apple-system, 'PingFang SC', sans-serif" },
-  { id: "georgia", label: "Georgia", family: "Georgia, serif" },
-  { id: "palatino", label: "Palatino", family: "Palatino, serif" },
-  { id: "inter", label: "Inter", family: "Inter, sans-serif" },
-  { id: "times", label: "Times New Roman", family: "'Times New Roman', serif" },
-] as const;
-
-export type ReaderTheme = (typeof themes)[number]["id"];
-export type ReaderFont = (typeof fonts)[number]["id"];
 
 export type ReadingMode = "scrolling" | "paginated";
 export type PageColumns = 1 | 2;
@@ -54,31 +42,10 @@ interface ReaderSettingsProps {
   anchorRef: React.RefObject<HTMLElement | null>;
   settings: ReaderSettingsState;
   onSettingsChange: (settings: ReaderSettingsState) => void;
-  bookFormat?: "epub" | "pdf";
+  capabilities: ReaderCapabilities;
 }
 
-export function getFontFamily(fontId: ReaderFont): string {
-  return fonts.find((f) => f.id === fontId)?.family ?? "Inter, system-ui, sans-serif";
-}
-
-export function getThemeStyles(themeId: ReaderTheme) {
-  switch (themeId) {
-    case "paper":
-      return { body: "#FAF7F0", text: "#29251E" };
-    case "quiet":
-      return { body: "#71717b", text: "#fafafa" };
-    case "dark":
-      return { body: "#1b1b1f", text: "#d8d8de" };
-    default:
-      return { body: "#ffffff", text: "#0a0a0a" };
-  }
-}
-
-export function getDefaultReaderTheme(): ReaderTheme {
-  return document.documentElement.classList.contains("dark") ? "dark" : "paper";
-}
-
-export default function ReaderSettings({ open, onClose, anchorRef, settings, onSettingsChange, bookFormat }: ReaderSettingsProps) {
+export default function ReaderSettings({ open, onClose, anchorRef, settings, onSettingsChange, capabilities }: ReaderSettingsProps) {
   const { t } = useTranslation();
   const popoverRef = useRef<HTMLDivElement>(null);
   const [position, setPosition] = useState({ top: 0, right: 0 });
@@ -129,7 +96,7 @@ export default function ReaderSettings({ open, onClose, anchorRef, settings, onS
       style={{ top: position.top, right: position.right }}
     >
       {/* Font size toggle */}
-      {bookFormat !== "pdf" && (<div className="flex items-center h-[60px] px-4 border-b border-border-light">
+      {capabilities.supportsReflowSettings && (<div className="flex items-center h-[60px] px-4 border-b border-border-light">
         <button
           onClick={() => update({ fontSize: Math.max(FONT_SIZE_MIN, settings.fontSize - 2) })}
           className="flex-1 flex items-center justify-center h-7 border-r border-border cursor-pointer text-text-primary hover:bg-bg-input"
@@ -162,8 +129,8 @@ export default function ReaderSettings({ open, onClose, anchorRef, settings, onS
       </div>
 
       {/* Theme selector */}
-      <div className={`flex items-center justify-center gap-5 h-[78px] ${bookFormat !== "pdf" ? "border-b border-border-light" : ""}`}>
-        {themes.filter((t) => bookFormat !== "pdf" || t.pdf).map((theme) => (
+      <div className={`flex items-center justify-center gap-5 h-[78px] ${capabilities.supportsReflowSettings ? "border-b border-border-light" : ""}`}>
+        {getReaderThemes().map((theme) => (
           <button
             key={theme.id}
             onClick={() => update({ theme: theme.id })}
@@ -189,7 +156,7 @@ export default function ReaderSettings({ open, onClose, anchorRef, settings, onS
       </div>
 
       {/* Font family — hidden for PDFs */}
-      {bookFormat !== "pdf" && (
+      {capabilities.supportsReflowSettings && (
       <div className="px-4 py-3 border-b border-border-light">
         <p className="text-[11px] font-medium text-text-muted tracking-[0.5px] uppercase mb-2">{t("readerSettings.font")}</p>
         <Select
@@ -200,8 +167,7 @@ export default function ReaderSettings({ open, onClose, anchorRef, settings, onS
       </div>
       )}
 
-      {/* Reading Mode — supported for both EPUB and PDF */}
-      <div className="px-4 py-3 border-b border-border-light">
+      {capabilities.supportsContinuousScroll && (<div className="px-4 py-3 border-b border-border-light">
         <p className="text-[11px] font-medium text-text-muted tracking-[0.5px] uppercase mb-2">{t("readerSettings.readingMode")}</p>
         <div className="flex gap-2">
           <button
@@ -227,10 +193,10 @@ export default function ReaderSettings({ open, onClose, anchorRef, settings, onS
             <span className="text-[12px] font-medium">{t("readerSettings.pageTurning")}</span>
           </button>
         </div>
-      </div>
+      </div>)}
 
-      {/* Page columns — single or two pages — PDF only */}
-      {bookFormat === "pdf" && (<div className="px-4 py-3 border-b border-border-light">
+      {/* Page columns — only formats whose renderer supports a spread. */}
+      {capabilities.supportsSpread && (<div className="px-4 py-3 border-b border-border-light">
         <p className="text-[11px] font-medium text-text-muted tracking-[0.5px] uppercase mb-2">{t("readerSettings.pageLayout")}</p>
         <div className="flex gap-2">
           <button
@@ -258,8 +224,7 @@ export default function ReaderSettings({ open, onClose, anchorRef, settings, onS
         </div>
       </div>)}
 
-      {/* Layout section — hidden for PDFs */}
-      {bookFormat !== "pdf" && (<div className="px-4 py-3 flex flex-col gap-4">
+      {capabilities.supportsReflowSettings && (<div className="px-4 py-3 flex flex-col gap-4">
         <p className="text-[11px] font-medium text-text-muted tracking-[0.5px] uppercase">{t("readerSettings.layout")}</p>
 
         {/* Line Spacing */}
@@ -331,7 +296,7 @@ export default function ReaderSettings({ open, onClose, anchorRef, settings, onS
         </div>
       </div>)}
 
-      {bookFormat !== "pdf" && (
+      {capabilities.supportsWordMarkers && (
         <div className="px-4 py-3 border-t border-border-light flex flex-col gap-3">
           <p className="text-[11px] font-medium text-text-muted tracking-[0.5px] uppercase">{t("readerSettings.wordMarkers")}</p>
           {[

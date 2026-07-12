@@ -217,7 +217,7 @@ export default function Home() {
       } else if (event.payload.type === "drop") {
         setIsDragging(false);
         const books = event.payload.paths.filter((p) =>
-          p.toLowerCase().endsWith(".epub") || p.toLowerCase().endsWith(".pdf")
+          [".epub", ".pdf", ".txt", ".md", ".markdown", ".html", ".htm", ".mobi", ".azw", ".azw3", ".fb2", ".fbz", ".cbz"].some((extension) => p.toLowerCase().endsWith(extension))
         );
         if (books.length > 0) {
           setImporting(true);
