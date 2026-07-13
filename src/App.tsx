@@ -22,6 +22,13 @@ function applyTheme(theme: string) {
 
 export default function App() {
   useEffect(() => {
+    // The main window starts hidden. Reveal it before any potentially slow
+    // backend initialization so a blocked settings query cannot leave the
+    // application running without visible UI.
+    if (isMainWindow) {
+      invoke("app_ready").catch(() => {});
+    }
+
     invoke<Record<string, string>>("get_all_settings")
       .then((settings) => {
         const theme = settings.theme ?? "system";
@@ -33,15 +40,6 @@ export default function App() {
     // Reconcile the language we picked synchronously from localStorage with
     // the persisted DB value (and persist to the DB on first launch).
     reconcileLanguage();
-
-    // Tell the backend the UI has mounted so it can show the (currently
-    // hidden) main window. We don't wrap this in requestAnimationFrame —
-    // macOS pauses rAF for hidden windows, so the callback would never fire.
-    // useEffect runs after React commits the DOM, which is good enough; the
-    // OS composites the committed tree when window.show() is called.
-    if (isMainWindow) {
-      invoke("app_ready").catch(() => {});
-    }
 
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
     const handler = () => {

@@ -12,18 +12,24 @@ pub fn get_all_settings(
     db: State<'_, Db>,
     secrets: State<'_, Secrets>,
 ) -> AppResult<HashMap<String, String>> {
-    let conn = db.reader();
-    let mut stmt = conn.prepare("SELECT key, value FROM settings")?;
-    let mut settings = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .filter_map(|row| match row {
-            Ok((key, value)) if !Secrets::is_sensitive_key(&key) => Some(Ok((key, value))),
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<Result<HashMap<_, _>, _>>()?;
+    // Release the reader lock before asking the AI router for credentials.
+    // `list_credentials` may read the same connection again when no profile
+    // id is supplied; keeping this guard alive would deadlock the command.
+    let mut settings = {
+        let conn = db.reader();
+        let mut stmt = conn.prepare("SELECT key, value FROM settings")?;
+        let result = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|row| match row {
+                Ok((key, value)) if !Secrets::is_sensitive_key(&key) => Some(Ok((key, value))),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        result
+    };
 
     // Never expose secret values to the webview. The UI only needs to know
     // whether a key exists so it can preserve it when unrelated settings save.
