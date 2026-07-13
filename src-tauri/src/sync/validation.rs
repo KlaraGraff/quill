@@ -2,7 +2,10 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::error::{AppError, AppResult};
 
-use super::events::{Event, EventBody, EVENT_SCHEMA_VERSION};
+use super::events::{
+    is_supported_event_schema_version, normalize_learning_term, word_mark_rule_id, Event,
+    EventBody, NotePayload, WordMarkPayload,
+};
 
 const BOOK_EXTENSIONS: &[&str] = &[
     "epub", "pdf", "txt", "md", "markdown", "html", "htm", "mobi", "azw", "azw3", "fb2", "fbz",
@@ -10,6 +13,12 @@ const BOOK_EXTENSIONS: &[&str] = &[
 ];
 const COVER_EXTENSIONS: &[&str] = &["img", "jpg", "jpeg", "png", "webp"];
 const MAX_FUTURE_CLOCK_SKEW_MS: i64 = 24 * 60 * 60 * 1_000;
+const MAX_NOTE_CONTENT_BYTES: usize = 100_000;
+const MAX_NOTE_SELECTED_TEXT_BYTES: usize = 100_000;
+const MAX_NOTE_LOCATION_BYTES: usize = 16 * 1024;
+const MAX_LEARNING_TERM_BYTES: usize = 256;
+const MAX_WORD_MARK_DISPLAY_BYTES: usize = 1_024;
+const MAX_WORD_MARK_COLOR_BYTES: usize = 64;
 
 pub fn validate_entity_id(id: &str) -> AppResult<()> {
     if id.is_empty()
@@ -36,6 +45,99 @@ pub fn validate_peer_device(device: &str) -> AppResult<()> {
     Err(AppError::Other("SYNC_DEVICE_ID_INVALID".to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_note_fields(
+    id: &str,
+    book_id: Option<&str>,
+    anchor_kind: &str,
+    normalized_word: Option<&str>,
+    scope: &str,
+    location: Option<&str>,
+    selected_text: Option<&str>,
+    content: &str,
+    content_format: &str,
+) -> AppResult<()> {
+    validate_entity_id(id)?;
+    if let Some(book_id) = book_id {
+        validate_entity_id(book_id)?;
+    }
+
+    let normalized_word_is_valid = normalized_word.is_none_or(|word| {
+        !word.is_empty()
+            && word.len() <= MAX_LEARNING_TERM_BYTES
+            && !word.chars().any(char::is_control)
+            && normalize_learning_term(word) == word
+    });
+    if !matches!(anchor_kind, "word" | "selection")
+        || !matches!(scope, "book" | "global" | "detached")
+        || (scope == "book" && book_id.is_none())
+        || (scope == "detached" && book_id.is_some())
+        || (anchor_kind == "word" && normalized_word.is_none())
+        || !normalized_word_is_valid
+        || content.len() > MAX_NOTE_CONTENT_BYTES
+        || selected_text.is_some_and(|text| text.len() > MAX_NOTE_SELECTED_TEXT_BYTES)
+        || location.is_some_and(|value| value.len() > MAX_NOTE_LOCATION_BYTES)
+        || content_format != "plain_text"
+    {
+        return Err(AppError::Other("SYNC_NOTE_INVALID".to_string()));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_note_payload(payload: &NotePayload) -> AppResult<()> {
+    validate_note_fields(
+        &payload.id,
+        payload.book_id.as_deref(),
+        &payload.anchor_kind,
+        payload.normalized_word.as_deref(),
+        &payload.scope,
+        payload.location.as_deref(),
+        payload.selected_text.as_deref(),
+        &payload.content,
+        &payload.content_format,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_word_mark_fields(
+    id: &str,
+    book_id: &str,
+    normalized_word: &str,
+    display_word: &str,
+    match_mode: &str,
+    color: &str,
+) -> AppResult<()> {
+    validate_entity_id(id)?;
+    validate_entity_id(book_id)?;
+    if normalized_word.is_empty()
+        || normalized_word.len() > MAX_LEARNING_TERM_BYTES
+        || normalized_word.chars().any(char::is_control)
+        || normalize_learning_term(normalized_word) != normalized_word
+        || display_word.trim().is_empty()
+        || display_word.len() > MAX_WORD_MARK_DISPLAY_BYTES
+        || display_word.chars().any(char::is_control)
+        || match_mode != "exact"
+        || color.is_empty()
+        || color.len() > MAX_WORD_MARK_COLOR_BYTES
+        || color.chars().any(char::is_control)
+        || id != word_mark_rule_id(book_id, normalized_word, match_mode)
+    {
+        return Err(AppError::Other("SYNC_WORD_MARK_INVALID".to_string()));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_word_mark_payload(payload: &WordMarkPayload) -> AppResult<()> {
+    validate_word_mark_fields(
+        &payload.id,
+        &payload.book_id,
+        &payload.normalized_word,
+        &payload.display_word,
+        &payload.match_mode,
+        &payload.color,
+    )
+}
+
 pub fn validate_event(event: &Event, expected_device: &str) -> AppResult<()> {
     validate_peer_device(expected_device)?;
     if event.device != expected_device {
@@ -45,7 +147,7 @@ pub fn validate_event(event: &Event, expected_device: &str) -> AppResult<()> {
         .id
         .parse::<ulid::Ulid>()
         .map_err(|_| AppError::Other("SYNC_EVENT_ENVELOPE_INVALID".to_string()))?;
-    if event.v != EVENT_SCHEMA_VERSION {
+    if !is_supported_event_schema_version(event.v) {
         return Err(AppError::Other("SYNC_EVENT_ENVELOPE_INVALID".to_string()));
     }
     ensure_not_from_far_future(event.ts, "SYNC_EVENT_TIMESTAMP_INVALID")?;
@@ -81,6 +183,32 @@ pub fn validate_event(event: &Event, expected_device: &str) -> AppResult<()> {
                     None => return Err(AppError::Other("SYNC_BLOB_PATH_INVALID".to_string())),
                 }
             }
+        }
+        EventBody::NoteUpsert(payload) => {
+            if event.v < 2 {
+                return Err(AppError::Other("SYNC_NOTE_INVALID".to_string()));
+            }
+            validate_note_payload(payload)?;
+            ensure_not_from_far_future(payload.created_at, "SYNC_NOTE_INVALID")?;
+        }
+        EventBody::NoteDelete { id } => {
+            if event.v < 2 {
+                return Err(AppError::Other("SYNC_NOTE_INVALID".to_string()));
+            }
+            validate_entity_id(id)?;
+        }
+        EventBody::WordMarkUpsert(payload) => {
+            if event.v < 2 {
+                return Err(AppError::Other("SYNC_WORD_MARK_INVALID".to_string()));
+            }
+            validate_word_mark_payload(payload)?;
+            ensure_not_from_far_future(payload.created_at, "SYNC_WORD_MARK_INVALID")?;
+        }
+        EventBody::WordMarkDelete { id } => {
+            if event.v < 2 {
+                return Err(AppError::Other("SYNC_WORD_MARK_INVALID".to_string()));
+            }
+            validate_entity_id(id)?;
         }
         _ => {}
     }
@@ -171,6 +299,7 @@ pub fn resolve_blob_path(data_dir: &Path, path: &str) -> AppResult<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Map;
 
     #[test]
     fn accepts_expected_blob_paths() {
@@ -196,5 +325,84 @@ mod tests {
     fn rejects_timestamps_far_in_the_future() {
         let future = chrono::Utc::now().timestamp_millis() + MAX_FUTURE_CLOCK_SKEW_MS + 1;
         assert!(ensure_not_from_far_future(future, "test").is_err());
+    }
+
+    #[test]
+    fn validates_learning_entity_invariants() {
+        assert!(validate_note_fields(
+            "note-1",
+            None,
+            "word",
+            Some("term"),
+            "book",
+            None,
+            Some("term"),
+            "content",
+            "plain_text",
+        )
+        .is_err());
+        assert!(validate_note_fields(
+            "note-detached",
+            None,
+            "selection",
+            None,
+            "detached",
+            None,
+            Some("quoted passage"),
+            "content",
+            "plain_text",
+        )
+        .is_ok());
+        assert!(validate_note_fields(
+            "note-1",
+            Some("b1"),
+            "word",
+            None,
+            "book",
+            None,
+            Some("term"),
+            "content",
+            "plain_text",
+        )
+        .is_err());
+
+        let stable_id = word_mark_rule_id("b1", "term", "exact");
+        assert!(
+            validate_word_mark_fields(&stable_id, "b1", "term", "Term", "exact", "lookup").is_ok()
+        );
+        assert!(
+            validate_word_mark_fields("random-id", "b1", "term", "Term", "exact", "lookup")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn accepts_legacy_v1_events_but_reserves_learning_events_for_v2() {
+        let legacy = Event {
+            id: "01HYZX0000000000000000EVT1".into(),
+            ts: 1_714_770_000_000,
+            device: "dev-A".into(),
+            v: 1,
+            body: EventBody::BookDelete { id: "b1".into() },
+            extra: Map::new(),
+        };
+        assert!(validate_event(&legacy, "dev-A").is_ok());
+
+        let invalid_v1_learning = Event {
+            body: EventBody::NoteUpsert(NotePayload {
+                id: "note-1".into(),
+                book_id: Some("b1".into()),
+                anchor_kind: "word".into(),
+                normalized_word: Some("term".into()),
+                scope: "book".into(),
+                location: None,
+                selected_text: Some("term".into()),
+                content: "content".into(),
+                content_format: "plain_text".into(),
+                created_at: 1_714_770_000_000,
+            }),
+            ..legacy
+        };
+        assert!(validate_event(&invalid_v1_learning, "dev-A").is_err());
     }
 }

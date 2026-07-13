@@ -114,8 +114,8 @@ export async function getBook(id: string): Promise<Book> {
   return invoke<Book>("get_book", { id });
 }
 
-export async function deleteBook(id: string): Promise<void> {
-  return invoke("delete_book", { id });
+export async function deleteBook(id: string, preserveNotes = false): Promise<void> {
+  return invoke("delete_book", { id, preserveNotes });
 }
 
 export async function updateReadingProgress(

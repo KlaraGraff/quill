@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emitTo } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -46,6 +46,10 @@ export interface LookupRecord {
   cfi: string | null;
   definition: string;
   context_explanation: string | null;
+  result_json?: string | null;
+  provider_profile_id?: string | null;
+  model?: string | null;
+  updated_at: number;
   created_at: number;
   last_looked_up_at: number;
   lookup_count: number;
@@ -174,8 +178,10 @@ export function useAllLookupHistory() {
   const [cursor, setCursor] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const [books, setBooks] = useState<LookupBookFacet[]>([]);
+  const requestGenerationRef = useRef(0);
 
   const refresh = useCallback(async (search?: string, bookId?: string) => {
+    const generation = ++requestGenerationRef.current;
     try {
       const page = await invoke<LookupRecordPage>("list_all_lookup_records", {
         search: search || null,
@@ -183,6 +189,7 @@ export function useAllLookupHistory() {
         cursor: null,
         limit: 50,
       });
+      if (generation !== requestGenerationRef.current) return;
       setRecords(page.records);
       setTotal(page.total);
       setCursor(page.next_cursor);
@@ -198,6 +205,7 @@ export function useAllLookupHistory() {
 
   const loadMore = useCallback(async (search?: string, bookId?: string) => {
     if (!cursor || loadingMore) return;
+    const generation = requestGenerationRef.current;
     setLoadingMore(true);
     try {
       const page = await invoke<LookupRecordPage>("list_all_lookup_records", {
@@ -206,6 +214,7 @@ export function useAllLookupHistory() {
         cursor,
         limit: 50,
       });
+      if (generation !== requestGenerationRef.current) return;
       setRecords((previous) => [...previous, ...page.records]);
       setCursor(page.next_cursor);
     } finally {

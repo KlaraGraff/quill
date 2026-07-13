@@ -47,6 +47,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         20,
         include_str!("../migrations/020_text_reader_preparation.sql"),
     ),
+    (21, include_str!("../migrations/021_learning_tools.sql")),
 ];
 
 /// SQLite handle for the local materialized view.

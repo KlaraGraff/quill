@@ -1,17 +1,26 @@
-import { useState, useEffect, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { ChevronDown, ChevronRight, Highlighter, LayoutPanelTop, Languages, MousePointer2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { ChevronDown, ChevronRight, Sparkles, X } from "lucide-react";
-import Toggle from "../ui/Toggle";
+import {
+  LEARNING_CARD_CONFIG_SETTING_KEY,
+  createDefaultCardDesignConfig,
+  parseCardDesignConfig,
+  serializeCardDesignConfig,
+  type CardDesignConfigV1,
+  type LearningCardKind,
+  type SelectionMenuKind,
+} from "../learning-card";
 import Select from "../ui/Select";
-import type { SettingsProps } from "./types";
+import Toggle from "../ui/Toggle";
+import CardDesignSettings from "./CardDesignSettings";
+import CardPreview from "./CardPreview";
+import DensityHelpDialog from "./DensityHelpDialog";
 import { LANGUAGE_OPTIONS } from "./languageOptions";
+import SelectionMenuSettings from "./SelectionMenuSettings";
+import type { SettingsProps } from "./types";
 
-const SAMPLE_TRANSLATIONS: Record<string, string> = {
-  en: "interfaces",
-  zh: "界面；接口",
-};
-
-type ToolSection = "lookup" | "explain" | "translate";
+type ToolsView = "languages" | "cards" | "menu" | "markers";
+type LanguageSection = "lookup" | "explain" | "translate";
 
 function AccordionHeader({
   title,
@@ -25,48 +34,19 @@ function AccordionHeader({
   onClick: () => void;
 }) {
   const Icon = open ? ChevronDown : ChevronRight;
-
   return (
     <button
       type="button"
       onClick={onClick}
       aria-expanded={open}
-      className="w-full min-h-[55px] flex items-center justify-between gap-3 pt-3.5 pb-2.5 text-left cursor-pointer"
+      className="flex min-h-[55px] w-full items-center justify-between gap-3 py-2.5 text-left"
     >
       <div className="min-w-0 flex-1">
-        <p className="text-[12px] font-semibold text-text-muted uppercase tracking-[0.3px]">
-          {title}
-        </p>
-        <p className="text-[12px] text-text-placeholder leading-[18px] truncate">
-          {subtitle}
-        </p>
+        <p className="text-[12px] font-semibold uppercase tracking-[0.3px] text-text-muted">{title}</p>
+        <p className="break-words text-[11px] leading-[18px] text-text-placeholder">{subtitle}</p>
       </div>
       <Icon size={16} className="shrink-0 text-text-placeholder" />
     </button>
-  );
-}
-
-function SettingsRow({
-  title,
-  subtitle,
-  children,
-}: {
-  title: string;
-  subtitle: string;
-  children: ReactNode;
-}) {
-  return (
-    <div className="w-full flex items-center justify-between gap-4 min-h-[50px] px-1 py-1.5">
-      <div className="min-w-0 flex-1">
-        <p className="text-[13px] font-medium text-text-primary tracking-[-0.15px]">
-          {title}
-        </p>
-        <p className="text-[11px] text-text-placeholder leading-[17px] truncate">
-          {subtitle}
-        </p>
-      </div>
-      {children}
-    </div>
   );
 }
 
@@ -74,213 +54,329 @@ function AccordionBody({ open, children }: { open: boolean; children: ReactNode 
   return (
     <div
       aria-hidden={!open}
-      className={`grid transition-[grid-template-rows,opacity,visibility] duration-200 ease-out ${
-        open ? "grid-rows-[1fr] opacity-100 visible" : "grid-rows-[0fr] opacity-0 invisible"
-      } w-full min-w-0`}
+      className={`grid w-full min-w-0 transition-[grid-template-rows,opacity,visibility] duration-200 ${open ? "visible grid-rows-[1fr] opacity-100" : "invisible grid-rows-[0fr] opacity-0"}`}
     >
-      <div className="w-full min-w-0 overflow-hidden">
-        {children}
-      </div>
+      <div className="min-w-0 overflow-hidden">{children}</div>
     </div>
   );
 }
 
-export default function ToolsSettings({ settings, loading, save, showSavedToast }: SettingsProps) {
+function SettingsRow({ title, subtitle, children }: { title: string; subtitle: string; children: ReactNode }) {
+  return (
+    <div className="flex min-h-[52px] w-full items-center justify-between gap-4 px-1 py-1.5">
+      <div className="min-w-0 flex-1">
+        <p className="text-[13px] font-medium text-text-primary">{title}</p>
+        <p className="break-words text-[11px] leading-[17px] text-text-placeholder">{subtitle}</p>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function setWordTranslationModule(config: CardDesignConfigV1, enabled: boolean): CardDesignConfigV1 {
+  return {
+    ...config,
+    cards: {
+      ...config.cards,
+      word: {
+        ...config.cards.word,
+        modules: config.cards.word.modules.map((module) =>
+          module.id === "target_translation" ? { ...module, enabled } : module,
+        ),
+      },
+    },
+  };
+}
+
+function wordTranslationEnabled(config: CardDesignConfigV1) {
+  return config.cards.word.modules.find((module) => module.id === "target_translation")?.enabled ?? true;
+}
+
+export default function ToolsSettings({ settings, loading, save, saveBulk, showSavedToast }: SettingsProps) {
   const { t } = useTranslation();
-  const [lookupLanguage, setLookupLanguage] = useState("en");
-  const [showTranslation, setShowTranslation] = useState(false);
+  const [view, setView] = useState<ToolsView>("languages");
+  const [cardKind, setCardKind] = useState<LearningCardKind>("word");
+  const [menuKind, setMenuKind] = useState<SelectionMenuKind>("phrase");
+  const [densityHelpOpen, setDensityHelpOpen] = useState(false);
+  const [config, setConfig] = useState<CardDesignConfigV1>(createDefaultCardDesignConfig);
+  const [lookupLanguage, setLookupLanguage] = useState("selection");
+  const [showTranslation, setShowTranslation] = useState(true);
   const [lookupTranslationLanguage, setLookupTranslationLanguage] = useState("");
   const [explainLanguage, setExplainLanguage] = useState("lookup");
   const [translationLanguage, setTranslationLanguage] = useState("");
-  const [openSections, setOpenSections] = useState<Record<ToolSection, boolean>>({
+  const [autoHighlightLookupWords, setAutoHighlightLookupWords] = useState(true);
+  const [openSections, setOpenSections] = useState<Record<LanguageSection, boolean>>({
     lookup: true,
     explain: false,
     translate: false,
   });
+  const saveQueue = useRef<Promise<void>>(Promise.resolve());
+  const hydratedRef = useRef(false);
 
   useEffect(() => {
-    if (loading) return;
+    if (loading || hydratedRef.current) return;
+    let parsed = parseCardDesignConfig(settings[LEARNING_CARD_CONFIG_SETTING_KEY]);
+    if (!settings[LEARNING_CARD_CONFIG_SETTING_KEY] && settings.show_translation !== undefined) {
+      parsed = setWordTranslationModule(parsed, settings.show_translation === "true");
+    }
+    setConfig(parsed);
     setLookupLanguage(settings.lookup_language || "selection");
     setLookupTranslationLanguage(settings.lookup_translation_language || settings.language || "en");
-    setShowTranslation(settings.show_translation === "true");
+    setShowTranslation(wordTranslationEnabled(parsed));
     setExplainLanguage(settings.explain_language || "lookup");
     setTranslationLanguage(settings.translation_language || settings.language || "en");
+    setAutoHighlightLookupWords(settings.auto_highlight_lookup_words !== "false");
+    hydratedRef.current = true;
   }, [settings, loading]);
 
   if (loading) return null;
 
-  const shouldShowTranslation =
-    showTranslation && lookupTranslationLanguage !== "" && lookupTranslationLanguage !== lookupLanguage;
-  const lookupLanguageOptions = [
-    { value: "selection", label: t("settings.tools.sameAsSelection") },
-    ...LANGUAGE_OPTIONS,
-  ];
-  const explainLanguageOptions = [
-    { value: "lookup", label: t("settings.tools.sameAsLookup") },
-    ...LANGUAGE_OPTIONS,
-  ];
-  const sections: { id: ToolSection; title: string; subtitle: string }[] = [
-    { id: "lookup", title: t("settings.tools.lookup"), subtitle: t("settings.tools.lookupSub") },
-    { id: "explain", title: t("settings.tools.explain"), subtitle: t("settings.tools.explainSub") },
-    { id: "translate", title: t("settings.tools.translate"), subtitle: t("settings.tools.translateSub") },
-  ];
-  const toggleSection = (section: ToolSection) => {
-    setOpenSections((current) => ({
-      ...current,
-      [section]: !current[section],
-    }));
+  const queueSave = (entries: Record<string, string>) => {
+    saveQueue.current = saveQueue.current
+      .catch(() => {})
+      .then(() => saveBulk(entries))
+      .then(() => showSavedToast())
+      .catch((error) => console.error("Failed to save learning tool settings:", error));
   };
+  const persistConfig = (next: CardDesignConfigV1) => {
+    const normalized = parseCardDesignConfig(next);
+    const translationEnabled = wordTranslationEnabled(normalized);
+    setConfig(normalized);
+    setShowTranslation(translationEnabled);
+    queueSave({
+      [LEARNING_CARD_CONFIG_SETTING_KEY]: serializeCardDesignConfig(normalized),
+      show_translation: String(translationEnabled),
+    });
+  };
+  const persistLegacy = (key: string, value: string) => {
+    save(key, value).then(() => showSavedToast()).catch((error) => {
+      console.error(`Failed to save ${key}:`, error);
+    });
+  };
+  const updateCard = (kind: LearningCardKind, card: CardDesignConfigV1["cards"][LearningCardKind]) => {
+    persistConfig({ ...config, cards: { ...config.cards, [kind]: card } });
+  };
+  const explanationLanguage = cardKind === "passage"
+    ? explainLanguage === "lookup" ? lookupLanguage : explainLanguage
+    : lookupLanguage;
+  const resolvedExplanationLanguage = explanationLanguage === "selection"
+    ? "en"
+    : explanationLanguage;
+  const targetLanguage = cardKind === "passage" ? translationLanguage : lookupTranslationLanguage;
+  const views: { id: ToolsView; icon: typeof Languages; label: string }[] = [
+    { id: "languages", icon: Languages, label: t("settings.tools.views.languages") },
+    { id: "cards", icon: LayoutPanelTop, label: t("settings.tools.views.cards") },
+    { id: "menu", icon: MousePointer2, label: t("settings.tools.views.menu") },
+    {
+      id: "markers",
+      icon: Highlighter,
+      label: t("settings.tools.views.markers", { defaultValue: "正文标记" }),
+    },
+  ];
 
   return (
     <div className="w-full min-w-0 pb-10">
-      <div className="w-full min-w-0">
-        {sections.map((section, index) => {
-          const open = openSections[section.id];
-
+      <div role="tablist" className="mb-4 flex min-w-0 gap-1 border-b border-border-light">
+        {views.map((item) => {
+          const Icon = item.icon;
           return (
-            <div key={section.id} className="w-full min-w-0">
-              {index > 0 && <div className="h-px bg-border-light" />}
-              <div className="w-full min-w-0">
-                <AccordionHeader
-                  title={section.title}
-                  subtitle={section.subtitle}
-                  open={open}
-                  onClick={() => toggleSection(section.id)}
-                />
-                <AccordionBody open={open}>
-                  {section.id === "lookup" && (
-                  <div className="w-full min-w-0 flex flex-col gap-1 pb-3">
-                    <SettingsRow
-                      title={t("settings.tools.lookupLanguage")}
-                      subtitle={t("settings.tools.lookupLanguageHint")}
-                    >
-                      <Select
-                        className="w-[175px] shrink-0"
-                        value={lookupLanguage}
-                        onChange={(lang) => {
-                          setLookupLanguage(lang);
-                          save("lookup_language", lang);
-                          showSavedToast();
-                        }}
-                        options={lookupLanguageOptions}
-                      />
-                    </SettingsRow>
-                    <SettingsRow
-                      title={t("settings.tools.briefTranslation")}
-                      subtitle={t("settings.tools.briefTranslationHint")}
-                    >
-                      <Toggle
-                        checked={showTranslation}
-                        onChange={(checked) => {
-                          setShowTranslation(checked);
-                          save("show_translation", String(checked));
-                          showSavedToast();
-                        }}
-                      />
-                    </SettingsRow>
-                    <SettingsRow
-                      title={t("settings.tools.glossTarget")}
-                      subtitle={t("settings.tools.glossTargetHint")}
-                    >
-                      <Select
-                        className="w-[130px] shrink-0"
-                        value={lookupTranslationLanguage}
-                        placeholder={t("settings.languageUnset")}
-                        onChange={(lang) => {
-                          setLookupTranslationLanguage(lang);
-                          save("lookup_translation_language", lang);
-                          showSavedToast();
-                        }}
-                        options={LANGUAGE_OPTIONS}
-                      />
-                    </SettingsRow>
-                    <div className="w-full min-w-0 pt-2 px-1">
-                      <p className="text-[10px] font-bold text-text-placeholder mb-1.5 uppercase tracking-[0.3px]">
-                        {t("settings.tools.preview")}
-                      </p>
-                      <div className="w-full min-w-0 bg-bg-muted border border-border rounded-lg overflow-hidden">
-                        <div className="flex items-center justify-between px-3 py-2">
-                          <div className="flex items-center gap-1.5">
-                            <Sparkles size={13} className="text-accent-text" />
-                            <span className="text-[12px] font-medium text-accent-text">{t("lookup.title")}</span>
-                          </div>
-                          <X size={12} className="text-text-placeholder" />
-                        </div>
-                        <div className="px-3 pb-3 flex flex-col gap-1.5">
-                          <p className="text-[14px] font-bold text-text-primary">interfaces</p>
-                          <p
-                            aria-hidden={!shouldShowTranslation}
-                            className={`text-[11px] font-medium text-accent-text leading-[16px] transition-opacity ${
-                              shouldShowTranslation ? "opacity-100" : "opacity-0"
-                            }`}
-                          >
-                            {SAMPLE_TRANSLATIONS[lookupTranslationLanguage] || "interfaces"}
-                          </p>
-                          <p className="text-[11px] text-text-secondary leading-[1.45]">
-                            {lookupLanguage === "zh"
-                              ? "名词。两个系统相互连接和交互的点或区域。"
-                              : "A term used in this passage to convey a specific quality relevant to themes of technological advancement."}
-                          </p>
-                          <div className="p-2 rounded-md bg-bg-surface border border-border">
-                            <p className="text-[9px] font-bold text-text-placeholder mb-0.5">
-                              {t("lookup.inContext")}
-                            </p>
-                            <p className="text-[10px] text-text-secondary leading-[1.45]">
-                              {lookupLanguage === "zh"
-                                ? "在这段文字中，interfaces 指的是人类与技术之间的边界。"
-                                : "This word contributes to the author's exploration of the intersection between humanity and technology."}
-                            </p>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                )}
-                  {section.id === "explain" && (
-                  <div className="w-full min-w-0 flex flex-col gap-1 pb-3">
-                    <SettingsRow
-                      title={t("settings.tools.explainLanguage")}
-                      subtitle={t("settings.tools.explainLanguageHint")}
-                    >
-                      <Select
-                        className="w-[150px] shrink-0"
-                        value={explainLanguage}
-                        onChange={(lang) => {
-                          setExplainLanguage(lang);
-                          save("explain_language", lang);
-                          showSavedToast();
-                        }}
-                        options={explainLanguageOptions}
-                      />
-                    </SettingsRow>
-                  </div>
-                )}
-                  {section.id === "translate" && (
-                  <div className="w-full min-w-0 flex flex-col gap-1 pb-3">
-                    <SettingsRow
-                      title={t("settings.tools.translateTo")}
-                      subtitle={t("settings.tools.translateToHint")}
-                    >
-                      <Select
-                        className="w-[130px] shrink-0"
-                        value={translationLanguage}
-                        placeholder={t("settings.languageUnset")}
-                        onChange={(lang) => {
-                          setTranslationLanguage(lang);
-                          save("translation_language", lang);
-                          showSavedToast();
-                        }}
-                        options={LANGUAGE_OPTIONS}
-                      />
-                    </SettingsRow>
-                  </div>
-                )}
-                </AccordionBody>
-              </div>
-            </div>
+            <button
+              key={item.id}
+              type="button"
+              role="tab"
+              aria-selected={view === item.id}
+              onClick={() => setView(item.id)}
+              className={`flex h-10 min-w-0 items-center gap-1.5 border-b-2 px-3 text-[12px] font-medium ${view === item.id ? "border-accent text-accent-text" : "border-transparent text-text-muted hover:text-text-primary"}`}
+            >
+              <Icon size={14} className="shrink-0" />
+              <span className="truncate">{item.label}</span>
+            </button>
           );
         })}
       </div>
+
+      {view === "languages" && (
+        <div className="mx-auto w-full max-w-[620px]">
+          {(["lookup", "explain", "translate"] as LanguageSection[]).map((section, index) => {
+            const open = openSections[section];
+            return (
+              <div key={section} className={index > 0 ? "border-t border-border-light" : ""}>
+                <AccordionHeader
+                  title={t(`settings.tools.${section}`)}
+                  subtitle={t(`settings.tools.${section}Sub`)}
+                  open={open}
+                  onClick={() => setOpenSections((current) => ({ ...current, [section]: !current[section] }))}
+                />
+                <AccordionBody open={open}>
+                  {section === "lookup" && (
+                    <div className="pb-3">
+                      <SettingsRow title={t("settings.tools.lookupLanguage")} subtitle={t("settings.tools.lookupLanguageHint")}>
+                        <Select
+                          className="w-[175px] shrink-0"
+                          value={lookupLanguage}
+                          onChange={(language) => {
+                            setLookupLanguage(language);
+                            persistLegacy("lookup_language", language);
+                          }}
+                          options={[{ value: "selection", label: t("settings.tools.sameAsSelection") }, ...LANGUAGE_OPTIONS]}
+                        />
+                      </SettingsRow>
+                      <SettingsRow title={t("settings.tools.briefTranslation")} subtitle={t("settings.tools.briefTranslationHint")}>
+                        <Toggle
+                          checked={showTranslation}
+                          onChange={(enabled) => persistConfig(setWordTranslationModule(config, enabled))}
+                        />
+                      </SettingsRow>
+                      <SettingsRow title={t("settings.tools.glossTarget")} subtitle={t("settings.tools.glossTargetHint")}>
+                        <Select
+                          className="w-[130px] shrink-0"
+                          value={lookupTranslationLanguage}
+                          placeholder={t("settings.languageUnset")}
+                          onChange={(language) => {
+                            setLookupTranslationLanguage(language);
+                            persistLegacy("lookup_translation_language", language);
+                          }}
+                          options={LANGUAGE_OPTIONS}
+                        />
+                      </SettingsRow>
+                    </div>
+                  )}
+                  {section === "explain" && (
+                    <div className="pb-3">
+                      <SettingsRow title={t("settings.tools.explainLanguage")} subtitle={t("settings.tools.explainLanguageHint")}>
+                        <Select
+                          className="w-[150px] shrink-0"
+                          value={explainLanguage}
+                          onChange={(language) => {
+                            setExplainLanguage(language);
+                            persistLegacy("explain_language", language);
+                          }}
+                          options={[{ value: "lookup", label: t("settings.tools.sameAsLookup") }, ...LANGUAGE_OPTIONS]}
+                        />
+                      </SettingsRow>
+                    </div>
+                  )}
+                  {section === "translate" && (
+                    <div className="pb-3">
+                      <SettingsRow title={t("settings.tools.translateTo")} subtitle={t("settings.tools.translateToHint")}>
+                        <Select
+                          className="w-[130px] shrink-0"
+                          value={translationLanguage}
+                          placeholder={t("settings.languageUnset")}
+                          onChange={(language) => {
+                            setTranslationLanguage(language);
+                            persistLegacy("translation_language", language);
+                          }}
+                          options={LANGUAGE_OPTIONS}
+                        />
+                      </SettingsRow>
+                    </div>
+                  )}
+                </AccordionBody>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {view === "cards" && (
+        <div>
+          <div className="mb-4 flex gap-1 border-b border-border-light" role="tablist">
+            {(["word", "phrase", "passage"] as LearningCardKind[]).map((kind) => (
+              <button
+                key={kind}
+                type="button"
+                role="tab"
+                aria-selected={cardKind === kind}
+                onClick={() => setCardKind(kind)}
+                className={`h-9 border-b-2 px-3 text-[12px] font-medium ${cardKind === kind ? "border-accent text-accent-text" : "border-transparent text-text-muted"}`}
+              >
+                {t(`settings.tools.cardKind.${kind}`)}
+              </button>
+            ))}
+          </div>
+          <div className="grid min-w-0 gap-6 lg:grid-cols-[minmax(300px,380px)_minmax(0,1fr)]">
+            <CardDesignSettings
+              kind={cardKind}
+              value={config.cards[cardKind]}
+              onChange={(card) => updateCard(cardKind, card)}
+              onOpenDensityHelp={() => setDensityHelpOpen(true)}
+            />
+            <CardPreview
+              kind={cardKind}
+              config={config}
+              explanationLanguage={resolvedExplanationLanguage}
+              targetLanguage={targetLanguage}
+              learnerLevel={settings.cefr_level || "B1"}
+              explanationMode={settings.explanation_mode || "adaptive_bilingual"}
+            />
+          </div>
+        </div>
+      )}
+
+      {view === "menu" && (
+        <div>
+          <div className="mb-4 flex gap-1 border-b border-border-light" role="tablist">
+            {(["phrase", "passage"] as SelectionMenuKind[]).map((kind) => (
+              <button
+                key={kind}
+                type="button"
+                role="tab"
+                aria-selected={menuKind === kind}
+                onClick={() => setMenuKind(kind)}
+                className={`h-9 border-b-2 px-3 text-[12px] font-medium ${menuKind === kind ? "border-accent text-accent-text" : "border-transparent text-text-muted"}`}
+              >
+                {t(`settings.tools.cardKind.${kind}`)}
+              </button>
+            ))}
+          </div>
+          <div className="grid min-w-0 gap-6 lg:grid-cols-[minmax(300px,380px)_minmax(0,1fr)]">
+            <SelectionMenuSettings
+              kind={menuKind}
+              value={config.selectionMenus[menuKind]}
+              onChange={(menu) => persistConfig({
+                ...config,
+                selectionMenus: { ...config.selectionMenus, [menuKind]: menu },
+              })}
+            />
+            <CardPreview
+              kind={menuKind}
+              config={config}
+              explanationLanguage={menuKind === "passage" ? (explainLanguage === "lookup" ? resolvedExplanationLanguage : explainLanguage) : resolvedExplanationLanguage}
+              targetLanguage={menuKind === "passage" ? translationLanguage : lookupTranslationLanguage}
+              learnerLevel={settings.cefr_level || "B1"}
+              explanationMode={settings.explanation_mode || "adaptive_bilingual"}
+              showMenu
+            />
+          </div>
+        </div>
+      )}
+
+      {view === "markers" && (
+        <div className="mx-auto w-full max-w-[620px]">
+          <SettingsRow
+            title={t("settings.tools.autoHighlightLookupWords", { defaultValue: "查词后自动标记" })}
+            subtitle={t("settings.tools.autoHighlightLookupWordsHint", {
+              defaultValue: "单击查询单词后，在本书中标记所有相同拼写；手动高亮不受影响。",
+            })}
+          >
+            <Toggle
+              checked={autoHighlightLookupWords}
+              onChange={(enabled) => {
+                setAutoHighlightLookupWords(enabled);
+                persistLegacy("auto_highlight_lookup_words", String(enabled));
+              }}
+            />
+          </SettingsRow>
+          <p className="border-t border-border-light px-1 py-3 text-[11px] leading-[18px] text-text-muted">
+            {t("settings.tools.wordMarkExactHint", {
+              defaultValue: "当前版本忽略大小写并只匹配完整的相同拼写。关闭后不会删除已有标记，可在正文菜单中取消某个单词的全书标记。",
+            })}
+          </p>
+        </div>
+      )}
+
+      {densityHelpOpen && <DensityHelpDialog initialKind={cardKind} onClose={() => setDensityHelpOpen(false)} />}
     </div>
   );
 }

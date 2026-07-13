@@ -9,6 +9,7 @@ import BookGrid from "../components/BookGrid";
 import BookList from "../components/BookList";
 import DictionaryContent from "../components/DictionaryContent";
 import ChatsContent from "../components/ChatsContent";
+import NotesContent from "../components/NotesContent";
 import SettingsModal, { type SettingsSection } from "../components/SettingsModal";
 import Button from "../components/ui/Button";
 import Input from "../components/ui/Input";
@@ -83,6 +84,13 @@ export default function Home() {
       unlisten.then((fn) => fn());
     };
   }, [normalizeSettingsSection]);
+
+  useEffect(() => {
+    const unlisten = getCurrentWebview().listen<string>("open-library-filter", (event) => {
+      setActiveFilter(event.payload || "all");
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
 
   // Cmd+, to open settings
   useEffect(() => {
@@ -330,6 +338,8 @@ export default function Home() {
         <DictionaryContent />
       ) : activeFilter === "chats" ? (
         <ChatsContent />
+      ) : activeFilter === "notes" ? (
+        <NotesContent />
       ) : (
         <main className="flex-1 flex flex-col min-w-0">
           <div className="border-b border-border px-page pb-section relative select-none">

@@ -586,7 +586,7 @@ pub fn run() {
             // library, while their reader documents are local derived caches.
             // Resume any interrupted work after managed state is available;
             // this deliberately runs away from setup's UI-critical path.
-            commands::books::schedule_pending_text_book_preparations(app.handle().clone());
+            commands::books::resume_interrupted_text_book_preparations(app.handle().clone());
 
             // Boot the sync engine on a background thread. Everything
             // that touches iCloud paths (EventLog::open, watcher::spawn,
@@ -660,7 +660,16 @@ pub fn run() {
             commands::settings::ai_api_key_configured,
             commands::settings::set_ai_api_key,
             commands::settings::ai_active_profile,
+            commands::settings::ai_list_profiles,
+            commands::settings::ai_create_profile,
+            commands::settings::ai_duplicate_profile,
             commands::settings::ai_save_profile,
+            commands::settings::ai_update_profile,
+            commands::settings::ai_set_profile_enabled,
+            commands::settings::ai_reorder_profiles,
+            commands::settings::ai_delete_profile,
+            commands::settings::ai_list_models,
+            commands::settings::ai_test_profile,
             commands::settings::ai_list_credentials,
             commands::settings::ai_add_credential,
             commands::settings::ai_replace_credential,
@@ -674,15 +683,33 @@ pub fn run() {
             commands::settings::get_book_settings,
             commands::settings::set_book_settings_bulk,
             commands::settings::open_settings_on_main,
+            commands::settings::open_library_on_main,
+            // Learner profile and exam-to-CEFR estimates
+            commands::language_assessments::estimate_cefr,
+            commands::language_assessments::summarize_language_assessments,
+            commands::language_assessments::save_language_assessment,
+            commands::language_assessments::list_language_assessments,
+            commands::language_assessments::delete_language_assessment,
             // Bookmarks & Highlights
             commands::bookmarks::add_bookmark,
             commands::bookmarks::remove_bookmark,
             commands::bookmarks::list_bookmarks,
             commands::bookmarks::add_highlight,
             commands::bookmarks::remove_highlight,
+            commands::bookmarks::replace_highlights,
             commands::bookmarks::list_highlights,
             commands::bookmarks::update_highlight_note,
             commands::bookmarks::update_highlight_color,
+            // Learning notes and automatic whole-book word markers
+            commands::notes::save_note,
+            commands::notes::delete_note,
+            commands::notes::list_notes,
+            commands::notes::list_context_notes,
+            commands::word_marks::upsert_word_mark,
+            commands::word_marks::ensure_word_mark_rule,
+            commands::word_marks::set_word_mark_rule_enabled,
+            commands::word_marks::remove_word_mark,
+            commands::word_marks::list_word_marks,
             // Collections
             commands::collections::list_collections,
             commands::collections::create_collection,
@@ -694,6 +721,7 @@ pub fn run() {
             commands::collections::list_books_in_collection,
             // AI
             commands::ai::ai_chat,
+            commands::ai::ai_learning_card,
             commands::ai::ai_lookup,
             commands::ai::ai_explain,
             commands::ai::ai_generate_title,

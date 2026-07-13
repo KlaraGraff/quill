@@ -22,11 +22,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use serde_json::Map;
+use serde_json::{Map, Value};
 
 use crate::error::{AppError, AppResult};
 
-use super::events::{Event, EventBody, EVENT_SCHEMA_VERSION};
+use super::events::{is_supported_event_schema_version, Event, EventBody, EVENT_SCHEMA_VERSION};
 
 pub const MAX_LOG_FILE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_LOG_LINE_BYTES: usize = 256 * 1024;
@@ -62,7 +62,7 @@ impl EventLog {
         let _ = OpenOptions::new().create(true).append(true).open(path)?;
         let last_id = read_log_file(path)?
             .into_iter()
-            .filter(|event| event.device == device && event.v == EVENT_SCHEMA_VERSION)
+            .filter(|event| event.device == device && is_supported_event_schema_version(event.v))
             .filter_map(|event| event.id.parse::<ulid::Ulid>().ok())
             .max();
         Ok(Self {
@@ -290,6 +290,24 @@ fn parse_log_bytes(bytes: &[u8], path: &Path) -> AppResult<Vec<Event>> {
         match serde_json::from_slice::<Event>(line) {
             Ok(ev) => out.push(ev),
             Err(e) => {
+                // A syntactically valid event envelope with an unsupported
+                // version/type must reject the log. Silently skipping it could
+                // let replay advance the peer watermark to a later event and
+                // lose this row permanently. Truly malformed/torn JSON keeps
+                // the legacy best-effort behavior below.
+                if let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(line) {
+                    if object.contains_key("id")
+                        && object.contains_key("device")
+                        && object.contains_key("v")
+                        && object.contains_key("type")
+                    {
+                        return Err(AppError::Other(format!(
+                            "sync log contains unsupported event at line {} in {}: {e}",
+                            idx + 1,
+                            path.display()
+                        )));
+                    }
+                }
                 log::warn!(
                     "sync: skipping malformed log line {} in {}: {e}",
                     idx + 1,
@@ -503,6 +521,44 @@ mod tests {
     }
 
     #[test]
+    fn reopen_seeds_from_the_max_supported_v1_or_v2_event() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("logs").join("dev-A.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let first_id = ulid::Ulid::from_datetime(
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_000),
+        );
+        let second_id = first_id.increment().unwrap();
+        let events = [
+            Event {
+                id: first_id.to_string(),
+                ts: 1_700_000_000_000,
+                device: "dev-A".into(),
+                v: 1,
+                body: sample_body(1),
+                extra: Map::new(),
+            },
+            Event {
+                id: second_id.to_string(),
+                ts: 1_700_000_000_001,
+                device: "dev-A".into(),
+                v: EVENT_SCHEMA_VERSION,
+                body: sample_body(2),
+                extra: Map::new(),
+            },
+        ];
+        let mut bytes = Vec::new();
+        for event in &events {
+            serde_json::to_writer(&mut bytes, event).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&path, bytes).unwrap();
+
+        let log = EventLog::open(&path, "dev-A", false).unwrap();
+        assert_eq!(log.inner.lock().unwrap().last_id, Some(second_id));
+    }
+
+    #[test]
     fn append_batch_shares_ts_and_generates_distinct_ids() {
         let tmp = TempDir::new().unwrap();
         let log = open_log(&tmp);
@@ -587,6 +643,16 @@ mod tests {
             events[0].extra.get("future_field"),
             Some(&serde_json::json!("keep-me"))
         );
+    }
+
+    #[test]
+    fn valid_unknown_event_is_rejected_instead_of_silently_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let log = open_log(&tmp);
+        let raw = r#"{"id":"01HYZX0000000000000000EVTZ","ts":1714770000000,"device":"dev-A","v":3,"type":"future.entity.upsert","payload":{"id":"future-1"}}"#;
+        std::fs::write(log.path(), format!("{raw}\n")).unwrap();
+        let error = log.read_all().unwrap_err().to_string();
+        assert!(error.contains("unsupported event"), "{error}");
     }
 
     #[test]

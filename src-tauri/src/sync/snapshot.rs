@@ -6,7 +6,7 @@
 //!
 //! ```jsonc
 //! {
-//!   "v": 1,
+//!   "v": 2,
 //!   "device": "<uuid>",
 //!   "id": "<latest event ULID included>",
 //!   "generated_at": <unix millis>,
@@ -46,8 +46,13 @@ pub const COMPACT_LOG_BYTE_THRESHOLD: u64 = 2 * 1024 * 1024; // 2 MB
 pub const COMPACT_LOG_EVENT_THRESHOLD: usize = 5_000;
 pub const COMPACT_AGE_THRESHOLD_MS: i64 = 30 * 24 * 60 * 60 * 1_000; // 30 days
 
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+pub const MIN_SUPPORTED_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
+
+fn is_supported_snapshot_schema_version(version: u32) -> bool {
+    (MIN_SUPPORTED_SNAPSHOT_SCHEMA_VERSION..=SNAPSHOT_SCHEMA_VERSION).contains(&version)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Snapshot {
@@ -75,6 +80,10 @@ pub struct SnapshotState {
     pub bookmarks: BTreeMap<String, BookmarkRow>,
     #[serde(default)]
     pub vocab_words: BTreeMap<String, VocabRow>,
+    #[serde(default)]
+    pub notes: BTreeMap<String, NoteRow>,
+    #[serde(default)]
+    pub word_mark_rules: BTreeMap<String, WordMarkRow>,
     #[serde(default)]
     pub collections: BTreeMap<String, CollectionRow>,
     /// Keyed by `"<collection_id>:<book_id>"` — the same composite key the
@@ -165,6 +174,34 @@ pub struct VocabRow {
     pub fsrs_difficulty: Option<f64>,
     #[serde(default = "default_fsrs_version")]
     pub fsrs_version: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub updated_by_device: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NoteRow {
+    pub book_id: Option<String>,
+    pub anchor_kind: String,
+    pub normalized_word: Option<String>,
+    pub scope: String,
+    pub location: Option<String>,
+    pub selected_text: Option<String>,
+    pub content: String,
+    pub content_format: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub updated_by_device: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WordMarkRow {
+    pub book_id: String,
+    pub normalized_word: String,
+    pub display_word: String,
+    pub match_mode: String,
+    pub color: String,
+    pub enabled: bool,
     pub created_at: i64,
     pub updated_at: i64,
     pub updated_by_device: String,
@@ -415,7 +452,7 @@ impl Snapshot {
     pub fn apply_peer(&self, tx: &Transaction, peer_device: &str) -> AppResult<ApplyOutcome> {
         super::validation::validate_peer_device(peer_device)?;
         if self.device != peer_device
-            || self.v != SNAPSHOT_SCHEMA_VERSION
+            || !is_supported_snapshot_schema_version(self.v)
             || self.id.parse::<Ulid>().is_err()
         {
             return Err(AppError::Other(
@@ -441,6 +478,45 @@ impl Snapshot {
             if let Some(path) = book.cover_path.as_deref() {
                 super::validation::validate_cover_path(path)?;
             }
+        }
+        for (id, note) in &self.state.notes {
+            super::validation::validate_note_fields(
+                id,
+                note.book_id.as_deref(),
+                &note.anchor_kind,
+                note.normalized_word.as_deref(),
+                &note.scope,
+                note.location.as_deref(),
+                note.selected_text.as_deref(),
+                &note.content,
+                &note.content_format,
+            )?;
+            super::validation::ensure_not_from_far_future(
+                note.created_at,
+                "SYNC_SNAPSHOT_NOTE_INVALID",
+            )?;
+            super::validation::ensure_not_from_far_future(
+                note.updated_at,
+                "SYNC_SNAPSHOT_NOTE_INVALID",
+            )?;
+        }
+        for (id, rule) in &self.state.word_mark_rules {
+            super::validation::validate_word_mark_fields(
+                id,
+                &rule.book_id,
+                &rule.normalized_word,
+                &rule.display_word,
+                &rule.match_mode,
+                &rule.color,
+            )?;
+            super::validation::ensure_not_from_far_future(
+                rule.created_at,
+                "SYNC_SNAPSHOT_WORD_MARK_INVALID",
+            )?;
+            super::validation::ensure_not_from_far_future(
+                rule.updated_at,
+                "SYNC_SNAPSHOT_WORD_MARK_INVALID",
+            )?;
         }
         let prior: Option<(Option<String>, Option<String>)> = tx
             .query_row(
@@ -508,6 +584,25 @@ impl Snapshot {
                 continue;
             }
             upsert_vocab(tx, id, row)?;
+        }
+        for (id, row) in &self.state.notes {
+            if merge::is_tombstoned(tx, merge::entity::NOTE, id)? {
+                continue;
+            }
+            if row.scope == "book" {
+                if let Some(book_id) = row.book_id.as_deref() {
+                    if merge::is_tombstoned(tx, merge::entity::BOOK, book_id)? {
+                        continue;
+                    }
+                }
+            }
+            upsert_note(tx, id, row)?;
+        }
+        for (id, row) in &self.state.word_mark_rules {
+            if merge::is_tombstoned(tx, merge::entity::BOOK, &row.book_id)? {
+                continue;
+            }
+            upsert_word_mark(tx, id, row)?;
         }
         for (id, row) in &self.state.collections {
             if merge::is_tombstoned(tx, merge::entity::COLLECTION, id)? {
@@ -807,8 +902,26 @@ fn upsert_book(tx: &Transaction, id: &str, r: &BookRow) -> AppResult<()> {
            source_file_path=excluded.source_file_path,
            source_sha256=excluded.source_sha256,
            conversion_version=excluded.conversion_version,
-           preparation_state=CASE WHEN excluded.render_format = 'text' THEN 'pending' ELSE 'ready' END,
-           preparation_error=NULL,
+           preparation_state=CASE
+             WHEN excluded.render_format IS NOT 'text' THEN 'ready'
+             WHEN excluded.source_format IS NOT books.source_format
+               OR excluded.render_format IS NOT books.render_format
+               OR excluded.source_file_path IS NOT books.source_file_path
+               OR excluded.source_sha256 IS NOT books.source_sha256
+               OR excluded.conversion_version IS NOT books.conversion_version
+             THEN 'pending'
+             ELSE books.preparation_state
+           END,
+           preparation_error=CASE
+             WHEN excluded.render_format IS NOT 'text' THEN NULL
+             WHEN excluded.source_format IS NOT books.source_format
+               OR excluded.render_format IS NOT books.render_format
+               OR excluded.source_file_path IS NOT books.source_file_path
+               OR excluded.source_sha256 IS NOT books.source_sha256
+               OR excluded.conversion_version IS NOT books.conversion_version
+             THEN NULL
+             ELSE books.preparation_error
+           END,
            status=excluded.status,
            progress=excluded.progress,
            current_cfi=excluded.current_cfi,
@@ -905,6 +1018,93 @@ fn upsert_vocab(tx: &Transaction, id: &str, r: &VocabRow) -> AppResult<()> {
             r.fsrs_stability,
             r.fsrs_difficulty,
             r.fsrs_version,
+            r.created_at,
+            r.updated_at,
+            r.updated_by_device,
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_note(tx: &Transaction, id: &str, r: &NoteRow) -> AppResult<()> {
+    let book_id = match r.book_id.as_deref() {
+        Some(book_id) if merge::is_tombstoned(tx, merge::entity::BOOK, book_id)? => None,
+        value => value,
+    };
+    if book_id.is_none() && r.book_id.is_some() {
+        // Detachment is an invariant imposed by the parent tombstone, not a
+        // competing note edit. Enforce it even when the local note has a newer
+        // LWW tuple (for example after replaying data from an older client).
+        tx.execute("UPDATE notes SET book_id = NULL WHERE id = ?1", params![id])?;
+    }
+    tx.execute(
+        "INSERT INTO notes
+         (id, book_id, anchor_kind, normalized_word, scope, location, selected_text,
+          content, content_format, created_at, updated_at, updated_by_device)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT(id) DO UPDATE SET
+           book_id=excluded.book_id,
+           anchor_kind=excluded.anchor_kind,
+           normalized_word=excluded.normalized_word,
+           scope=excluded.scope,
+           location=excluded.location,
+           selected_text=excluded.selected_text,
+           content=excluded.content,
+           content_format=excluded.content_format,
+           updated_at=excluded.updated_at,
+           updated_by_device=excluded.updated_by_device
+         WHERE (notes.updated_at, notes.updated_by_device)
+             < (excluded.updated_at, excluded.updated_by_device)",
+        params![
+            id,
+            book_id,
+            r.anchor_kind,
+            r.normalized_word,
+            r.scope,
+            r.location,
+            r.selected_text,
+            r.content,
+            r.content_format,
+            r.created_at,
+            r.updated_at,
+            r.updated_by_device,
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_word_mark(tx: &Transaction, id: &str, r: &WordMarkRow) -> AppResult<()> {
+    if merge::tombstone_timestamp(tx, merge::entity::WORD_MARK, id)?
+        .is_some_and(|deleted_at| deleted_at >= r.updated_at)
+    {
+        return Ok(());
+    }
+    tx.execute(
+        "DELETE FROM _tombstones WHERE entity = ?1 AND id = ?2",
+        params![merge::entity::WORD_MARK, id],
+    )?;
+    tx.execute(
+        "INSERT INTO word_mark_rules
+         (id, book_id, normalized_word, display_word, match_mode, color, enabled,
+          created_at, updated_at, updated_by_device)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(book_id, normalized_word, match_mode) DO UPDATE SET
+           id=excluded.id,
+           display_word=excluded.display_word,
+           color=excluded.color,
+           enabled=excluded.enabled,
+           updated_at=excluded.updated_at,
+           updated_by_device=excluded.updated_by_device
+         WHERE (word_mark_rules.updated_at, word_mark_rules.updated_by_device)
+             < (excluded.updated_at, excluded.updated_by_device)",
+        params![
+            id,
+            r.book_id,
+            r.normalized_word,
+            r.display_word,
+            r.match_mode,
+            r.color,
+            r.enabled as i64,
             r.created_at,
             r.updated_at,
             r.updated_by_device,
@@ -1159,6 +1359,64 @@ fn dump_state(conn: &Connection) -> AppResult<SnapshotState> {
     }
     drop(stmt);
 
+    // notes
+    let mut stmt = conn.prepare(
+        "SELECT id, book_id, anchor_kind, normalized_word, scope, location,
+                selected_text, content, content_format, created_at, updated_at,
+                updated_by_device FROM notes",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            NoteRow {
+                book_id: r.get(1)?,
+                anchor_kind: r.get(2)?,
+                normalized_word: r.get(3)?,
+                scope: r.get(4)?,
+                location: r.get(5)?,
+                selected_text: r.get(6)?,
+                content: r.get(7)?,
+                content_format: r.get(8)?,
+                created_at: r.get(9)?,
+                updated_at: r.get(10)?,
+                updated_by_device: r.get(11)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (id, note) = row?;
+        state.notes.insert(id, note);
+    }
+    drop(stmt);
+
+    // whole-book automatic word markers
+    let mut stmt = conn.prepare(
+        "SELECT id, book_id, normalized_word, display_word, match_mode, color,
+                enabled, created_at, updated_at, updated_by_device
+         FROM word_mark_rules",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            WordMarkRow {
+                book_id: r.get(1)?,
+                normalized_word: r.get(2)?,
+                display_word: r.get(3)?,
+                match_mode: r.get(4)?,
+                color: r.get(5)?,
+                enabled: r.get::<_, i64>(6)? != 0,
+                created_at: r.get(7)?,
+                updated_at: r.get(8)?,
+                updated_by_device: r.get(9)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (id, mark) = row?;
+        state.word_mark_rules.insert(id, mark);
+    }
+    drop(stmt);
+
     // collections
     let mut stmt = conn.prepare(
         "SELECT id, name, sort_order, created_at, updated_at, updated_by_device FROM collections",
@@ -1329,22 +1587,182 @@ mod tests {
         tx.commit().unwrap();
     }
 
+    fn text_book_row(updated_at: i64, source_sha256: &str) -> BookRow {
+        BookRow {
+            title: "Text book".into(),
+            author: "Author".into(),
+            description: None,
+            cover_path: None,
+            file_path: "sources/text-book.txt".into(),
+            genre: None,
+            pages: Some(1),
+            format: "txt".into(),
+            source_format: Some("txt".into()),
+            render_format: Some("text".into()),
+            source_file_path: Some("sources/text-book.txt".into()),
+            source_sha256: Some(source_sha256.into()),
+            conversion_version: 2,
+            status: "reading".into(),
+            progress: 0,
+            current_cfi: None,
+            created_at: 1,
+            updated_at,
+            updated_by_device: "dev-A".into(),
+            cover_data: None,
+        }
+    }
+
+    #[test]
+    fn text_book_snapshot_upsert_preserves_active_preparation_for_same_source() {
+        let mut conn = open_db();
+        {
+            let tx = conn.transaction().unwrap();
+            upsert_book(&tx, "text-book", &text_book_row(10, "same-hash")).unwrap();
+            tx.commit().unwrap();
+        }
+        conn.execute(
+            "UPDATE books
+             SET preparation_state = 'preparing', preparation_error = 'in flight'
+             WHERE id = 'text-book'",
+            [],
+        )
+        .unwrap();
+
+        let mut same_source = text_book_row(20, "same-hash");
+        same_source.progress = 40;
+        {
+            let tx = conn.transaction().unwrap();
+            upsert_book(&tx, "text-book", &same_source).unwrap();
+            tx.commit().unwrap();
+        }
+        let same_state: (String, Option<String>, i32) = conn
+            .query_row(
+                "SELECT preparation_state, preparation_error, progress
+                 FROM books WHERE id = 'text-book'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            same_state,
+            ("preparing".to_string(), Some("in flight".to_string()), 40)
+        );
+
+        {
+            let tx = conn.transaction().unwrap();
+            upsert_book(&tx, "text-book", &text_book_row(30, "new-hash")).unwrap();
+            tx.commit().unwrap();
+        }
+        let changed_state: (String, Option<String>) = conn
+            .query_row(
+                "SELECT preparation_state, preparation_error
+                 FROM books WHERE id = 'text-book'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(changed_state, ("pending".to_string(), None));
+    }
+
     #[test]
     fn write_then_read_roundtrip() {
         let tmp = TempDir::new().unwrap();
+        let mut state = SnapshotState::default();
+        state.notes.insert(
+            "note-1".into(),
+            NoteRow {
+                book_id: Some("b1".into()),
+                anchor_kind: "word".into(),
+                normalized_word: Some("term".into()),
+                scope: "global".into(),
+                location: Some("epubcfi(/6/4!)".into()),
+                selected_text: Some("term".into()),
+                content: "remember this".into(),
+                content_format: "plain_text".into(),
+                created_at: 1_714_770_000_000,
+                updated_at: 1_714_770_000_000,
+                updated_by_device: "dev-A".into(),
+            },
+        );
+        let marker_id = word_mark_rule_id("b1", "term", "exact");
+        state.word_mark_rules.insert(
+            marker_id,
+            WordMarkRow {
+                book_id: "b1".into(),
+                normalized_word: "term".into(),
+                display_word: "Term".into(),
+                match_mode: "exact".into(),
+                color: "lookup".into(),
+                enabled: false,
+                created_at: 1_714_770_000_000,
+                updated_at: 1_714_770_000_100,
+                updated_by_device: "dev-A".into(),
+            },
+        );
         let snap = Snapshot {
             v: SNAPSHOT_SCHEMA_VERSION,
             device: "dev-A".into(),
             id: "01HYZX0000000000000000FFFF".into(),
             generated_at: 1_714_770_000_000,
             truncated_before: Some("01HYZX0000000000000000FFFF".into()),
-            state: SnapshotState::default(),
+            state,
         };
         let path = tmp.path().join("logs/dev-A.snapshot.json");
         snap.write_atomic(&path).unwrap();
 
         let read = Snapshot::read_from(&path).unwrap();
         assert_eq!(read, snap);
+    }
+
+    #[test]
+    fn v1_snapshot_without_learning_fields_remains_readable_and_applicable() {
+        let raw = serde_json::json!({
+            "v": 1,
+            "device": "dev-A",
+            "id": "01HYZX0000000000000000FFFF",
+            "generated_at": 1_714_770_000_000_i64,
+            "truncated_before": null,
+            "state": {}
+        });
+        let snapshot: Snapshot = serde_json::from_value(raw).unwrap();
+        assert!(snapshot.state.notes.is_empty());
+        assert!(snapshot.state.word_mark_rules.is_empty());
+
+        let mut db = open_db();
+        let tx = db.transaction().unwrap();
+        let outcome = snapshot.apply_peer(&tx, "dev-A").unwrap();
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn snapshot_rejects_word_mark_with_noncanonical_id() {
+        let mut state = SnapshotState::default();
+        state.word_mark_rules.insert(
+            "random-id".into(),
+            WordMarkRow {
+                book_id: "b1".into(),
+                normalized_word: "term".into(),
+                display_word: "Term".into(),
+                match_mode: "exact".into(),
+                color: "lookup".into(),
+                enabled: true,
+                created_at: 1_714_770_000_000,
+                updated_at: 1_714_770_000_000,
+                updated_by_device: "dev-A".into(),
+            },
+        );
+        let snapshot = Snapshot {
+            v: SNAPSHOT_SCHEMA_VERSION,
+            device: "dev-A".into(),
+            id: "01HYZX0000000000000000FFFF".into(),
+            generated_at: 1_714_770_000_000,
+            truncated_before: None,
+            state,
+        };
+        let mut db = open_db();
+        let tx = db.transaction().unwrap();
+        assert!(snapshot.apply_peer(&tx, "dev-A").is_err());
     }
 
     /// `from_legacy_db` reads a fully-migrated quill.db (v11 schema) and

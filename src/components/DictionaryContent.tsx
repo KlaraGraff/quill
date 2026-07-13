@@ -31,6 +31,11 @@ import { useAllDictionary, useAllLookupHistory, type DictionaryWord, type Lookup
 import { timeAgo } from "../utils/timeAgo";
 import VocabDetailModal from "./VocabDetailModal";
 import { openReaderWindow } from "../utils/openReaderWindow";
+import {
+  LearningCardModules,
+  parseCardDesignConfig,
+  type LearningCardResult,
+} from "./learning-card";
 
 type SortMode = "newest" | "oldest" | "az";
 type ViewMode = "list" | "card";
@@ -132,7 +137,14 @@ export default function DictionaryContent() {
   const [bulkMastery, setBulkMastery] = useState<"new" | "learning" | "mastered">("learning");
   const [bulkBusy, setBulkBusy] = useState(false);
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
+  const [learningCardConfig, setLearningCardConfig] = useState(() => parseCardDesignConfig(undefined));
   const clearConfirmationTimer = useRef<number | null>(null);
+
+  useEffect(() => {
+    invoke<Record<string, string>>("get_all_settings")
+      .then((settings) => setLearningCardConfig(parseCardDesignConfig(settings.learning_card_config)))
+      .catch(() => {});
+  }, []);
 
   const historySearch = contentTab === "history" ? search.trim() : "";
   const historyBookFilter = contentTab === "history" ? bookFilter ?? undefined : undefined;
@@ -655,11 +667,44 @@ export default function DictionaryContent() {
                   <div className="flex items-start justify-between gap-4">
                     <div className="min-w-0">
                       <p className="text-[15px] font-semibold text-text-primary">{record.lookup_text}</p>
-                      <p className="mt-1 text-[13px] text-text-secondary line-clamp-2 whitespace-pre-line">{record.definition}</p>
+                      {!record.result_json && <p className="mt-1 text-[13px] text-text-secondary line-clamp-2 whitespace-pre-line">{record.definition}</p>}
                     </div>
                     <span className="shrink-0 text-[11px] text-text-muted">{timeAgo(record.last_looked_up_at)}</span>
                   </div>
                   {record.context_sentence && <p className="mt-2 text-[12px] italic text-text-muted line-clamp-2">"{record.context_sentence}"</p>}
+                  {record.result_json && (() => {
+                    try {
+                      const result = JSON.parse(record.result_json) as LearningCardResult;
+                      if (
+                        result.version !== 1
+                        || !["word", "phrase", "passage"].includes(result.kind)
+                        || !result.modules
+                      ) return null;
+                      return (
+                        <div className="mt-2 border-t border-border-light pt-2">
+                          {result.modules.context_meaning?.summary && (
+                            <p className="text-[13px] leading-[1.6] text-text-secondary">
+                              {result.modules.context_meaning.summary}
+                            </p>
+                          )}
+                          <details className="mt-2">
+                            <summary className="cursor-pointer text-[11px] font-medium text-accent-text">
+                              {t("vocab.showStructuredResult", { defaultValue: "查看完整学习卡片" })}
+                            </summary>
+                            <div className="mt-2 divide-y divide-border-light border-y border-border-light">
+                              <LearningCardModules
+                                card={learningCardConfig.cards[result.kind]}
+                                kind={result.kind}
+                                content={result.modules}
+                              />
+                            </div>
+                          </details>
+                        </div>
+                      );
+                    } catch {
+                      return <p className="mt-1 text-[13px] text-text-secondary whitespace-pre-line">{record.definition}</p>;
+                    }
+                  })()}
                   <div className="mt-2 flex items-center gap-3 text-[11px] text-text-muted">
                     <span className="flex items-center gap-1 min-w-0"><BookOpen size={12} /><span className="truncate">{record.book_title || t("common.unknownBook")}</span></span>
                     {record.chapter && <span className="truncate">{record.chapter}</span>}

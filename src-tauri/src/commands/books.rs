@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::Cursor;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
@@ -21,7 +21,7 @@ use crate::epub;
 use crate::error::{AppError, AppResult};
 use crate::icloud;
 use crate::pdfium;
-use crate::sync::events::{BookImportPayload, EventBody};
+use crate::sync::events::{BookImportPayload, EventBody, NotePayload};
 use crate::sync::writer::SyncWriter;
 use crate::LocalDir;
 
@@ -49,21 +49,58 @@ struct PdfExtracted {
     cover: Option<Vec<u8>>,
 }
 
-const TEXT_DOCUMENT_VERSION: i32 = 1;
+const TEXT_DOCUMENT_VERSION: i32 = 2;
 const MAX_TEXT_IMPORT_BYTES: u64 = 25 * 1024 * 1024;
 const TXT_CHAPTER_TARGET_CHARS: usize = 24_000;
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TextBookBlockKind {
+    Heading,
+    Paragraph,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct TextBookChapter {
+pub struct TextBookSourceSpan {
+    pub rendered_start: u64,
+    pub source_start: u64,
+    pub length: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TextBookBlock {
+    pub kind: TextBookBlockKind,
+    pub text: String,
+    pub source_start: u64,
+    pub source_end: u64,
+    pub source_spans: Vec<TextBookSourceSpan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TextBookChunk {
+    pub blocks: Vec<TextBookBlock>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TextBookTocEntry {
     pub title: String,
-    pub paragraphs: Vec<String>,
+    pub depth: u8,
+    pub source_offset: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TextBookDocument {
     pub version: i32,
     pub source_sha256: Option<String>,
-    pub chapters: Vec<TextBookChapter>,
+    pub coordinate_space: String,
+    pub chunks: Vec<TextBookChunk>,
+    pub toc: Vec<TextBookTocEntry>,
+    // V1 locations used generated chunk and paragraph indexes. Keeping this
+    // compact offset table lets existing progress, bookmarks, and highlights
+    // survive a V2 re-parse without retaining the old rendered document.
+    pub legacy_locations: Vec<Vec<u64>>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -288,53 +325,946 @@ fn html_to_text(html: &str) -> String {
         .join("\n")
 }
 
-fn text_chapters(text: &str) -> Vec<TextBookChapter> {
+#[derive(Debug, Clone)]
+struct TextLine {
+    text: String,
+    source_start: u64,
+    source_end: u64,
+    separator_before: Option<u64>,
+    paragraph_break_before: bool,
+    leading_whitespace: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum HeadingRank {
+    Volume,
+    Book,
+    Division,
+    Chapter,
+    Section,
+}
+
+#[derive(Clone)]
+enum ParsedHeading {
+    Parent {
+        title: String,
+        rank: HeadingRank,
+        child: Option<(String, HeadingRank)>,
+    },
+    Child {
+        title: String,
+        rank: HeadingRank,
+    },
+    TopLevel(String),
+}
+
+#[derive(Clone)]
+struct HeadingContext {
+    rank: HeadingRank,
+    identity: String,
+}
+
+fn utf16_len(value: &str) -> u64 {
+    value.encode_utf16().count() as u64
+}
+
+fn normalized_text_lines(text: &str) -> Vec<TextLine> {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    let mut chapters = Vec::<TextBookChapter>::new();
-    let mut current_title = "Reading".to_string();
-    let mut current = Vec::<String>::new();
-    let flush =
-        |chapters: &mut Vec<TextBookChapter>, title: &mut String, current: &mut Vec<String>| {
-            if !current.is_empty() {
-                chapters.push(TextBookChapter {
-                    title: std::mem::take(title),
-                    paragraphs: std::mem::take(current),
-                });
-            }
-        };
-    for line in normalized.lines() {
-        let line = line.trim();
-        let chapter_title = line.len() < 100
-            && (line.to_ascii_lowercase().starts_with("chapter ")
-                || line.to_ascii_lowercase().starts_with("chapter\t")
-                || (line.starts_with('第') && (line.contains('章') || line.contains('节'))));
-        if chapter_title {
-            flush(&mut chapters, &mut current_title, &mut current);
-            current_title = line.to_string();
-        } else if !line.is_empty() {
-            current.push(line.to_string());
-            if current.iter().map(String::len).sum::<usize>() >= TXT_CHAPTER_TARGET_CHARS {
-                flush(&mut chapters, &mut current_title, &mut current);
-                current_title = format!("Part {}", chapters.len() + 1);
-            }
+    let mut result = Vec::new();
+    let mut source_offset = 0_u64;
+    let mut separator_before = None;
+    let mut paragraph_break_before = true;
+    for segment in normalized.split_inclusive('\n') {
+        let raw = segment.strip_suffix('\n').unwrap_or(segment);
+        let trimmed_start = raw.trim_start();
+        let trimmed = trimmed_start.trim_end();
+        if !trimmed.is_empty() {
+            let leading_bytes = raw.len() - trimmed_start.len();
+            let start = source_offset + utf16_len(&raw[..leading_bytes]);
+            result.push(TextLine {
+                text: trimmed.to_string(),
+                source_start: start,
+                source_end: start + utf16_len(trimmed),
+                separator_before,
+                paragraph_break_before,
+                leading_whitespace: raw[..leading_bytes].chars().count(),
+            });
+            paragraph_break_before = false;
+        } else if !result.is_empty() {
+            paragraph_break_before = true;
+        }
+        separator_before = segment
+            .ends_with('\n')
+            .then(|| source_offset + utf16_len(raw));
+        source_offset += utf16_len(segment);
+    }
+    result
+}
+
+fn legacy_chapter_title(line: &str) -> bool {
+    line.len() < 100
+        && (line.to_ascii_lowercase().starts_with("chapter ")
+            || line.to_ascii_lowercase().starts_with("chapter\t")
+            || (line.starts_with('第') && (line.contains('章') || line.contains('节'))))
+}
+
+fn legacy_text_locations(lines: &[TextLine]) -> Vec<Vec<u64>> {
+    let mut chapters = Vec::new();
+    let mut current = Vec::new();
+    let mut current_chars = 0_usize;
+    let flush = |chapters: &mut Vec<Vec<u64>>, current: &mut Vec<u64>| {
+        if !current.is_empty() {
+            chapters.push(std::mem::take(current));
+        }
+    };
+
+    for line in lines {
+        if legacy_chapter_title(&line.text) {
+            flush(&mut chapters, &mut current);
+            current_chars = 0;
+            continue;
+        }
+        current.push(line.source_start);
+        current_chars += line.text.len();
+        if current_chars >= TXT_CHAPTER_TARGET_CHARS {
+            flush(&mut chapters, &mut current);
+            current_chars = 0;
         }
     }
-    flush(&mut chapters, &mut current_title, &mut current);
+    flush(&mut chapters, &mut current);
     if chapters.is_empty() {
-        chapters.push(TextBookChapter {
-            title: "Reading".to_string(),
-            paragraphs: vec!["".to_string()],
-        });
+        chapters.push(vec![0]);
     }
     chapters
+}
+
+fn trim_heading_separator(value: &str) -> &str {
+    value.trim_matches(|character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                ':' | '.' | '-' | '\u{2013}' | '\u{2014}' | '\u{00b7}'
+            )
+    })
+}
+
+fn canonical_roman_number(value: &str) -> bool {
+    let upper = value.to_ascii_uppercase();
+    if upper.is_empty() || upper.len() > 15 {
+        return false;
+    }
+    let mut total = 0_u32;
+    let mut previous = 0_u32;
+    for character in upper.chars().rev() {
+        let current = match character {
+            'I' => 1,
+            'V' => 5,
+            'X' => 10,
+            'L' => 50,
+            'C' => 100,
+            'D' => 500,
+            'M' => 1_000,
+            _ => return false,
+        };
+        if current < previous {
+            total = total.saturating_sub(current);
+        } else {
+            total += current;
+            previous = current;
+        }
+    }
+    if !(1..=3_999).contains(&total) {
+        return false;
+    }
+    let mut remaining = total;
+    let mut canonical = String::new();
+    for (number, numeral) in [
+        (1_000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ] {
+        while remaining >= number {
+            canonical.push_str(numeral);
+            remaining -= number;
+        }
+    }
+    canonical == upper
+}
+
+fn number_word_kind(value: &str) -> Option<u8> {
+    match trim_heading_separator(value).to_ascii_uppercase().as_str() {
+        "ZERO" | "TEN" | "ELEVEN" | "TWELVE" | "THIRTEEN" | "FOURTEEN" | "FIFTEEN" | "SIXTEEN"
+        | "SEVENTEEN" | "EIGHTEEN" | "NINETEEN" => Some(1),
+        "ONE" | "TWO" | "THREE" | "FOUR" | "FIVE" | "SIX" | "SEVEN" | "EIGHT" | "NINE" => Some(2),
+        "TWENTY" | "THIRTY" | "FORTY" | "FIFTY" | "SIXTY" | "SEVENTY" | "EIGHTY" | "NINETY" => {
+            Some(3)
+        }
+        "HUNDRED" => Some(4),
+        _ => None,
+    }
+}
+
+fn english_number_phrase_len(words: &[&str]) -> usize {
+    let Some(first) = words.first() else {
+        return 0;
+    };
+    let cleaned = trim_heading_separator(first);
+    if cleaned.chars().all(|character| character.is_ascii_digit())
+        || canonical_roman_number(cleaned)
+    {
+        return 1;
+    }
+    match number_word_kind(cleaned) {
+        Some(2)
+            if words
+                .get(1)
+                .is_some_and(|word| number_word_kind(word) == Some(4)) =>
+        {
+            let mut length = 2;
+            if words
+                .get(length)
+                .is_some_and(|word| word.eq_ignore_ascii_case("and"))
+            {
+                length += 1;
+            }
+            match words.get(length).and_then(|word| number_word_kind(word)) {
+                Some(3) => {
+                    length += 1;
+                    if words.get(length).and_then(|word| number_word_kind(word)) == Some(2) {
+                        length += 1;
+                    }
+                }
+                Some(1 | 2) => length += 1,
+                _ => {}
+            }
+            length
+        }
+        Some(3) => 1 + usize::from(words.get(1).and_then(|word| number_word_kind(word)) == Some(2)),
+        Some(1 | 2 | 4) => 1,
+        _ => 0,
+    }
+}
+
+fn is_heading_number(value: &str) -> bool {
+    let value = trim_heading_separator(value);
+    if value.is_empty() {
+        return false;
+    }
+    if value.chars().all(|character| character.is_ascii_digit()) {
+        return true;
+    }
+    if canonical_roman_number(value) {
+        return true;
+    }
+    number_word_kind(value).is_some()
+}
+
+fn english_heading_rank(keyword: &str) -> Option<HeadingRank> {
+    match trim_heading_separator(keyword)
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "VOLUME" => Some(HeadingRank::Volume),
+        "BOOK" => Some(HeadingRank::Book),
+        "PART" | "ACT" => Some(HeadingRank::Division),
+        "CHAPTER" | "SCENE" => Some(HeadingRank::Chapter),
+        "SECTION" => Some(HeadingRank::Section),
+        _ => None,
+    }
+}
+
+fn english_parent_heading(line: &str) -> Option<ParsedHeading> {
+    let words = line.split_whitespace().collect::<Vec<_>>();
+    if words.len() < 2 {
+        return None;
+    }
+    let keyword = trim_heading_separator(words[0]).to_ascii_uppercase();
+    let rank = english_heading_rank(&keyword)?;
+    if rank > HeadingRank::Division {
+        return None;
+    }
+
+    let number_length = english_number_phrase_len(&words[1..]);
+    if number_length == 0 {
+        return None;
+    }
+    let parent_end = 1 + number_length;
+
+    let parent_title = words[..parent_end]
+        .iter()
+        .map(|word| trim_heading_separator(word))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut child_index = parent_end;
+    while child_index < words.len() && trim_heading_separator(words[child_index]).is_empty() {
+        child_index += 1;
+    }
+    let child = words.get(child_index).and_then(|first| {
+        let first = trim_heading_separator(first);
+        let child_rank = if is_heading_number(first) {
+            Some(HeadingRank::Chapter)
+        } else {
+            english_heading_rank(first)
+        }?;
+        Some((
+            trim_heading_separator(&words[child_index..].join(" ")).to_string(),
+            child_rank,
+        ))
+    });
+
+    Some(ParsedHeading::Parent {
+        title: if child.is_some() {
+            parent_title
+        } else {
+            line.to_string()
+        },
+        rank,
+        child,
+    })
+}
+
+fn english_child_heading(line: &str) -> Option<HeadingRank> {
+    let words = line.split_whitespace().collect::<Vec<_>>();
+    let rank = english_heading_rank(words.first()?)?;
+    (english_number_phrase_len(&words[1..]) > 0).then_some(rank)
+}
+
+fn prefixed_chinese_heading_unit(line: &str) -> Option<char> {
+    let rest = line.strip_prefix('第')?;
+    let mut numeral_end = 0_usize;
+    for (index, character) in rest.char_indices() {
+        if character.is_ascii_digit()
+            || "零〇一二三四五六七八九十百千万两壹贰叁肆伍陆柒捌玖拾佰仟".contains(character)
+        {
+            numeral_end = index + character.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if numeral_end == 0 {
+        return None;
+    }
+
+    let mut suffix = rest[numeral_end..].chars();
+    let unit = suffix.next()?;
+    if !"章节回卷部篇集".contains(unit) {
+        return None;
+    }
+    Some(unit)
+}
+
+fn chinese_heading(line: &str) -> Option<ParsedHeading> {
+    if let Some(unit) = prefixed_chinese_heading_unit(line) {
+        if matches!(unit, '章' | '节' | '回') {
+            return Some(ParsedHeading::Child {
+                title: line.to_string(),
+                rank: if unit == '节' {
+                    HeadingRank::Section
+                } else {
+                    HeadingRank::Chapter
+                },
+            });
+        }
+        if matches!(unit, '卷' | '部' | '篇' | '集') {
+            return Some(ParsedHeading::Parent {
+                title: line.to_string(),
+                rank: if unit == '卷' {
+                    HeadingRank::Volume
+                } else {
+                    HeadingRank::Division
+                },
+                child: None,
+            });
+        }
+    }
+    let compact = line.split_whitespace().next().unwrap_or(line);
+    let mut characters = compact.chars();
+    let first = characters.next();
+    let second = characters.next();
+    if matches!(first, Some('上' | '中' | '下')) && matches!(second, Some('卷' | '部' | '篇'))
+        || matches!(first, Some('卷' | '部' | '篇'))
+            && second.is_some_and(|character| {
+                character.is_ascii_digit() || "零〇一二三四五六七八九十百千两".contains(character)
+            })
+    {
+        return Some(ParsedHeading::Parent {
+            title: line.to_string(),
+            rank: if matches!(second, Some('卷')) || matches!(first, Some('卷')) {
+                HeadingRank::Volume
+            } else {
+                HeadingRank::Division
+            },
+            child: None,
+        });
+    }
+    None
+}
+
+fn title_case_heading_word(value: &str) -> bool {
+    let value = trim_heading_separator(value);
+    if value.is_empty()
+        || value.chars().all(|character| character.is_ascii_digit())
+        || canonical_roman_number(value) && value == value.to_ascii_uppercase()
+    {
+        return true;
+    }
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "a" | "an"
+            | "and"
+            | "as"
+            | "at"
+            | "by"
+            | "for"
+            | "from"
+            | "in"
+            | "of"
+            | "on"
+            | "or"
+            | "the"
+            | "to"
+            | "with"
+    ) {
+        return true;
+    }
+    value.chars().next().is_some_and(char::is_uppercase)
+}
+
+fn english_heading_shape(line: &str) -> bool {
+    let words = line.split_whitespace().collect::<Vec<_>>();
+    let Some(keyword) = words.first() else {
+        return false;
+    };
+    let keyword = trim_heading_separator(keyword).to_ascii_uppercase();
+    let number_length = if matches!(keyword.as_str(), "PART" | "BOOK" | "VOLUME")
+        || matches!(keyword.as_str(), "CHAPTER" | "SECTION" | "SCENE" | "ACT")
+    {
+        english_number_phrase_len(&words[1..])
+    } else {
+        0
+    };
+    if number_length == 0 {
+        return false;
+    }
+    let suffix_start = 1 + number_length;
+    if suffix_start == words.len()
+        || line == line.to_ascii_uppercase()
+        || line.contains(':')
+        || line.contains(" - ")
+        || line.contains(" \u{2013} ")
+        || line.contains(" \u{2014} ")
+    {
+        return true;
+    }
+    let numbered_words_are_title_case = words[1..suffix_start].iter().all(|word| {
+        let word = trim_heading_separator(word);
+        word.chars().all(|character| character.is_ascii_digit())
+            || canonical_roman_number(word) && word == word.to_ascii_uppercase()
+            || word.chars().next().is_some_and(char::is_uppercase)
+    });
+    numbered_words_are_title_case
+        && words[suffix_start..]
+            .iter()
+            .all(|word| title_case_heading_word(word))
+}
+
+fn parse_heading(
+    line: &str,
+    has_parent: bool,
+    paragraph_break_before: bool,
+) -> Option<ParsedHeading> {
+    if line.chars().count() > 120 {
+        return None;
+    }
+    if english_heading_shape(line) {
+        if let Some(heading) = english_parent_heading(line) {
+            return Some(heading);
+        }
+        if let Some(rank) = english_child_heading(line) {
+            return Some(ParsedHeading::Child {
+                title: line.to_string(),
+                rank,
+            });
+        }
+    }
+    if let Some(heading) = chinese_heading(line) {
+        return Some(heading);
+    }
+
+    let upper = line.to_ascii_uppercase();
+    const TOP_LEVEL_HEADINGS: [&str; 10] = [
+        "PROLOGUE",
+        "EPILOGUE",
+        "INTRODUCTION",
+        "PREFACE",
+        "FOREWORD",
+        "AFTERWORD",
+        "ACKNOWLEDGMENTS",
+        "ACKNOWLEDGEMENTS",
+        "CONCLUSION",
+        "POSTSCRIPT",
+    ];
+    if TOP_LEVEL_HEADINGS.iter().any(|heading| {
+        if upper == *heading {
+            return true;
+        }
+        let Some(rest) = upper.strip_prefix(heading) else {
+            return false;
+        };
+        rest.starts_with([':', '-', '\u{2013}', '\u{2014}'])
+            || rest.starts_with(' ')
+                && (line == upper
+                    || line.contains(':')
+                    || line.split_whitespace().skip(1).all(title_case_heading_word))
+    }) {
+        return Some(ParsedHeading::TopLevel(line.to_string()));
+    }
+    let bare_number = line.split_whitespace().count() == 1 && is_heading_number(line);
+    let bare_number_shape = line.chars().all(|character| character.is_ascii_digit())
+        || line == line.to_ascii_uppercase()
+        || paragraph_break_before && number_word_kind(line).is_some();
+    if bare_number && bare_number_shape && (has_parent || paragraph_break_before) {
+        return Some(ParsedHeading::Child {
+            title: line.to_string(),
+            rank: HeadingRank::Chapter,
+        });
+    }
+    None
+}
+
+fn has_sentence_ending(value: &str) -> bool {
+    value
+        .trim_end_matches(|character: char| {
+            matches!(
+                character,
+                '"' | '\'' | ')' | ']' | '}' | '\u{2019}' | '\u{201d}'
+            )
+        })
+        .ends_with([
+            '.', '?', '!', '\u{2026}', '\u{3002}', '\u{ff1f}', '\u{ff01}',
+        ])
+}
+
+fn is_list_item_line(value: &str) -> bool {
+    let value = value.trim_start();
+    if [
+        "- ",
+        "* ",
+        "+ ",
+        "\u{2022} ",
+        "\u{2023} ",
+        "\u{25e6} ",
+        "[ ] ",
+        "[x] ",
+        "[X] ",
+    ]
+    .iter()
+    .any(|prefix| value.starts_with(prefix))
+    {
+        return true;
+    }
+
+    let Some(marker_end) = value.find(char::is_whitespace) else {
+        return false;
+    };
+    let marker = &value[..marker_end];
+    let marker = marker
+        .strip_suffix('.')
+        .or_else(|| marker.strip_suffix(')'));
+    let Some(marker) = marker else {
+        return false;
+    };
+    let marker = marker.strip_prefix('(').unwrap_or(marker);
+    if marker.is_empty() || marker.len() > 15 {
+        return false;
+    }
+    marker.chars().all(|character| character.is_ascii_digit())
+        || marker.len() == 1
+            && marker
+                .chars()
+                .all(|character| character.is_ascii_alphabetic())
+        || canonical_roman_number(marker)
+}
+
+fn starts_with_uppercase_letter(value: &str) -> bool {
+    value
+        .chars()
+        .find(|character| character.is_alphabetic())
+        .is_some_and(char::is_uppercase)
+}
+
+fn starts_with_lowercase_letter(value: &str) -> bool {
+    value
+        .chars()
+        .find(|character| character.is_alphabetic())
+        .is_some_and(char::is_lowercase)
+}
+
+fn hard_wrap_width(lines: &[TextLine], depths: &[Option<u8>]) -> Option<usize> {
+    let content_lines = lines
+        .iter()
+        .zip(depths)
+        .filter(|(_, depth)| depth.is_none())
+        .map(|(line, _)| line)
+        .collect::<Vec<_>>();
+    let content = content_lines
+        .iter()
+        .map(|line| line.text.chars().count())
+        .filter(|length| *length >= 8)
+        .collect::<Vec<_>>();
+    if content.len() < 12 {
+        return None;
+    }
+
+    let list_items = content_lines
+        .iter()
+        .filter(|line| is_list_item_line(&line.text))
+        .count();
+    if list_items >= 3 && list_items * 100 >= content_lines.len() * 20 {
+        return None;
+    }
+    let uppercase_starts = content_lines
+        .iter()
+        .filter(|line| starts_with_uppercase_letter(&line.text))
+        .count();
+    let soft_lines = content_lines
+        .iter()
+        .filter(|line| !has_sentence_ending(&line.text))
+        .count();
+    if content_lines.len() >= 8
+        && uppercase_starts * 100 >= content_lines.len() * 75
+        && soft_lines * 100 >= content_lines.len() * 35
+    {
+        return None;
+    }
+
+    let mut sorted = content.clone();
+    sorted.sort_unstable();
+    let median = sorted[sorted.len() / 2];
+    if !(24..=120).contains(&median) {
+        return None;
+    }
+    let regular = content
+        .iter()
+        .filter(|length| **length * 100 >= median * 65 && **length * 100 <= median * 140)
+        .count();
+    if regular * 100 < content.len() * 65 {
+        return None;
+    }
+
+    let mut adjacent = 0_usize;
+    let mut soft_endings = 0_usize;
+    for (index, line) in lines.iter().enumerate().take(lines.len().saturating_sub(1)) {
+        if depths[index].is_some()
+            || depths[index + 1].is_some()
+            || lines[index + 1].paragraph_break_before
+        {
+            continue;
+        }
+        adjacent += 1;
+        if !has_sentence_ending(&line.text) {
+            soft_endings += 1;
+        }
+    }
+    (adjacent >= 8 && soft_endings * 100 >= adjacent * 35).then_some(median)
+}
+
+fn intentional_line_breaks(
+    lines: &[TextLine],
+    depths: &[Option<u8>],
+    wrap_width: usize,
+) -> Vec<bool> {
+    let mut protected = vec![false; lines.len()];
+    let mut start = 0_usize;
+    while start < lines.len() {
+        if depths[start].is_some() {
+            start += 1;
+            continue;
+        }
+
+        let mut end = start + 1;
+        while end < lines.len() && depths[end].is_none() && !lines[end].paragraph_break_before {
+            end += 1;
+        }
+        let run = &lines[start..end];
+        if run.len() >= 3 {
+            let soft_lines = run
+                .iter()
+                .filter(|line| !has_sentence_ending(&line.text))
+                .count();
+            let uppercase_starts = run
+                .iter()
+                .filter(|line| starts_with_uppercase_letter(&line.text))
+                .count();
+            let lowercase_starts = run
+                .iter()
+                .filter(|line| starts_with_lowercase_letter(&line.text))
+                .count();
+            let shorter_lines = run
+                .iter()
+                .filter(|line| line.text.chars().count() * 100 <= wrap_width * 85)
+                .count();
+            let verse_like = soft_lines * 100 >= run.len() * 75
+                && (uppercase_starts * 100 >= run.len() * 75
+                    || lowercase_starts == run.len()
+                    || shorter_lines * 100 >= run.len() * 75);
+            if verse_like {
+                protected[start..end].fill(true);
+            }
+        }
+        start = end;
+    }
+    protected
+}
+
+fn block_from_line(line: &TextLine, kind: TextBookBlockKind, depth: Option<u8>) -> TextBookBlock {
+    TextBookBlock {
+        kind,
+        text: line.text.clone(),
+        source_start: line.source_start,
+        source_end: line.source_end,
+        source_spans: vec![TextBookSourceSpan {
+            rendered_start: 0,
+            source_start: line.source_start,
+            length: utf16_len(&line.text),
+        }],
+        depth,
+    }
+}
+
+fn append_reflowed_line(block: &mut TextBookBlock, line: &TextLine) {
+    let separator_rendered_start = utf16_len(&block.text);
+    let previous = block.text.chars().next_back();
+    let next = line.text.chars().next();
+    let cjk = |character: char| {
+        matches!(
+            character as u32,
+            0x3040..=0x30ff | 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xac00..=0xd7af
+        )
+    };
+    let cjk_punctuation = |character: char| "，。！？；：、）》」』】…".contains(character);
+    let insert_space = !matches!(previous, Some('-' | '\u{2010}' | '\u{2011}'))
+        && !matches!((previous, next), (Some(left), Some(right)) if cjk(right) && (cjk(left) || cjk_punctuation(left)));
+    if insert_space {
+        block.text.push(' ');
+        block.source_spans.push(TextBookSourceSpan {
+            rendered_start: separator_rendered_start,
+            source_start: line.separator_before.unwrap_or(block.source_end),
+            length: 1,
+        });
+    }
+    block.source_spans.push(TextBookSourceSpan {
+        rendered_start: separator_rendered_start + u64::from(insert_space),
+        source_start: line.source_start,
+        length: utf16_len(&line.text),
+    });
+    block.text.push_str(&line.text);
+    block.source_end = line.source_end;
+}
+
+fn chunk_text_blocks(blocks: Vec<TextBookBlock>) -> Vec<TextBookChunk> {
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut current_chars = 0_usize;
+    for block in blocks {
+        current_chars += block.text.len();
+        current.push(block);
+        if current_chars >= TXT_CHAPTER_TARGET_CHARS {
+            chunks.push(TextBookChunk {
+                blocks: std::mem::take(&mut current),
+            });
+            current_chars = 0;
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(TextBookChunk { blocks: current });
+    }
+    chunks
+}
+
+fn enter_heading_context(
+    stack: &mut Vec<HeadingContext>,
+    rank: HeadingRank,
+    title: &str,
+) -> (u8, bool) {
+    while stack.last().is_some_and(|context| context.rank > rank) {
+        stack.pop();
+    }
+
+    let identity = trim_heading_separator(title).to_ascii_uppercase();
+    if stack.last().is_some_and(|context| context.rank == rank) {
+        let same = stack
+            .last()
+            .is_some_and(|context| context.identity == identity);
+        if same {
+            return ((stack.len() - 1) as u8, true);
+        }
+        stack.pop();
+    }
+    stack.push(HeadingContext { rank, identity });
+    ((stack.len() - 1) as u8, false)
+}
+
+fn text_document_parts(
+    text: &str,
+    reflow_hard_wraps: bool,
+) -> (Vec<TextBookChunk>, Vec<TextBookTocEntry>, Vec<Vec<u64>>) {
+    let lines = normalized_text_lines(text);
+    let legacy_locations = legacy_text_locations(&lines);
+    let mut toc = Vec::new();
+    let mut heading_stack = Vec::<HeadingContext>::new();
+    let mut depths = Vec::with_capacity(lines.len());
+
+    for line in &lines {
+        let heading = parse_heading(
+            &line.text,
+            heading_stack
+                .iter()
+                .any(|context| context.rank < HeadingRank::Chapter),
+            line.paragraph_break_before,
+        );
+        let depth = match heading {
+            Some(ParsedHeading::Parent { title, rank, child }) => {
+                let (parent_depth, repeated_parent) =
+                    enter_heading_context(&mut heading_stack, rank, &title);
+                if child.is_none() || !repeated_parent {
+                    toc.push(TextBookTocEntry {
+                        title: title.clone(),
+                        depth: parent_depth,
+                        source_offset: line.source_start,
+                    });
+                }
+                if let Some((child, child_rank)) = child {
+                    let (child_depth, _) =
+                        enter_heading_context(&mut heading_stack, child_rank, &child);
+                    toc.push(TextBookTocEntry {
+                        title: child,
+                        depth: child_depth,
+                        source_offset: line.source_start,
+                    });
+                    Some(child_depth)
+                } else {
+                    Some(parent_depth)
+                }
+            }
+            Some(ParsedHeading::Child { title, rank }) => {
+                let (depth, _) = enter_heading_context(&mut heading_stack, rank, &title);
+                toc.push(TextBookTocEntry {
+                    title,
+                    depth,
+                    source_offset: line.source_start,
+                });
+                Some(depth)
+            }
+            Some(ParsedHeading::TopLevel(title)) => {
+                heading_stack.clear();
+                toc.push(TextBookTocEntry {
+                    title,
+                    depth: 0,
+                    source_offset: line.source_start,
+                });
+                Some(0)
+            }
+            None => None,
+        };
+        depths.push(depth);
+    }
+
+    let wrap_width = reflow_hard_wraps
+        .then(|| hard_wrap_width(&lines, &depths))
+        .flatten();
+    let mut blocks = Vec::new();
+    let mut paragraph: Option<TextBookBlock> = None;
+    let mut previous_line: Option<&TextLine> = None;
+    let protected_line_breaks = wrap_width
+        .map(|width| intentional_line_breaks(&lines, &depths, width))
+        .unwrap_or_else(|| vec![false; lines.len()]);
+    for (index, (line, depth)) in lines.iter().zip(depths).enumerate() {
+        if let Some(depth) = depth {
+            if let Some(paragraph) = paragraph.take() {
+                blocks.push(paragraph);
+            }
+            blocks.push(block_from_line(
+                line,
+                TextBookBlockKind::Heading,
+                Some(depth),
+            ));
+            previous_line = Some(line);
+            continue;
+        }
+
+        let starts_paragraph = paragraph.is_none()
+            || wrap_width.is_none()
+            || line.paragraph_break_before
+            || line.leading_whitespace > 0
+            || previous_line.is_some_and(|previous| previous.leading_whitespace > 0)
+            || is_list_item_line(&line.text)
+            || previous_line.is_some_and(|previous| is_list_item_line(&previous.text))
+            || protected_line_breaks[index]
+            || index
+                .checked_sub(1)
+                .is_some_and(|previous| protected_line_breaks[previous])
+            || previous_line.is_some_and(|previous| {
+                previous.text.chars().count() * 100 < wrap_width.unwrap_or_default() * 60
+            });
+        if starts_paragraph {
+            if let Some(paragraph) =
+                paragraph.replace(block_from_line(line, TextBookBlockKind::Paragraph, None))
+            {
+                blocks.push(paragraph);
+            }
+        } else if let Some(paragraph) = &mut paragraph {
+            append_reflowed_line(paragraph, line);
+        }
+        previous_line = Some(line);
+    }
+    if let Some(paragraph) = paragraph {
+        blocks.push(paragraph);
+    }
+    let chunks = chunk_text_blocks(blocks);
+
+    if let Some(first_block) = chunks.first().and_then(|chunk| chunk.blocks.first()) {
+        if toc
+            .first()
+            .is_none_or(|entry| entry.source_offset > first_block.source_start)
+        {
+            toc.insert(
+                0,
+                TextBookTocEntry {
+                    title: "Reading".to_string(),
+                    depth: 0,
+                    source_offset: first_block.source_start,
+                },
+            );
+        }
+    }
+    (chunks, toc, legacy_locations)
 }
 
 fn prepare_text_document(
     source_path: &Path,
     source_format: &str,
-    source_sha256: Option<String>,
+    expected_source_sha256: Option<String>,
 ) -> AppResult<TextBookDocument> {
-    let decoded = decode_txt(&fs::read(source_path)?)?;
+    let source_bytes = fs::read(source_path)?;
+    let actual_source_sha256 = format!("{:x}", Sha256::digest(&source_bytes));
+    if expected_source_sha256
+        .as_ref()
+        .is_some_and(|expected| expected != &actual_source_sha256)
+    {
+        return Err(AppError::Other("TEXT_SOURCE_HASH_MISMATCH".to_string()));
+    }
+    let decoded = decode_txt(&source_bytes)?;
     let text = match source_format {
         "markdown" => markdown_to_text(&decoded),
         "html" => html_to_text(&decoded),
@@ -343,15 +1273,99 @@ fn prepare_text_document(
     if text.trim().is_empty() {
         return Err(AppError::Other("EMPTY_BOOK".to_string()));
     }
+    let (chunks, toc, legacy_locations) = text_document_parts(&text, source_format == "txt");
     Ok(TextBookDocument {
         version: TEXT_DOCUMENT_VERSION,
-        source_sha256,
-        chapters: text_chapters(&text),
+        source_sha256: Some(actual_source_sha256),
+        coordinate_space: "normalized_utf16".to_string(),
+        chunks,
+        toc,
+        legacy_locations,
     })
 }
 
 fn prepared_document_path(local_dir: &Path, book_id: &str) -> PathBuf {
+    local_dir
+        .join("prepared")
+        .join(format!("{book_id}.v{TEXT_DOCUMENT_VERSION}.json"))
+}
+
+fn legacy_prepared_document_path(local_dir: &Path, book_id: &str) -> PathBuf {
     local_dir.join("prepared").join(format!("{book_id}.json"))
+}
+
+fn prepared_document_sidecar_path(path: &Path, suffix: &str) -> AppResult<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Other("PREPARATION_PATH_INVALID".to_string()))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| AppError::Other("PREPARATION_PATH_INVALID".to_string()))?
+        .to_string_lossy();
+    Ok(parent.join(format!(".{file_name}.{suffix}")))
+}
+
+fn prepared_document_backup_path(path: &Path) -> AppResult<PathBuf> {
+    prepared_document_sidecar_path(path, "backup")
+}
+
+fn prepared_document_temporary_path(path: &Path) -> AppResult<PathBuf> {
+    prepared_document_sidecar_path(path, "tmp")
+}
+
+fn read_prepared_document(
+    path: &Path,
+    expected_source_sha256: Option<&str>,
+) -> Option<TextBookDocument> {
+    let document = fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<TextBookDocument>(&bytes).ok())?;
+    (document.version == TEXT_DOCUMENT_VERSION
+        && expected_source_sha256
+            .is_none_or(|expected| document.source_sha256.as_deref() == Some(expected)))
+    .then_some(document)
+}
+
+fn load_prepared_document(
+    path: &Path,
+    expected_source_sha256: Option<&str>,
+) -> Option<TextBookDocument> {
+    let backup_path = prepared_document_backup_path(path).ok()?;
+    let temporary_path = prepared_document_temporary_path(path).ok()?;
+    if let Some(document) = read_prepared_document(path, expected_source_sha256) {
+        let _ = fs::remove_file(backup_path);
+        let _ = fs::remove_file(temporary_path);
+        return Some(document);
+    }
+
+    for recovery_path in [&temporary_path, &backup_path] {
+        let Some(document) = read_prepared_document(recovery_path, expected_source_sha256) else {
+            continue;
+        };
+        if path.exists() {
+            let _ = fs::remove_file(path);
+        }
+        if fs::rename(recovery_path, path).is_ok() {
+            let _ = fs::remove_file(&temporary_path);
+            let _ = fs::remove_file(&backup_path);
+            log::warn!(
+                "recovered interrupted text cache replacement at {}",
+                path.display()
+            );
+        }
+        return Some(document);
+    }
+    None
+}
+
+fn text_toc_leaf_count(toc: &[TextBookTocEntry]) -> usize {
+    toc.iter()
+        .enumerate()
+        .filter(|(index, entry)| {
+            toc.get(index + 1)
+                .is_none_or(|next| next.depth <= entry.depth)
+        })
+        .count()
 }
 
 fn write_prepared_document(path: &Path, document: &TextBookDocument) -> AppResult<()> {
@@ -359,18 +1373,38 @@ fn write_prepared_document(path: &Path, document: &TextBookDocument) -> AppResul
         .parent()
         .ok_or_else(|| AppError::Other("PREPARATION_PATH_INVALID".to_string()))?;
     fs::create_dir_all(parent)?;
-    let temporary_path = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("document"),
-        uuid::Uuid::new_v4()
-    ));
+    let temporary_path = prepared_document_temporary_path(path)?;
+    let backup_path = prepared_document_backup_path(path)?;
     let result = (|| -> AppResult<()> {
         let bytes = serde_json::to_vec(document)
             .map_err(|error| AppError::Other(format!("PREPARATION_SERIALIZE_FAILED: {error}")))?;
-        fs::write(&temporary_path, bytes)?;
-        fs::rename(&temporary_path, path)?;
+        match fs::remove_file(&temporary_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut temporary = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary_path)?;
+        temporary.write_all(&bytes)?;
+        temporary.sync_all()?;
+        drop(temporary);
+        if path.exists() {
+            match fs::remove_file(&backup_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            fs::rename(path, &backup_path)?;
+            if let Err(error) = fs::rename(&temporary_path, path) {
+                let _ = fs::rename(&backup_path, path);
+                return Err(error.into());
+            }
+        } else {
+            fs::rename(&temporary_path, path)?;
+        }
+        let _ = fs::remove_file(&backup_path);
         Ok(())
     })();
     if result.is_err() {
@@ -623,26 +1657,177 @@ fn resolve_book_paths(book: &mut Book, db: &Db) -> AppResult<()> {
     Ok(())
 }
 
-fn update_text_preparation_state(
+#[derive(Clone, Debug)]
+struct TextPreparationSource {
+    file_path: Option<String>,
+    format: Option<String>,
+    sha256: Option<String>,
+    conversion_version: i32,
+}
+
+fn transition_text_preparation_state(
     db: &Db,
     book_id: &str,
-    state: &str,
+    expected_state: &str,
+    next_state: &str,
     error: Option<&str>,
-    pages: Option<i32>,
-) -> AppResult<()> {
+) -> AppResult<bool> {
     let conn = db
         .conn
         .lock()
         .map_err(|error| AppError::Other(error.to_string()))?;
-    conn.execute(
+    let changed = conn.execute(
+        "UPDATE books
+         SET preparation_state = ?1,
+             preparation_error = ?2
+         WHERE id = ?3 AND render_format = 'text' AND preparation_state = ?4",
+        params![next_state, error, book_id, expected_state],
+    )?;
+    Ok(changed == 1)
+}
+
+fn text_preparation_job_is_current(
+    conn: &rusqlite::Connection,
+    book_id: &str,
+    source: &TextPreparationSource,
+) -> AppResult<bool> {
+    let current = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM books
+             WHERE id = ?1
+               AND render_format = 'text'
+               AND preparation_state = 'preparing'
+               AND source_file_path IS ?2
+               AND source_format IS ?3
+               AND source_sha256 IS ?4
+               AND COALESCE(conversion_version, 0) = ?5
+         )",
+        params![
+            book_id,
+            source.file_path.as_deref(),
+            source.format.as_deref(),
+            source.sha256.as_deref(),
+            source.conversion_version,
+        ],
+        |row| row.get::<_, bool>(0),
+    )?;
+    Ok(current)
+}
+
+fn update_current_text_preparation_job(
+    db: &Db,
+    book_id: &str,
+    source: &TextPreparationSource,
+    next_state: &str,
+    error: Option<&str>,
+    pages: Option<i32>,
+) -> AppResult<bool> {
+    let conn = db
+        .conn
+        .lock()
+        .map_err(|lock_error| AppError::Other(lock_error.to_string()))?;
+    let changed = conn.execute(
         "UPDATE books
          SET preparation_state = ?1,
              preparation_error = ?2,
              pages = COALESCE(?3, pages)
-         WHERE id = ?4 AND render_format = 'text'",
-        params![state, error, pages, book_id],
+         WHERE id = ?4
+           AND render_format = 'text'
+           AND preparation_state = 'preparing'
+           AND source_file_path IS ?5
+           AND source_format IS ?6
+           AND source_sha256 IS ?7
+           AND COALESCE(conversion_version, 0) = ?8",
+        params![
+            next_state,
+            error,
+            pages,
+            book_id,
+            source.file_path.as_deref(),
+            source.format.as_deref(),
+            source.sha256.as_deref(),
+            source.conversion_version,
+        ],
     )?;
-    Ok(())
+    Ok(changed == 1)
+}
+
+fn recover_current_text_preparation_job(
+    db: &Db,
+    book_id: &str,
+    source: &TextPreparationSource,
+    prepared_path: &Path,
+) -> AppResult<bool> {
+    let conn = db
+        .conn
+        .lock()
+        .map_err(|lock_error| AppError::Other(lock_error.to_string()))?;
+    if !text_preparation_job_is_current(&conn, book_id, source)? {
+        return Ok(false);
+    }
+    let Some(document) = load_prepared_document(prepared_path, source.sha256.as_deref()) else {
+        return Ok(false);
+    };
+    let pages = i32::try_from(text_toc_leaf_count(&document.toc).max(1))
+        .map_err(|_| AppError::Other("TEXT_BOOK_TOO_LARGE".to_string()))?;
+    let changed = conn.execute(
+        "UPDATE books
+         SET preparation_state = 'ready', preparation_error = NULL, pages = ?1
+         WHERE id = ?2
+           AND render_format = 'text'
+           AND preparation_state = 'preparing'
+           AND source_file_path IS ?3
+           AND source_format IS ?4
+           AND source_sha256 IS ?5
+           AND COALESCE(conversion_version, 0) = ?6",
+        params![
+            pages,
+            book_id,
+            source.file_path.as_deref(),
+            source.format.as_deref(),
+            source.sha256.as_deref(),
+            source.conversion_version,
+        ],
+    )?;
+    Ok(changed == 1)
+}
+
+fn publish_current_text_preparation_job(
+    db: &Db,
+    book_id: &str,
+    source: &TextPreparationSource,
+    prepared_path: &Path,
+    document: &TextBookDocument,
+    pages: i32,
+) -> AppResult<bool> {
+    let conn = db
+        .conn
+        .lock()
+        .map_err(|lock_error| AppError::Other(lock_error.to_string()))?;
+    if !text_preparation_job_is_current(&conn, book_id, source)? {
+        return Ok(false);
+    }
+    write_prepared_document(prepared_path, document)?;
+    let changed = conn.execute(
+        "UPDATE books
+         SET preparation_state = 'ready', preparation_error = NULL, pages = ?1
+         WHERE id = ?2
+           AND render_format = 'text'
+           AND preparation_state = 'preparing'
+           AND source_file_path IS ?3
+           AND source_format IS ?4
+           AND source_sha256 IS ?5
+           AND COALESCE(conversion_version, 0) = ?6",
+        params![
+            pages,
+            book_id,
+            source.file_path.as_deref(),
+            source.format.as_deref(),
+            source.sha256.as_deref(),
+            source.conversion_version,
+        ],
+    )?;
+    Ok(changed == 1)
 }
 
 fn emit_text_preparation_changed(app: &AppHandle, book_id: &str, state: &str) {
@@ -674,66 +1859,120 @@ fn run_text_preparation(app: &AppHandle, book_id: &str) -> AppResult<()> {
             return Ok(());
         }
         conn.query_row(
-            "SELECT source_file_path, source_format, source_sha256 FROM books WHERE id = ?1",
+            "SELECT source_file_path, source_format, source_sha256,
+                    COALESCE(conversion_version, 0)
+             FROM books WHERE id = ?1",
             params![book_id],
             |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
+                Ok(TextPreparationSource {
+                    file_path: row.get(0)?,
+                    format: row.get(1)?,
+                    sha256: row.get(2)?,
+                    conversion_version: row.get(3)?,
+                })
             },
         )?
     };
     emit_text_preparation_changed(app, book_id, "preparing");
 
-    let (source_file_path, source_format, source_sha256) = source;
-    let Some(source_file_path) = source_file_path else {
-        update_text_preparation_state(&db, book_id, "failed", Some("TEXT_SOURCE_MISSING"), None)?;
-        emit_text_preparation_changed(app, book_id, "failed");
+    let prepared_path = prepared_document_path(&local_dir.0, book_id);
+    if recover_current_text_preparation_job(&db, book_id, &source, &prepared_path)? {
+        let _ = fs::remove_file(legacy_prepared_document_path(&local_dir.0, book_id));
+        emit_text_preparation_changed(app, book_id, "ready");
+        return Ok(());
+    }
+    let Some(source_file_path) = source.file_path.as_deref() else {
+        if update_current_text_preparation_job(
+            &db,
+            book_id,
+            &source,
+            "failed",
+            Some("TEXT_SOURCE_MISSING"),
+            None,
+        )? {
+            emit_text_preparation_changed(app, book_id, "failed");
+        }
         return Ok(());
     };
-    let source_path = db.resolve_path(&source_file_path)?;
+    let source_path = match db.resolve_path(source_file_path) {
+        Ok(path) => path,
+        Err(error) => {
+            let message = error.to_string();
+            if update_current_text_preparation_job(
+                &db,
+                book_id,
+                &source,
+                "failed",
+                Some(&message),
+                None,
+            )? {
+                emit_text_preparation_changed(app, book_id, "failed");
+            }
+            return Ok(());
+        }
+    };
     match icloud::file_availability(&source_path) {
         icloud::FileAvailability::Available => {}
         icloud::FileAvailability::ICloudPlaceholder => {
             icloud::trigger_download_file(&source_path);
-            update_text_preparation_state(&db, book_id, "pending", None, None)?;
-            emit_text_preparation_changed(app, book_id, "pending");
+            if update_current_text_preparation_job(&db, book_id, &source, "pending", None, None)? {
+                emit_text_preparation_changed(app, book_id, "pending");
+            }
             return Ok(());
         }
         icloud::FileAvailability::Missing => {
-            update_text_preparation_state(
+            if update_current_text_preparation_job(
                 &db,
                 book_id,
+                &source,
                 "failed",
                 Some("TEXT_SOURCE_UNAVAILABLE"),
                 None,
-            )?;
-            emit_text_preparation_changed(app, book_id, "failed");
+            )? {
+                emit_text_preparation_changed(app, book_id, "failed");
+            }
             return Ok(());
         }
     }
 
     let result = prepare_text_document(
         &source_path,
-        source_format.as_deref().unwrap_or("txt"),
-        source_sha256,
+        source.format.as_deref().unwrap_or("txt"),
+        source.sha256.clone(),
     )
     .and_then(|document| {
-        let pages = i32::try_from(document.chapters.len())
+        let pages = i32::try_from(text_toc_leaf_count(&document.toc).max(1))
             .map_err(|_| AppError::Other("TEXT_BOOK_TOO_LARGE".to_string()))?;
-        write_prepared_document(&prepared_document_path(&local_dir.0, book_id), &document)?;
-        update_text_preparation_state(&db, book_id, "ready", None, Some(pages))?;
-        Ok(())
+        publish_current_text_preparation_job(
+            &db,
+            book_id,
+            &source,
+            &prepared_path,
+            &document,
+            pages,
+        )
     });
 
     match result {
-        Ok(()) => emit_text_preparation_changed(app, book_id, "ready"),
+        Ok(true) => {
+            let _ = fs::remove_file(legacy_prepared_document_path(&local_dir.0, book_id));
+            emit_text_preparation_changed(app, book_id, "ready");
+        }
+        Ok(false) => {
+            log::debug!("discarded stale text preparation task for {book_id}");
+        }
         Err(error) => {
             let message = error.to_string();
-            update_text_preparation_state(&db, book_id, "failed", Some(&message), None)?;
-            emit_text_preparation_changed(app, book_id, "failed");
+            if update_current_text_preparation_job(
+                &db,
+                book_id,
+                &source,
+                "failed",
+                Some(&message),
+                None,
+            )? {
+                emit_text_preparation_changed(app, book_id, "failed");
+            }
             log::warn!("text preparation failed for {book_id}: {message}");
         }
     }
@@ -747,36 +1986,37 @@ pub fn schedule_text_book_preparation(app: AppHandle, book_id: String) {
         .spawn(move || {
             if let Err(error) = run_text_preparation(&app, &book_id) {
                 log::warn!("text preparation task failed for {book_id}: {error}");
-                let db = app.state::<Db>();
-                let message = error.to_string();
-                let _ =
-                    update_text_preparation_state(&db, &book_id, "failed", Some(&message), None);
-                emit_text_preparation_changed(&app, &book_id, "failed");
             }
         });
 }
 
-pub fn schedule_pending_text_book_preparations(app: AppHandle) {
-    let db = app.state::<Db>();
-    let pending = (|| -> AppResult<Vec<String>> {
-        let conn = db
-            .conn
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
+fn pending_text_book_ids(db: &Db, recover_interrupted: bool) -> AppResult<Vec<String>> {
+    let conn = db
+        .conn
+        .lock()
+        .map_err(|error| AppError::Other(error.to_string()))?;
+    if recover_interrupted {
         conn.execute(
             "UPDATE books SET preparation_state = 'pending', preparation_error = NULL
              WHERE render_format = 'text' AND preparation_state = 'preparing'",
             [],
         )?;
-        let mut statement = conn.prepare(
-            "SELECT id FROM books WHERE render_format = 'text' AND preparation_state = 'pending'",
-        )?;
-        let book_ids = statement
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<Vec<String>, _>>()
-            .map_err(AppError::from)?;
-        Ok(book_ids)
-    })();
+    }
+    let mut statement = conn.prepare(
+        "SELECT id FROM books
+         WHERE render_format = 'text' AND preparation_state = 'pending'
+         ORDER BY id",
+    )?;
+    let book_ids = statement
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(AppError::from)?;
+    Ok(book_ids)
+}
+
+fn schedule_pending_text_book_preparations_inner(app: AppHandle, recover_interrupted: bool) {
+    let db = app.state::<Db>();
+    let pending = pending_text_book_ids(&db, recover_interrupted);
     match pending {
         Ok(book_ids) => {
             for book_id in book_ids {
@@ -785,6 +2025,14 @@ pub fn schedule_pending_text_book_preparations(app: AppHandle) {
         }
         Err(error) => log::warn!("text preparation startup scan failed: {error}"),
     }
+}
+
+pub fn resume_interrupted_text_book_preparations(app: AppHandle) {
+    schedule_pending_text_book_preparations_inner(app, true);
+}
+
+pub fn schedule_pending_text_book_preparations(app: AppHandle) {
+    schedule_pending_text_book_preparations_inner(app, false);
 }
 
 pub(crate) fn do_import_epub(file_path: &str, db: &Db, sync: &SyncWriter) -> AppResult<Book> {
@@ -1540,25 +2788,27 @@ pub fn get_text_book_document(
     app: AppHandle,
 ) -> AppResult<TextBookDocument> {
     crate::sync::validation::validate_entity_id(&book_id)?;
-    let state: (String, Option<String>) = {
+    let state: (String, Option<String>, Option<String>) = {
         let conn = db.reader();
         conn.query_row(
-            "SELECT preparation_state, preparation_error FROM books WHERE id = ?1 AND render_format = 'text'",
+            "SELECT preparation_state, preparation_error, source_sha256
+             FROM books WHERE id = ?1 AND render_format = 'text'",
             params![book_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?
     };
     match state.0.as_str() {
         "ready" => {
             let path = prepared_document_path(&local_dir.0, &book_id);
-            match fs::read(&path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<TextBookDocument>(&bytes).ok())
-            {
-                Some(document) if document.version == TEXT_DOCUMENT_VERSION => Ok(document),
+            // Reader-side cache access stays non-mutating. Recovery and
+            // sidecar cleanup run only inside the preparation job while it
+            // owns the database writer lock.
+            match read_prepared_document(&path, state.2.as_deref()) {
+                Some(document) => Ok(document),
                 _ => {
-                    update_text_preparation_state(&db, &book_id, "pending", None, None)?;
-                    schedule_text_book_preparation(app, book_id);
+                    if transition_text_preparation_state(&db, &book_id, "ready", "pending", None)? {
+                        schedule_text_book_preparation(app, book_id);
+                    }
                     Err(AppError::Other("TEXT_PREPARATION_PENDING".to_string()))
                 }
             }
@@ -1583,9 +2833,10 @@ pub fn retry_text_book_preparation(
     app: AppHandle,
 ) -> AppResult<()> {
     crate::sync::validation::validate_entity_id(&book_id)?;
-    update_text_preparation_state(&db, &book_id, "pending", None, None)?;
-    emit_text_preparation_changed(&app, &book_id, "pending");
-    schedule_text_book_preparation(app, book_id);
+    if transition_text_preparation_state(&db, &book_id, "failed", "pending", None)? {
+        emit_text_preparation_changed(&app, &book_id, "pending");
+        schedule_text_book_preparation(app, book_id);
+    }
     Ok(())
 }
 
@@ -1612,6 +2863,15 @@ pub fn check_book_available(id: String, db: State<'_, Db>) -> AppResult<BookAvai
 }
 
 pub(crate) fn do_delete_book(id: &str, db: &Db, sync: &SyncWriter) -> AppResult<()> {
+    do_delete_book_with_note_policy(id, false, db, sync)
+}
+
+pub(crate) fn do_delete_book_with_note_policy(
+    id: &str,
+    preserve_book_notes: bool,
+    db: &Db,
+    sync: &SyncWriter,
+) -> AppResult<()> {
     crate::sync::validation::validate_entity_id(id)?;
     let (file_path, source_file_path): (String, Option<String>) = {
         let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
@@ -1623,7 +2883,44 @@ pub(crate) fn do_delete_book(id: &str, db: &Db, sync: &SyncWriter) -> AppResult<
     };
 
     let now = chrono::Utc::now().timestamp_millis();
+    let device = sync.self_device().to_string();
     sync.with_tx(db, now, |tx, events| {
+        if preserve_book_notes {
+            let detached_notes = {
+                let mut statement = tx.prepare(
+                    "SELECT id, anchor_kind, normalized_word, selected_text, content,
+                            content_format, created_at
+                     FROM notes WHERE book_id = ?1 AND scope = 'book'",
+                )?;
+                let notes = statement
+                    .query_map(params![id], |row| {
+                        Ok(NotePayload {
+                            id: row.get(0)?,
+                            book_id: None,
+                            anchor_kind: row.get(1)?,
+                            normalized_word: row.get(2)?,
+                            scope: "detached".to_string(),
+                            location: None,
+                            selected_text: row.get(3)?,
+                            content: row.get(4)?,
+                            content_format: row.get(5)?,
+                            created_at: row.get(6)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                notes
+            };
+            for note in detached_notes {
+                tx.execute(
+                    "UPDATE notes
+                     SET book_id = NULL, scope = 'detached', location = NULL,
+                         updated_at = ?2, updated_by_device = ?3
+                     WHERE id = ?1",
+                    params![note.id, now, device],
+                )?;
+                events.push(EventBody::NoteUpsert(note));
+            }
+        }
         tx.execute(
             "DELETE FROM chat_messages WHERE chat_id IN (SELECT id FROM chats WHERE book_id = ?1)",
             params![id],
@@ -1637,6 +2934,18 @@ pub(crate) fn do_delete_book(id: &str, db: &Db, sync: &SyncWriter) -> AppResult<
         tx.execute("DELETE FROM bookmarks WHERE book_id = ?1", params![id])?;
         tx.execute("DELETE FROM vocab_words WHERE book_id = ?1", params![id])?;
         tx.execute("DELETE FROM lookup_records WHERE book_id = ?1", params![id])?;
+        tx.execute(
+            "DELETE FROM word_mark_rules WHERE book_id = ?1",
+            params![id],
+        )?;
+        tx.execute(
+            "DELETE FROM notes WHERE book_id = ?1 AND scope = 'book'",
+            params![id],
+        )?;
+        tx.execute(
+            "UPDATE notes SET book_id = NULL WHERE book_id = ?1 AND scope = 'global'",
+            params![id],
+        )?;
         tx.execute("DELETE FROM book_settings WHERE book_id = ?1", params![id])?;
         tx.execute("DELETE FROM books WHERE id = ?1", params![id])?;
         events.push(EventBody::BookDelete { id: id.to_string() });
@@ -1658,12 +2967,21 @@ pub(crate) fn do_delete_book(id: &str, db: &Db, sync: &SyncWriter) -> AppResult<
 #[tauri::command]
 pub fn delete_book(
     id: String,
+    preserve_notes: Option<bool>,
     db: State<'_, Db>,
     sync: State<'_, SyncWriter>,
     local_dir: State<'_, LocalDir>,
 ) -> AppResult<()> {
-    do_delete_book(&id, &db, &sync)?;
-    let _ = fs::remove_file(prepared_document_path(&local_dir.0, &id));
+    do_delete_book_with_note_policy(&id, preserve_notes.unwrap_or(false), &db, &sync)?;
+    let prepared_path = prepared_document_path(&local_dir.0, &id);
+    let _ = fs::remove_file(&prepared_path);
+    if let Ok(backup_path) = prepared_document_backup_path(&prepared_path) {
+        let _ = fs::remove_file(backup_path);
+    }
+    if let Ok(temporary_path) = prepared_document_temporary_path(&prepared_path) {
+        let _ = fs::remove_file(temporary_path);
+    }
+    let _ = fs::remove_file(legacy_prepared_document_path(&local_dir.0, &id));
     Ok(())
 }
 
@@ -1915,32 +3233,529 @@ mod tests {
         let html_document = prepare_text_document(&html, "html", None).unwrap();
 
         assert_eq!(markdown_document.version, TEXT_DOCUMENT_VERSION);
-        assert!(markdown_document.chapters[0]
-            .paragraphs
-            .join(" ")
-            .contains("Hello reader"));
-        assert!(html_document.chapters[0]
-            .paragraphs
-            .join(" ")
-            .contains("Hello reader"));
+        let markdown_text = markdown_document
+            .chunks
+            .iter()
+            .flat_map(|chunk| &chunk.blocks)
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let html_text = html_document
+            .chunks
+            .iter()
+            .flat_map(|chunk| &chunk.blocks)
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(markdown_text.contains("Hello reader"));
+        assert!(html_text.contains("Hello reader"));
+    }
+
+    #[test]
+    fn text_preparation_hashes_the_source_bytes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("book.txt");
+        fs::write(&path, "Chapter One\n\nHello reader.").unwrap();
+        let actual_hash = source_sha256(&path).unwrap();
+
+        let document = prepare_text_document(&path, "txt", Some(actual_hash.clone())).unwrap();
+        assert_eq!(
+            document.source_sha256.as_deref(),
+            Some(actual_hash.as_str())
+        );
+
+        let error = prepare_text_document(&path, "txt", Some("0".repeat(64)))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("TEXT_SOURCE_HASH_MISMATCH"));
+    }
+
+    #[test]
+    fn text_parser_builds_hierarchical_part_toc_without_generated_chunks() {
+        let text = "PART ONE 1\nFirst.\nPART ONE 2\nSecond.\nPART TWO 1\nThird.\nPART TWO 22\nLast.\nEPILOGUE\nDone.";
+        let (chunks, toc, legacy_locations) = text_document_parts(text, true);
+        let entries = toc
+            .iter()
+            .map(|entry| (entry.title.as_str(), entry.depth))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            entries,
+            [
+                ("PART ONE", 0),
+                ("1", 1),
+                ("2", 1),
+                ("PART TWO", 0),
+                ("1", 1),
+                ("22", 1),
+                ("EPILOGUE", 0),
+            ]
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .flat_map(|chunk| &chunk.blocks)
+                .filter(|block| block.kind == TextBookBlockKind::Heading)
+                .count(),
+            5
+        );
+        assert!(toc.iter().all(|entry| !entry.title.starts_with("Part ")));
+        assert_eq!(text_toc_leaf_count(&toc), 5);
+        // PART headings were ordinary V1 paragraphs, so old locations still
+        // resolve to the exact same canonical source offsets.
+        assert_eq!(legacy_locations[0][0], 0);
+        assert_eq!(
+            legacy_locations[0][2],
+            "PART ONE 1\nFirst.\n".encode_utf16().count() as u64
+        );
+    }
+
+    #[test]
+    fn text_parser_recognizes_common_english_and_chinese_headings() {
+        let text = "BOOK I\nCHAPTER ONE\nBody\nSECTION 2\nMore\nACT III\nPlay\nVOLUME TWO 3\nNext\n第一卷\n第一章 开始\n正文\n第十二章：结局\n第一章初见\nEPILOGUE\nEnd";
+        let (_, toc, _) = text_document_parts(text, true);
+        let entries = toc
+            .iter()
+            .map(|entry| (entry.title.as_str(), entry.depth))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            entries,
+            [
+                ("BOOK I", 0),
+                ("CHAPTER ONE", 1),
+                ("SECTION 2", 2),
+                ("ACT III", 1),
+                ("VOLUME TWO", 0),
+                ("3", 1),
+                ("第一卷", 0),
+                ("第一章 开始", 1),
+                ("第十二章：结局", 1),
+                ("第一章初见", 1),
+                ("EPILOGUE", 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn text_parser_builds_multilevel_book_and_play_trees() {
+        let text = "VOLUME I\nBOOK ONE\nPART ONE\nCHAPTER 1\nSECTION 1\nText\nACT II\nSCENE 1\nPlay\nEPILOGUE\nEnd";
+        let (_, toc, _) = text_document_parts(text, true);
+        let entries = toc
+            .iter()
+            .map(|entry| (entry.title.as_str(), entry.depth))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            entries,
+            [
+                ("VOLUME I", 0),
+                ("BOOK ONE", 1),
+                ("PART ONE", 2),
+                ("CHAPTER 1", 3),
+                ("SECTION 1", 4),
+                ("ACT II", 2),
+                ("SCENE 1", 3),
+                ("EPILOGUE", 0),
+            ]
+        );
+        assert_eq!(text_toc_leaf_count(&toc), 3);
+
+        let (_, play_toc, _) = text_document_parts("ACT I\nSCENE 1\nText\nSCENE 2\nMore", true);
+        let play_entries = play_toc
+            .iter()
+            .map(|entry| (entry.title.as_str(), entry.depth))
+            .collect::<Vec<_>>();
+        assert_eq!(play_entries, [("ACT I", 0), ("SCENE 1", 1), ("SCENE 2", 1)]);
+    }
+
+    #[test]
+    fn text_parser_recognizes_punctuated_english_headings() {
+        let text = "Chapter 1.\nBody\n\nChapter One.\nMore\n\nPart Two.\nLast";
+        let (_, toc, _) = text_document_parts(text, true);
+        let entries = toc
+            .iter()
+            .map(|entry| (entry.title.as_str(), entry.depth))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            entries,
+            [("Chapter 1.", 0), ("Chapter One.", 0), ("Part Two.", 0)]
+        );
+    }
+
+    #[test]
+    fn text_parser_recognizes_bare_number_chapters_without_a_parent() {
+        let text = "1\nFirst\n\n2\nSecond\n\nI\nThird\n\nII\nFourth";
+        let (_, toc, _) = text_document_parts(text, true);
+        let entries = toc
+            .iter()
+            .map(|entry| (entry.title.as_str(), entry.depth))
+            .collect::<Vec<_>>();
+
+        assert_eq!(entries, [("1", 0), ("2", 0), ("I", 0), ("II", 0)]);
+    }
+
+    #[test]
+    fn text_parser_does_not_treat_prose_as_a_heading() {
+        let text = "The chapter was short.\nWe took part in the work.\nChapter books were nearby.\nChapter one was the longest\nPart one of the story\nPART CIVIL DUTY\n2024\ncontinues as prose\n第一次读到这一章时，我没有停下来\n\nmix";
+        let (chunks, toc, _) = text_document_parts(text, true);
+        assert_eq!(toc.len(), 1);
+        assert_eq!(toc[0].title, "Reading");
+        assert!(chunks
+            .iter()
+            .flat_map(|chunk| &chunk.blocks)
+            .all(|block| block.kind == TextBookBlockKind::Paragraph));
+    }
+
+    #[test]
+    fn text_parser_does_not_promote_inline_numbers_after_a_chapter() {
+        let (_, toc, _) = text_document_parts("CHAPTER 1\nprose\n2024\ncontinues", true);
+        let entries = toc
+            .iter()
+            .map(|entry| (entry.title.as_str(), entry.depth))
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [("CHAPTER 1", 0)]);
+    }
+
+    #[test]
+    fn text_parser_accepts_canonical_roman_and_compound_word_numbers() {
+        assert!(canonical_roman_number("MCMXCIV"));
+        assert!(!canonical_roman_number("CIVIL"));
+        assert!(!canonical_roman_number("ILL"));
+
+        let (_, toc, _) = text_document_parts("PART TWENTY ONE 3\nText\nCHAPTER XLII\nMore", true);
+        let entries = toc
+            .iter()
+            .map(|entry| (entry.title.as_str(), entry.depth))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            [("PART TWENTY ONE", 0), ("3", 1), ("CHAPTER XLII", 1)]
+        );
+    }
+
+    #[test]
+    fn text_parser_reflows_consistently_hard_wrapped_paragraphs() {
+        let first = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        let second = "lambda mu nu xi omicron pi rho sigma tau upsilon omega";
+        let mut groups = Vec::new();
+        for index in 0..5 {
+            groups.push(format!("{first}\n{second}  \nparagraph {index} ends."));
+        }
+        let text = groups.join("\n\n");
+        let lines = normalized_text_lines(&text);
+        let (chunks, _, legacy_locations) = text_document_parts(&text, true);
+        let blocks = chunks
+            .iter()
+            .flat_map(|chunk| &chunk.blocks)
+            .collect::<Vec<_>>();
+
+        assert!(hard_wrap_width(&lines, &vec![None; lines.len()]).is_some());
+        assert_eq!(blocks.len(), 5);
+        assert_eq!(legacy_locations[0].len(), 15);
+        assert_eq!(
+            blocks[0].text,
+            format!("{first} {second} paragraph 0 ends.")
+        );
+        assert_eq!(blocks[0].source_spans.len(), 5);
+        assert_eq!(blocks[0].source_spans[2].source_start, utf16_len(first) + 1);
+        assert_eq!(
+            blocks[0].source_spans[4].source_start,
+            utf16_len(first) + 1 + utf16_len(second) + 2 + 1
+        );
+        let (unreflowed, _, _) = text_document_parts(&text, false);
+        assert_eq!(
+            unreflowed
+                .iter()
+                .map(|chunk| chunk.blocks.len())
+                .sum::<usize>(),
+            15
+        );
+    }
+
+    #[test]
+    fn text_parser_reflows_prose_with_lowercase_continuation_lines() {
+        let groups = (0..4)
+            .map(|index| {
+                format!(
+                    "Alpha beta gamma delta epsilon zeta eta theta iota\n\
+                     lambda mu nu xi omicron pi rho sigma tau upsilon\n\
+                     continuation words remain part of the same paragraph\n\
+                     final line {index} ends with ordinary punctuation."
+                )
+            })
+            .collect::<Vec<_>>();
+        let text = groups.join("\n\n");
+        let lines = normalized_text_lines(&text);
+        assert!(hard_wrap_width(&lines, &vec![None; lines.len()]).is_some());
+
+        let (chunks, _, _) = text_document_parts(&text, true);
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.blocks.len()).sum::<usize>(),
+            4
+        );
+    }
+
+    #[test]
+    fn text_parser_preserves_bullet_and_numbered_lists() {
+        let bullet_list = (0..12)
+            .map(|index| format!("- list item {index:02} keeps its deliberate line boundary"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let numbered_list = (1..=12)
+            .map(|index| format!("{index}. list item keeps its deliberate line boundary"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let alpha_list = (b'A'..=b'L')
+            .map(|marker| {
+                format!(
+                    "{}) list item keeps its deliberate line boundary",
+                    char::from(marker)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let roman_list = [
+            "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII",
+        ]
+        .into_iter()
+        .map(|marker| format!("{marker}. list item keeps its deliberate line boundary"))
+        .collect::<Vec<_>>()
+        .join("\n");
+        let task_list = (0..12)
+            .map(|index| format!("[ ] task {index:02} keeps its deliberate line boundary"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for text in [
+            bullet_list,
+            numbered_list,
+            alpha_list,
+            roman_list,
+            task_list,
+        ] {
+            let lines = normalized_text_lines(&text);
+            assert_eq!(hard_wrap_width(&lines, &vec![None; lines.len()]), None);
+
+            let (chunks, _, _) = text_document_parts(&text, true);
+            assert_eq!(
+                chunks.iter().map(|chunk| chunk.blocks.len()).sum::<usize>(),
+                12
+            );
+        }
+    }
+
+    #[test]
+    fn text_parser_preserves_repeated_capitalized_verse_lines() {
+        let text = (0..12)
+            .map(|index| format!("Silver light crosses the quiet water in verse {index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = normalized_text_lines(&text);
+
+        assert_eq!(hard_wrap_width(&lines, &vec![None; lines.len()]), None);
+        let (chunks, _, _) = text_document_parts(&text, true);
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.blocks.len()).sum::<usize>(),
+            12
+        );
+    }
+
+    #[test]
+    fn text_parser_preserves_repeated_lowercase_verse_lines() {
+        let text = (0..12)
+            .map(|index| format!("silver light crosses the quiet water in verse {index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = normalized_text_lines(&text);
+
+        assert!(hard_wrap_width(&lines, &vec![None; lines.len()]).is_some());
+        let (chunks, _, _) = text_document_parts(&text, true);
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.blocks.len()).sum::<usize>(),
+            12
+        );
+    }
+
+    #[test]
+    fn text_parser_preserves_an_embedded_lowercase_verse_stanza() {
+        let first = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        let second = "lambda mu nu xi omicron pi rho sigma tau upsilon omega";
+        let mut groups = (0..4)
+            .map(|index| format!("{first}\n{second}\nparagraph {index} ends."))
+            .collect::<Vec<_>>();
+        let verse = [
+            "silver light crosses the quiet water below",
+            "wind leans softly through the winter reeds",
+            "footsteps fade beyond the sleeping shore",
+            "night keeps every word we could not say",
+        ];
+        groups.push(verse.join("\n"));
+        let text = groups.join("\n\n");
+        let lines = normalized_text_lines(&text);
+        assert!(hard_wrap_width(&lines, &vec![None; lines.len()]).is_some());
+
+        let (chunks, _, _) = text_document_parts(&text, true);
+        let blocks = chunks
+            .iter()
+            .flat_map(|chunk| &chunk.blocks)
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 8);
+        assert_eq!(&blocks[4..], verse);
+    }
+
+    #[test]
+    fn text_parser_keeps_prose_after_an_indented_line_separate() {
+        let first = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        let second = "lambda mu nu xi omicron pi rho sigma tau upsilon omega";
+        let mut groups = (0..4)
+            .map(|index| format!("{first}\n{second}\nparagraph {index} ends."))
+            .collect::<Vec<_>>();
+        groups.push(
+            "    indented quotation keeps its deliberate boundary here\nfollowing prose remains separate from the indented quotation"
+                .to_string(),
+        );
+        let text = groups.join("\n\n");
+        let lines = normalized_text_lines(&text);
+        assert!(hard_wrap_width(&lines, &vec![None; lines.len()]).is_some());
+
+        let (chunks, _, _) = text_document_parts(&text, true);
+        let blocks = chunks
+            .iter()
+            .flat_map(|chunk| &chunk.blocks)
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(blocks.contains(&"indented quotation keeps its deliberate boundary here"));
+        assert!(blocks.contains(&"following prose remains separate from the indented quotation"));
+    }
+
+    #[test]
+    fn text_reflow_uses_script_appropriate_separators() {
+        let cjk_lines = normalized_text_lines("中文换行\n继续阅读");
+        let mut cjk = block_from_line(&cjk_lines[0], TextBookBlockKind::Paragraph, None);
+        append_reflowed_line(&mut cjk, &cjk_lines[1]);
+        assert_eq!(cjk.text, "中文换行继续阅读");
+
+        let hyphen_lines = normalized_text_lines("well-\nknown");
+        let mut hyphen = block_from_line(&hyphen_lines[0], TextBookBlockKind::Paragraph, None);
+        append_reflowed_line(&mut hyphen, &hyphen_lines[1]);
+        assert_eq!(hyphen.text, "well-known");
+    }
+
+    #[test]
+    fn text_parser_keeps_complete_lines_as_separate_paragraphs() {
+        let text = (0..12)
+            .map(|index| {
+                format!(
+                    "This is complete paragraph number {index}, with a natural sentence ending."
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = normalized_text_lines(&text);
+        assert_eq!(hard_wrap_width(&lines, &vec![None; lines.len()]), None);
+        let (chunks, _, _) = text_document_parts(&text, true);
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.blocks.len()).sum::<usize>(),
+            12
+        );
+    }
+
+    #[test]
+    fn text_preparation_does_not_reflow_markdown_soft_breaks() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("lines.md");
+        let markdown = (0..12)
+            .map(|index| format!("soft wrapped markdown line {index} without terminal punctuation"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, markdown).unwrap();
+
+        let document = prepare_text_document(&path, "markdown", None).unwrap();
+        assert_eq!(
+            document
+                .chunks
+                .iter()
+                .map(|chunk| chunk.blocks.len())
+                .sum::<usize>(),
+            12
+        );
+    }
+
+    #[test]
+    fn text_offsets_use_utf16_but_legacy_chunks_keep_utf8_threshold() {
+        let emoji_lines = normalized_text_lines("A😀B\nNext");
+        assert_eq!(emoji_lines[0].source_start, 0);
+        assert_eq!(emoji_lines[0].source_end, 4);
+        assert_eq!(emoji_lines[1].source_start, 5);
+
+        let cjk_line = "文".repeat(8_000);
+        let text = format!("{cjk_line}\n{cjk_line}");
+        let locations = legacy_text_locations(&normalized_text_lines(&text));
+        assert_eq!(locations.len(), 2);
+        assert_eq!(locations[0], [0]);
+        assert_eq!(locations[1], [8_001]);
+    }
+
+    fn sample_text_document(source_sha256: &str) -> TextBookDocument {
+        TextBookDocument {
+            version: TEXT_DOCUMENT_VERSION,
+            source_sha256: Some(source_sha256.to_string()),
+            coordinate_space: "normalized_utf16".to_string(),
+            chunks: vec![TextBookChunk {
+                blocks: vec![TextBookBlock {
+                    kind: TextBookBlockKind::Paragraph,
+                    text: "A paragraph".to_string(),
+                    source_start: 0,
+                    source_end: 11,
+                    source_spans: vec![TextBookSourceSpan {
+                        rendered_start: 0,
+                        source_start: 0,
+                        length: 11,
+                    }],
+                    depth: None,
+                }],
+            }],
+            toc: vec![TextBookTocEntry {
+                title: "Reading".to_string(),
+                depth: 0,
+                source_offset: 0,
+            }],
+            legacy_locations: vec![vec![0]],
+        }
     }
 
     #[test]
     fn prepared_document_write_is_readable() {
         let dir = TempDir::new().unwrap();
-        let document = TextBookDocument {
-            version: TEXT_DOCUMENT_VERSION,
-            source_sha256: Some("abc".to_string()),
-            chapters: vec![TextBookChapter {
-                title: "Reading".to_string(),
-                paragraphs: vec!["A paragraph".to_string()],
-            }],
-        };
+        let document = sample_text_document("abc");
         let path = prepared_document_path(dir.path(), "book-id");
         write_prepared_document(&path, &document).unwrap();
+        let mut replacement = document.clone();
+        replacement.chunks[0].blocks[0].text = "Replacement".to_string();
+        write_prepared_document(&path, &replacement).unwrap();
 
-        let restored: TextBookDocument = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert_eq!(restored.chapters[0].paragraphs, ["A paragraph"]);
+        let restored: TextBookDocument = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restored.chunks[0].blocks[0].text, "Replacement");
+        assert!(path.ends_with("book-id.v2.json"));
+
+        let backup_path = prepared_document_backup_path(&path).unwrap();
+        assert!(!backup_path.exists());
+        fs::rename(&path, &backup_path).unwrap();
+        let recovered = load_prepared_document(&path, Some("abc")).unwrap();
+        assert_eq!(recovered.chunks[0].blocks[0].text, "Replacement");
+        assert!(path.exists());
+        assert!(!backup_path.exists());
+
+        let temporary_path = prepared_document_temporary_path(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::write(&temporary_path, serde_json::to_vec(&replacement).unwrap()).unwrap();
+        let recovered = load_prepared_document(&path, Some("abc")).unwrap();
+        assert_eq!(recovered.chunks[0].blocks[0].text, "Replacement");
+        assert!(path.exists());
+        assert!(!temporary_path.exists());
     }
 
     fn setup() -> (TempDir, Db) {
@@ -1957,6 +3772,162 @@ mod tests {
              VALUES (?1, 'Test', 'Author', 'books/test.epub', ?2, 'reading', 0, ?3, ?3)",
             params![id, format, now],
         ).unwrap();
+    }
+
+    fn insert_text_preparation_book(db: &Db, id: &str, state: &str, source_sha256: &str) {
+        let conn = db.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO books
+             (id, title, author, file_path, format, source_format, render_format,
+              source_file_path, source_sha256, conversion_version, preparation_state,
+              preparation_error, status, progress, created_at, updated_at)
+             VALUES (?1, 'Text', 'Author', ?2, 'txt', 'txt', 'text', ?2, ?3, ?4, ?5,
+                     'existing error', 'reading', 0, ?6, ?6)",
+            params![
+                id,
+                format!("sources/{id}.txt"),
+                source_sha256,
+                TEXT_DOCUMENT_VERSION,
+                state,
+                now,
+            ],
+        )
+        .unwrap();
+    }
+
+    fn text_preparation_source(id: &str, source_sha256: &str) -> TextPreparationSource {
+        TextPreparationSource {
+            file_path: Some(format!("sources/{id}.txt")),
+            format: Some("txt".to_string()),
+            sha256: Some(source_sha256.to_string()),
+            conversion_version: TEXT_DOCUMENT_VERSION,
+        }
+    }
+
+    #[test]
+    fn repeated_pending_scan_does_not_reset_an_active_preparation() {
+        let (_dir, db) = setup();
+        insert_text_preparation_book(&db, "active", "preparing", "active-hash");
+        insert_text_preparation_book(&db, "queued", "pending", "queued-hash");
+
+        assert_eq!(pending_text_book_ids(&db, false).unwrap(), ["queued"]);
+        let active: (String, Option<String>) = db
+            .reader()
+            .query_row(
+                "SELECT preparation_state, preparation_error FROM books WHERE id = 'active'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            active,
+            ("preparing".to_string(), Some("existing error".to_string()))
+        );
+
+        assert_eq!(
+            pending_text_book_ids(&db, true).unwrap(),
+            ["active", "queued"]
+        );
+        let active: (String, Option<String>) = db
+            .reader()
+            .query_row(
+                "SELECT preparation_state, preparation_error FROM books WHERE id = 'active'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(active, ("pending".to_string(), None));
+    }
+
+    #[test]
+    fn text_preparation_state_transitions_are_compare_and_set() {
+        let (_dir, db) = setup();
+        insert_text_preparation_book(&db, "retry", "failed", "hash");
+
+        assert!(
+            transition_text_preparation_state(&db, "retry", "failed", "pending", None,).unwrap()
+        );
+        assert!(
+            !transition_text_preparation_state(&db, "retry", "failed", "pending", None,).unwrap()
+        );
+        assert!(
+            !transition_text_preparation_state(&db, "retry", "ready", "pending", None,).unwrap()
+        );
+
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE books SET preparation_state = 'ready' WHERE id = 'retry'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            transition_text_preparation_state(&db, "retry", "ready", "pending", None,).unwrap()
+        );
+        assert!(
+            !transition_text_preparation_state(&db, "retry", "ready", "pending", None,).unwrap()
+        );
+    }
+
+    #[test]
+    fn preparation_publish_requires_current_source_and_surviving_book() {
+        let (dir, db) = setup();
+        let document = sample_text_document("hash");
+
+        insert_text_preparation_book(&db, "current", "preparing", "hash");
+        let current_path = prepared_document_path(dir.path(), "current");
+        assert!(publish_current_text_preparation_job(
+            &db,
+            "current",
+            &text_preparation_source("current", "hash"),
+            &current_path,
+            &document,
+            1,
+        )
+        .unwrap());
+        assert!(current_path.exists());
+        let current_state: (String, i32) = db
+            .reader()
+            .query_row(
+                "SELECT preparation_state, pages FROM books WHERE id = 'current'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(current_state, ("ready".to_string(), 1));
+
+        insert_text_preparation_book(&db, "changed", "preparing", "new-hash");
+        let changed_path = prepared_document_path(dir.path(), "changed");
+        assert!(!publish_current_text_preparation_job(
+            &db,
+            "changed",
+            &text_preparation_source("changed", "old-hash"),
+            &changed_path,
+            &document,
+            1,
+        )
+        .unwrap());
+        assert!(!changed_path.exists());
+
+        insert_text_preparation_book(&db, "deleted", "preparing", "hash");
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM books WHERE id = 'deleted'", [])
+            .unwrap();
+        let deleted_path = prepared_document_path(dir.path(), "deleted");
+        assert!(!publish_current_text_preparation_job(
+            &db,
+            "deleted",
+            &text_preparation_source("deleted", "hash"),
+            &deleted_path,
+            &document,
+            1,
+        )
+        .unwrap());
+        assert!(!deleted_path.exists());
     }
 
     #[test]
@@ -2499,5 +4470,94 @@ mod tests {
             .unwrap();
         let bytes = stored.expect("cover_data BLOB present");
         assert_eq!(&bytes[..3], &[0xFF, 0xD8, 0xFF], "stored bytes are JPEG");
+    }
+
+    #[test]
+    fn delete_book_removes_book_notes_and_markers_but_detaches_global_notes() {
+        let (_dir, db) = setup();
+        insert_book(&db, "b1", "epub");
+        let now = chrono::Utc::now().timestamp_millis();
+        let marker_id = crate::sync::events::word_mark_rule_id("b1", "term", "exact");
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO notes
+                 (id, book_id, anchor_kind, normalized_word, scope, location, selected_text,
+                  content, content_format, created_at, updated_at)
+                 VALUES ('note-book', 'b1', 'word', 'term', 'book', NULL, 'term',
+                         'book note', 'plain_text', ?1, ?1)",
+                params![now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO notes
+                 (id, book_id, anchor_kind, normalized_word, scope, location, selected_text,
+                  content, content_format, created_at, updated_at)
+                 VALUES ('note-global', 'b1', 'word', 'term', 'global', NULL, 'term',
+                         'global note', 'plain_text', ?1, ?1)",
+                params![now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO word_mark_rules
+                 (id, book_id, normalized_word, display_word, match_mode, color, enabled,
+                  created_at, updated_at)
+                 VALUES (?1, 'b1', 'term', 'Term', 'exact', 'lookup', 1, ?2, ?2)",
+                params![marker_id, now],
+            )
+            .unwrap();
+        }
+
+        let sync = SyncWriter::new("dev-A".into());
+        do_delete_book("b1", &db, &sync).unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let notes: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT id, book_id FROM notes ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(notes, vec![("note-global".into(), None)]);
+        let marker_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM word_mark_rules", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(marker_count, 0);
+    }
+
+    #[test]
+    fn delete_book_can_preserve_book_notes_as_detached_material() {
+        let (_dir, db) = setup();
+        insert_book(&db, "b1", "epub");
+        let now = chrono::Utc::now().timestamp_millis();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO notes
+                 (id, book_id, anchor_kind, normalized_word, scope, location, selected_text,
+                  content, content_format, created_at, updated_at)
+                 VALUES ('note-book', 'b1', 'selection', NULL, 'book', 'epubcfi(/6/4!)',
+                         'quoted passage', 'my note', 'plain_text', ?1, ?1)",
+                params![now],
+            )
+            .unwrap();
+        }
+
+        let sync = SyncWriter::new("dev-A".into());
+        do_delete_book_with_note_policy("b1", true, &db, &sync).unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let note: (Option<String>, String, Option<String>, String) = conn
+            .query_row(
+                "SELECT book_id, scope, location, selected_text FROM notes WHERE id = 'note-book'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            note,
+            (None, "detached".into(), None, "quoted passage".into())
+        );
     }
 }

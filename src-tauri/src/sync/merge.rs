@@ -29,7 +29,7 @@ use crate::error::{AppError, AppResult};
 
 use super::events::{
     BookImportPayload, BookmarkPayload, ChatMessagePayload, Event, EventBody, HighlightPayload,
-    VocabPayload,
+    NotePayload, VocabPayload, WordMarkPayload,
 };
 
 /// Fold `event` into `tx`. Idempotent — applying the same event twice is a
@@ -89,6 +89,11 @@ pub fn apply_event(tx: &Transaction, event: &Event) -> AppResult<()> {
         ),
         EventBody::VocabDelete { id } => apply_vocab_delete(tx, event, id),
 
+        EventBody::NoteUpsert(payload) => apply_note_upsert(tx, event, payload),
+        EventBody::NoteDelete { id } => apply_note_delete(tx, event, id),
+        EventBody::WordMarkUpsert(payload) => apply_word_mark_upsert(tx, event, payload),
+        EventBody::WordMarkDelete { id } => apply_word_mark_delete(tx, event, id),
+
         EventBody::TranslationAdd(_) | EventBody::TranslationDelete { .. } => Ok(()),
 
         EventBody::CollectionCreate {
@@ -131,6 +136,8 @@ pub mod entity {
     pub const HIGHLIGHT: &str = "highlight";
     pub const BOOKMARK: &str = "bookmark";
     pub const VOCAB: &str = "vocab";
+    pub const NOTE: &str = "note";
+    pub const WORD_MARK: &str = "word_mark";
     pub const COLLECTION: &str = "collection";
     /// Composite-key entity for `collection_books`. Id format:
     /// `"<collection_id>:<book_id>"`.
@@ -146,6 +153,19 @@ pub fn is_tombstoned(tx: &Transaction, entity: &str, id: &str) -> AppResult<bool
         |r| r.get(0),
     )?;
     Ok(exists)
+}
+
+pub fn tombstone_timestamp(tx: &Transaction, entity: &str, id: &str) -> AppResult<Option<i64>> {
+    tx.query_row(
+        "SELECT ts FROM _tombstones WHERE entity = ?1 AND id = ?2",
+        params![entity, id],
+        |row| row.get(0),
+    )
+    .map(Some)
+    .or_else(|error| match error {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        other => Err(other.into()),
+    })
 }
 
 pub fn insert_tombstone(tx: &Transaction, entity: &str, id: &str, ts: i64) -> AppResult<()> {
@@ -206,6 +226,18 @@ pub fn cascade_delete(tx: &Transaction, entity: &str, id: &str, ts: i64) -> AppR
             tx.execute("DELETE FROM vocab_words WHERE id = ?1", params![id])?;
             Ok(())
         }
+        entity::NOTE => {
+            tx.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
+            Ok(())
+        }
+        entity::WORD_MARK => {
+            tx.execute(
+                "UPDATE word_mark_rules SET enabled = 0, updated_at = MAX(updated_at, ?2)
+                 WHERE id = ?1",
+                params![id, ts],
+            )?;
+            Ok(())
+        }
         "translation" => Ok(()),
         entity::CHAT_MESSAGE => {
             tx.execute("DELETE FROM chat_messages WHERE id = ?1", params![id])?;
@@ -237,6 +269,18 @@ fn cascade_delete_book(tx: &Transaction, id: &str, ts: i64) -> AppResult<()> {
     tx.execute("DELETE FROM highlights WHERE book_id = ?1", params![id])?;
     tx.execute("DELETE FROM vocab_words WHERE book_id = ?1", params![id])?;
     tx.execute("DELETE FROM lookup_records WHERE book_id = ?1", params![id])?;
+    tx.execute(
+        "DELETE FROM word_mark_rules WHERE book_id = ?1",
+        params![id],
+    )?;
+    tx.execute(
+        "DELETE FROM notes WHERE book_id = ?1 AND scope = 'book'",
+        params![id],
+    )?;
+    tx.execute(
+        "UPDATE notes SET book_id = NULL WHERE book_id = ?1 AND scope = 'global'",
+        params![id],
+    )?;
     tx.execute(
         "DELETE FROM collection_books WHERE book_id = ?1",
         params![id],
@@ -607,6 +651,121 @@ fn apply_vocab_delete(tx: &Transaction, event: &Event, id: &str) -> AppResult<()
 }
 
 // ---------------------------------------------------------------------------
+// notes and whole-book word markers
+// ---------------------------------------------------------------------------
+
+fn apply_note_upsert(tx: &Transaction, event: &Event, payload: &NotePayload) -> AppResult<()> {
+    if is_tombstoned(tx, entity::NOTE, &payload.id)? {
+        return Ok(());
+    }
+    let effective_book_id = match payload.book_id.as_deref() {
+        Some(book_id) if parent_tombstoned(tx, &[(entity::BOOK, book_id)])? => {
+            if payload.scope == "book" {
+                return Ok(());
+            }
+            None
+        }
+        value => value,
+    };
+    if effective_book_id.is_none() && payload.book_id.is_some() {
+        // Parent deletion is an invariant, not a competing note edit. Repair
+        // rows reattached by an older client even if their note LWW tuple is
+        // newer than this incoming edit.
+        tx.execute(
+            "UPDATE notes SET book_id = NULL WHERE id = ?1",
+            params![payload.id],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO notes (id, book_id, anchor_kind, normalized_word, scope, location, selected_text, content, content_format, created_at, updated_at, updated_by_device)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT(id) DO UPDATE SET book_id = excluded.book_id, anchor_kind = excluded.anchor_kind,
+           normalized_word = excluded.normalized_word, scope = excluded.scope, location = excluded.location,
+           selected_text = excluded.selected_text, content = excluded.content,
+           content_format = excluded.content_format, updated_at = excluded.updated_at,
+           updated_by_device = excluded.updated_by_device
+         WHERE notes.updated_at < excluded.updated_at
+            OR (notes.updated_at = excluded.updated_at AND notes.updated_by_device < excluded.updated_by_device)",
+        params![
+            payload.id,
+            effective_book_id,
+            payload.anchor_kind,
+            payload.normalized_word,
+            payload.scope,
+            payload.location,
+            payload.selected_text,
+            payload.content,
+            payload.content_format,
+            payload.created_at,
+            event.ts,
+            event.device,
+        ],
+    )?;
+    Ok(())
+}
+
+fn apply_note_delete(tx: &Transaction, event: &Event, id: &str) -> AppResult<()> {
+    tx.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
+    insert_tombstone(tx, entity::NOTE, id, event.ts)
+}
+
+fn apply_word_mark_upsert(
+    tx: &Transaction,
+    event: &Event,
+    payload: &WordMarkPayload,
+) -> AppResult<()> {
+    if parent_tombstoned(tx, &[(entity::BOOK, &payload.book_id)])? {
+        return Ok(());
+    }
+    // Early development builds represented cancellation as a permanent
+    // tombstone. A later full upsert supersedes it; an older upsert does not.
+    if tombstone_timestamp(tx, entity::WORD_MARK, &payload.id)?
+        .is_some_and(|deleted_at| deleted_at >= event.ts)
+    {
+        return Ok(());
+    }
+    tx.execute(
+        "DELETE FROM _tombstones WHERE entity = ?1 AND id = ?2",
+        params![entity::WORD_MARK, payload.id],
+    )?;
+    tx.execute(
+        "INSERT INTO word_mark_rules (id, book_id, normalized_word, display_word, match_mode, color, enabled, created_at, updated_at, updated_by_device)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(book_id, normalized_word, match_mode) DO UPDATE SET id = excluded.id,
+           display_word = excluded.display_word, color = excluded.color,
+           enabled = excluded.enabled, updated_at = excluded.updated_at,
+           updated_by_device = excluded.updated_by_device
+         WHERE word_mark_rules.updated_at < excluded.updated_at
+            OR (word_mark_rules.updated_at = excluded.updated_at AND word_mark_rules.updated_by_device < excluded.updated_by_device)",
+        params![
+            payload.id,
+            payload.book_id,
+            payload.normalized_word,
+            payload.display_word,
+            payload.match_mode,
+            payload.color,
+            payload.enabled as i64,
+            payload.created_at,
+            event.ts,
+            event.device,
+        ],
+    )?;
+    Ok(())
+}
+
+fn apply_word_mark_delete(tx: &Transaction, event: &Event, id: &str) -> AppResult<()> {
+    // Compatibility for logs produced by the first development build. New
+    // commands publish WordMarkUpsert(enabled=false), but replaying the legacy
+    // delete should converge to the same disabled state when the row exists.
+    tx.execute(
+        "UPDATE word_mark_rules SET enabled = 0, updated_at = ?2, updated_by_device = ?3
+         WHERE id = ?1 AND (updated_at < ?2 OR (updated_at = ?2 AND updated_by_device < ?3))",
+        params![id, event.ts, event.device],
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // collections + collection_books
 // ---------------------------------------------------------------------------
 
@@ -863,6 +1022,35 @@ mod tests {
         })
     }
 
+    fn note(id: &str, book: &str, scope: &str, content: &str, created_at: i64) -> EventBody {
+        EventBody::NoteUpsert(NotePayload {
+            id: id.into(),
+            book_id: Some(book.into()),
+            anchor_kind: "word".into(),
+            normalized_word: Some("term".into()),
+            scope: scope.into(),
+            location: Some("epubcfi(/6/4!)".into()),
+            selected_text: Some("term".into()),
+            content: content.into(),
+            content_format: "plain_text".into(),
+            created_at,
+        })
+    }
+
+    fn word_mark(book: &str, enabled: bool, color: &str, created_at: i64) -> EventBody {
+        let normalized_word = "term".to_string();
+        EventBody::WordMarkUpsert(WordMarkPayload {
+            id: word_mark_rule_id(book, &normalized_word, "exact"),
+            book_id: book.into(),
+            normalized_word,
+            display_word: "Term".into(),
+            match_mode: "exact".into(),
+            color: color.into(),
+            enabled,
+            created_at,
+        })
+    }
+
     // -----------------------------------------------------------------------
     // book.import / book.delete + tombstone semantics
     // -----------------------------------------------------------------------
@@ -909,6 +1097,89 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tomb, 1);
+    }
+
+    #[test]
+    fn book_delete_cascades_learning_tools_and_late_global_note_stays_detached() {
+        let mut db = open_db();
+        apply_all(
+            &mut db,
+            &[
+                ev(1000, "dev-A", import_book("b1")),
+                ev(
+                    1100,
+                    "dev-A",
+                    note("note-book", "b1", "book", "book note", 1100),
+                ),
+                ev(
+                    1200,
+                    "dev-A",
+                    note("note-global", "b1", "global", "global note", 1200),
+                ),
+                ev(1300, "dev-A", word_mark("b1", true, "lookup", 1300)),
+                ev(2000, "dev-B", EventBody::BookDelete { id: "b1".into() }),
+                // An offline peer may publish a newer edit that still carries
+                // the deleted source book. Content should merge, but the
+                // parent link must remain detached.
+                ev(
+                    2100,
+                    "dev-A",
+                    note("note-global", "b1", "global", "edited later", 1200),
+                ),
+                ev(
+                    2200,
+                    "dev-A",
+                    note("note-book-late", "b1", "book", "must not return", 2200),
+                ),
+                ev(2300, "dev-A", word_mark("b1", true, "lookup", 2300)),
+            ],
+        );
+
+        let notes: Vec<(String, Option<String>, String)> = {
+            let mut statement = db
+                .prepare("SELECT id, book_id, content FROM notes ORDER BY id")
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(
+            notes,
+            vec![("note-global".to_string(), None, "edited later".to_string())]
+        );
+        let marker_count: i64 = db
+            .query_row("SELECT COUNT(*) FROM word_mark_rules", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(marker_count, 0);
+    }
+
+    #[test]
+    fn concurrent_same_word_rules_converge_to_one_stable_lww_row() {
+        let mut db = open_db();
+        apply_all(
+            &mut db,
+            &[
+                ev(1000, "dev-A", import_book("b1")),
+                ev(2000, "dev-A", word_mark("b1", true, "lookup", 2000)),
+                ev(2000, "dev-B", word_mark("b1", false, "muted", 2000)),
+            ],
+        );
+
+        let expected_id = word_mark_rule_id("b1", "term", "exact");
+        let row: (String, i64, String, String) = db
+            .query_row(
+                "SELECT id, enabled, color, updated_by_device FROM word_mark_rules",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (expected_id, 0, "muted".into(), "dev-B".into()));
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM word_mark_rules", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

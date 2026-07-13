@@ -1,6 +1,6 @@
 use rusqlite::params;
 use std::collections::HashMap;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::ai::router::{self, AiCredentialView, AiProfileView};
 use crate::db::Db;
@@ -33,13 +33,11 @@ pub fn get_all_settings(
 
     // Never expose secret values to the webview. The UI only needs to know
     // whether a key exists so it can preserve it when unrelated settings save.
-    let configured = router::list_credentials(&db, None)
-        .map(|credentials| credentials.iter().any(|credential| credential.enabled))
-        .unwrap_or_else(|_| {
-            secrets
-                .get("ai_api_key")
-                .is_some_and(|value| !value.trim().is_empty())
-        });
+    let configured = router::has_configured_service(&db, &secrets) || {
+        secrets
+            .get("ai_api_key")
+            .is_some_and(|value| !value.trim().is_empty())
+    };
     settings.insert("ai_api_key_configured".to_string(), configured.to_string());
 
     Ok(settings)
@@ -47,13 +45,11 @@ pub fn get_all_settings(
 
 #[tauri::command]
 pub fn ai_api_key_configured(db: State<'_, Db>, secrets: State<'_, Secrets>) -> bool {
-    router::list_credentials(&db, None)
-        .map(|credentials| credentials.iter().any(|credential| credential.enabled))
-        .unwrap_or_else(|_| {
-            secrets
-                .get("ai_api_key")
-                .is_some_and(|value| !value.trim().is_empty())
-        })
+    router::has_configured_service(&db, &secrets) || {
+        secrets
+            .get("ai_api_key")
+            .is_some_and(|value| !value.trim().is_empty())
+    }
 }
 
 #[tauri::command]
@@ -130,6 +126,46 @@ pub fn ai_active_profile(db: State<'_, Db>) -> AppResult<AiProfileView> {
 }
 
 #[tauri::command]
+pub fn ai_list_profiles(db: State<'_, Db>) -> AppResult<Vec<AiProfileView>> {
+    router::list_profiles(&db)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn ai_create_profile(
+    label: String,
+    provider: String,
+    auth_mode: String,
+    base_url: Option<String>,
+    model: String,
+    temperature: f64,
+    keep_alive: Option<String>,
+    enabled: Option<bool>,
+    db: State<'_, Db>,
+) -> AppResult<AiProfileView> {
+    router::create_profile(
+        &db,
+        label,
+        provider,
+        auth_mode,
+        base_url,
+        model,
+        temperature,
+        keep_alive,
+        enabled.unwrap_or(true),
+    )
+}
+
+#[tauri::command]
+pub fn ai_duplicate_profile(
+    id: String,
+    label: Option<String>,
+    db: State<'_, Db>,
+) -> AppResult<AiProfileView> {
+    router::duplicate_profile(&db, &id, label)
+}
+
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub fn ai_save_profile(
     id: String,
@@ -153,6 +189,73 @@ pub fn ai_save_profile(
         temperature,
         keep_alive,
     )
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn ai_update_profile(
+    id: String,
+    label: String,
+    provider: String,
+    auth_mode: String,
+    base_url: Option<String>,
+    model: String,
+    temperature: f64,
+    keep_alive: Option<String>,
+    db: State<'_, Db>,
+) -> AppResult<AiProfileView> {
+    router::save_profile(
+        &db,
+        id,
+        label,
+        provider,
+        auth_mode,
+        base_url,
+        model,
+        temperature,
+        keep_alive,
+    )
+}
+
+#[tauri::command]
+pub fn ai_set_profile_enabled(id: String, enabled: bool, db: State<'_, Db>) -> AppResult<()> {
+    router::set_profile_enabled(&db, &id, enabled)
+}
+
+#[tauri::command]
+pub fn ai_reorder_profiles(ids: Vec<String>, db: State<'_, Db>) -> AppResult<()> {
+    router::reorder_profiles(&db, &ids)
+}
+
+#[tauri::command]
+pub fn ai_delete_profile(
+    id: String,
+    db: State<'_, Db>,
+    secrets: State<'_, Secrets>,
+) -> AppResult<()> {
+    router::delete_profile(&db, &secrets, &id)
+}
+
+#[tauri::command]
+pub async fn ai_list_models(
+    profile_id: String,
+    provider: Option<String>,
+    auth_mode: Option<String>,
+    base_url: Option<String>,
+    db: State<'_, Db>,
+    secrets: State<'_, Secrets>,
+) -> AppResult<Vec<String>> {
+    router::list_models(&db, &secrets, &profile_id, provider, auth_mode, base_url).await
+}
+
+#[tauri::command]
+pub async fn ai_test_profile(
+    id: String,
+    app: AppHandle,
+    db: State<'_, Db>,
+    secrets: State<'_, Secrets>,
+) -> AppResult<router::AiConnectionTestResult> {
+    router::test_profile(&app, &db, &secrets, &id).await
 }
 
 #[tauri::command]
@@ -369,5 +472,25 @@ mod tests {
 pub fn open_settings_on_main(section: String, app: AppHandle) -> AppResult<()> {
     app.emit_to("main", "open-settings", &section)
         .map_err(|e| AppError::Other(e.to_string()))?;
+    Ok(())
+}
+
+/// Show the main window and switch its library surface from a reader window.
+#[tauri::command]
+pub fn open_library_on_main(filter: String, app: AppHandle) -> AppResult<()> {
+    const ALLOWED_FILTERS: &[&str] = &["all", "reading", "finished", "vocab", "chats", "notes"];
+    if !ALLOWED_FILTERS.contains(&filter.as_str()) && !filter.starts_with("collection:") {
+        return Err(AppError::Other("LIBRARY_FILTER_INVALID".to_string()));
+    }
+    app.emit_to("main", "open-library-filter", &filter)
+        .map_err(|error| AppError::Other(error.to_string()))?;
+    if let Some(window) = app.get_webview_window("main") {
+        window
+            .show()
+            .map_err(|error| AppError::Other(error.to_string()))?;
+        window
+            .set_focus()
+            .map_err(|error| AppError::Other(error.to_string()))?;
+    }
     Ok(())
 }

@@ -20,7 +20,7 @@ import AiPanel from "../components/AiPanel";
 import BookmarksPanel from "../components/BookmarksPanel";
 import ReaderSettings, { type ReaderSettingsState } from "../components/ReaderSettings";
 import { getFontFamily, getThemeStyles, getDefaultReaderTheme, getReaderCapabilities } from "../components/reader-settings";
-import ReaderContextMenu from "../components/ReaderContextMenu";
+import ReaderContextMenu, { type ReaderMenuAction } from "../components/ReaderContextMenu";
 import HighlightToolbar from "../components/HighlightToolbar";
 import LookupPopover from "../components/LookupPopover";
 import ExplainPopover from "../components/ExplainPopover";
@@ -29,9 +29,33 @@ import TranslationPopover from "../components/TranslationPopover";
 import TableOfContents from "../components/TableOfContents";
 import TextBookReader from "../components/TextBookReader";
 import { textLocation, type TextBookDocument } from "../components/text-book-location";
+import {
+  classifySelection,
+  applyWordMarkHighlights,
+  contextForRange,
+  isInteractiveReaderTarget,
+  normalizeInteractionText,
+  serializableRect,
+  selectedRange,
+  viewportRectForRange,
+  wordRangeAtPoint,
+  type ReaderInteraction,
+  type SerializableRect,
+} from "../components/reader-interaction";
+import {
+  planCfiHighlightMutation,
+  planTextHighlightMutation,
+  type HighlightMutationPlan,
+} from "../components/highlight-ranges";
 import { getBook, updateReadingProgress, checkBookAvailable, type Book, type BookAvailabilityStatus } from "../hooks/useBooks";
 import { getAllSettings } from "../hooks/useSettings";
 import type { Highlight } from "../hooks/useBookmarks";
+import {
+  DEFAULT_CARD_DESIGN_CONFIG,
+  LearningCardController,
+  parseCardDesignConfig,
+  type CardDesignConfigV1,
+} from "../components/learning-card";
 
 // foliate-js <foliate-view> web component interface
 /* eslint-disable @typescript-eslint/no-explicit-any -- foliate-js has no TS definitions */
@@ -62,6 +86,11 @@ interface LookupRecord {
 interface VocabMarker {
   cfi: string | null;
   mastery: string;
+}
+
+interface WordMarkRule {
+  normalized_word: string;
+  enabled: boolean;
 }
 
 type MarkerKind = "lookup" | "vocab";
@@ -227,6 +256,16 @@ const wordMarkerColor = {
   mastered: "__mastered__",
 };
 
+const readerMenuActionMap: Record<string, ReaderMenuAction> = {
+  define: "primary",
+  explain: "primary",
+  ask_ai: "ask-ai",
+  collect: "save",
+  highlight: "highlight",
+  translate: "translate",
+  copy: "copy",
+};
+
 const appWindow = getCurrentWebviewWindow();
 const isStandaloneWindow = appWindow.label.startsWith("reader-");
 
@@ -311,13 +350,12 @@ export default function Reader() {
   const [availabilityRetry, setAvailabilityRetry] = useState(0);
   const [readerError, setReaderError] = useState<string | null>(null);
   const [readerRetry, setReaderRetry] = useState(0);
-  const [contextMenu, setContextMenu] = useState<{
-    x: number;
-    y: number;
-    text: string;
-    sentence: string;
-    cfiRange?: string;
-  } | null>(null);
+  const [textInitialLocation, setTextInitialLocation] = useState<string | null>(null);
+  const [contextMenu, setContextMenu] = useState<ReaderInteraction | null>(null);
+  const [contextSelectionFullyHighlighted, setContextSelectionFullyHighlighted] = useState(false);
+  const [learningCardConfig, setLearningCardConfig] = useState<CardDesignConfigV1>(DEFAULT_CARD_DESIGN_CONFIG);
+  const [learningInteraction, setLearningInteraction] = useState<ReaderInteraction | null>(null);
+  const [readerRect, setReaderRect] = useState<SerializableRect | null>(null);
   const [aiContext, setAiContext] = useState<{ text: string; cfi?: string } | undefined>();
   const [initialChatId, setInitialChatId] = useState<string | undefined>();
   const [activeVocabCfi, setActiveVocabCfi] = useState<string | null>(null);
@@ -370,9 +408,11 @@ export default function Reader() {
     showMasteredMarkers: false,
   }));
   const readerSettingsRef = useRef(readerSettings);
+  const autoHighlightLookupsRef = useRef(true);
 
   const settingsAnchorRef = useRef<HTMLButtonElement>(null);
   const viewerRef = useRef<HTMLDivElement>(null);
+  const readerViewportRef = useRef<HTMLElement>(null);
   const viewRef = useRef<FoliateView | null>(null);
   const zoomRef = useRef<number | "fit">(zoom);
   const fitPctRef = useRef(100);
@@ -389,17 +429,21 @@ export default function Reader() {
   } | null>(null);
   const isDragging = useRef(false);
   const chaptersRef = useRef<TocChapter[]>([]);
-  const selectedTextRef = useRef<{ text: string; cfi: string } | null>(null);
+  const pendingWordClickRef = useRef<number | null>(null);
+  const contextMenuRequestRef = useRef(0);
+  const loadedInteractionDocumentsRef = useRef(new Set<Document>());
+  const wordMarkWordsRef = useRef<string[]>([]);
 
   const handleTextBookReady = useCallback((document: TextBookDocument) => {
-    const textChapters = document.chapters.map((chapter, index) => ({
-      title: chapter.title,
-      href: textLocation(index, 0, 0),
-      targetHref: textLocation(index, 0, 0),
-      depth: 0,
+    const textChapters = document.toc.map((entry) => ({
+      title: entry.title,
+      href: textLocation(entry.source_offset),
+      targetHref: textLocation(entry.source_offset),
+      depth: entry.depth,
     }));
     chaptersRef.current = textChapters;
     setChapters(textChapters);
+    setCurrentChapterIndex(0);
     setBookReady(true);
     setReaderError(null);
   }, []);
@@ -411,9 +455,45 @@ export default function Reader() {
     if (bookId) updateReadingProgress(bookId, nextProgress, textLocationValue).catch(() => {});
   }, [bookId]);
 
-  const handleTextBookSelection = useCallback(({ text, location: textLocationValue }: { text: string; location: string }) => {
-    selectedTextRef.current = { text, cfi: textLocationValue };
+  const cancelPendingWordClick = useCallback(() => {
+    if (pendingWordClickRef.current !== null) {
+      window.clearTimeout(pendingWordClickRef.current);
+      pendingWordClickRef.current = null;
+    }
   }, []);
+
+  const getHighlightMutationPlan = useCallback(async (
+    interaction: ReaderInteraction,
+    highlights: Highlight[],
+  ): Promise<HighlightMutationPlan | null> => (
+    interaction.source === "text"
+      ? planTextHighlightMutation(interaction.location, highlights, "yellow", interaction.text)
+      : planCfiHighlightMutation(interaction.location, highlights, "yellow", interaction.text)
+  ), []);
+
+  const openLearningInteraction = useCallback((interaction: ReaderInteraction) => {
+    cancelPendingWordClick();
+    if (interaction.trigger === "selection-contextmenu") {
+      const requestToken = ++contextMenuRequestRef.current;
+      setContextMenu(interaction);
+      setContextSelectionFullyHighlighted(false);
+      if (bookId) {
+        invoke<Highlight[]>("list_highlights", { bookId }).then(async (highlights) => {
+          if (contextMenuRequestRef.current !== requestToken) return;
+          const plan = await getHighlightMutationPlan(interaction, highlights);
+          if (contextMenuRequestRef.current !== requestToken) return;
+          setContextSelectionFullyHighlighted(plan?.fullyHighlighted ?? false);
+        }).catch(() => {});
+      }
+      return;
+    }
+    if (bookId && autoHighlightLookupsRef.current) {
+      invoke("ensure_word_mark_rule", { bookId, word: interaction.text, color: "lookup" })
+        .then(() => window.dispatchEvent(new CustomEvent("word-mark-changed", { detail: { bookId } })))
+        .catch(() => {});
+    }
+    setLearningInteraction(interaction);
+  }, [bookId, cancelPendingWordClick, getHighlightMutationPlan]);
 
   const handleTextBookError = useCallback((error: string) => {
     setReaderError(error);
@@ -462,6 +542,19 @@ export default function Reader() {
     depth: chapter.depth,
     disabled: !chapter.targetHref,
   })), [chapters]);
+
+  const chapterCounter = useMemo(() => {
+    const readingUnits = chapters
+      .map((chapter, index) => ({ chapter, index }))
+      .filter(({ chapter, index }) => chapters[index + 1]?.depth <= chapter.depth || index === chapters.length - 1)
+      .map(({ index }) => index);
+    if (readingUnits.length === 0) return null;
+    const current = readingUnits.findIndex((index) => index >= Math.max(0, currentChapterIndex));
+    return {
+      current: (current < 0 ? readingUnits.length - 1 : current) + 1,
+      total: readingUnits.length,
+    };
+  }, [chapters, currentChapterIndex]);
 
   const applyAnnotations = useCallback(async (reapplyVisible = false) => {
     const view = viewRef.current;
@@ -547,8 +640,12 @@ export default function Reader() {
     appliedAnnotationsRef.current.clear();
     navigationFlashRef.current.clear();
     markerSnapshotRef.current = null;
+    currentCfiRef.current = null;
+    setTextInitialLocation(null);
     getBook(bookId)
       .then((b) => {
+        currentCfiRef.current = b.current_cfi;
+        setTextInitialLocation(b.current_cfi);
         setBook(b);
         if (isStandaloneWindow && b) {
           appWindow.setTitle(b.title);
@@ -561,6 +658,8 @@ export default function Reader() {
       const saved = localStorage.getItem(`reader-settings-${bookId}`);
       const bookSettings = saved ? JSON.parse(saved) as Partial<ReaderSettingsState> : {};
       const g = globalSettings;
+      autoHighlightLookupsRef.current = g.auto_highlight_lookup_words !== "false";
+      setLearningCardConfig(parseCardDesignConfig(g.learning_card_config));
       setReaderSettings((prev) => ({
         ...prev,
         theme: bookSettings.theme || (g.reader_theme as ReaderSettingsState["theme"]) || prev.theme,
@@ -687,6 +786,7 @@ export default function Reader() {
 
     const container = viewerRef.current;
     container.innerHTML = "";
+    loadedInteractionDocumentsRef.current.clear();
     setBookReady(false);
     setReaderError(null);
 
@@ -694,6 +794,14 @@ export default function Reader() {
     let activeView: FoliateView | null = null;
 
     const initFoliate = async () => {
+      if (supportsWordMarkers && bookId) {
+        const rules = await invoke<WordMarkRule[]>("list_word_marks", { bookId }).catch(() => []);
+        wordMarkWordsRef.current = rules
+          .filter((rule) => rule.enabled)
+          .map((rule) => rule.normalized_word);
+      } else {
+        wordMarkWordsRef.current = [];
+      }
       // Load foliate-js web components (from public/ dir, loaded as native ES module)
       if (!customElements.get("foliate-view")) {
         await withTimeout(new Promise<void>((resolve, reject) => {
@@ -855,60 +963,34 @@ export default function Reader() {
       // Handle section loads — text selection, keyboard, highlights
       view.addEventListener("load", ((e: CustomEvent) => {
         const { doc, index } = e.detail;
-
-        // Text selection tracking
-        doc.addEventListener("mouseup", () => {
-          if (!supportsSelection) return;
-          const sel = doc.getSelection?.();
-          const text = sel?.toString().trim();
-          if (text && sel.rangeCount > 0) {
-            const range = sel.getRangeAt(0);
-            const cfi = view.getCFI(index, range);
-            selectedTextRef.current = { text, cfi };
-          }
-        });
+        if (loadedInteractionDocumentsRef.current.has(doc)) return;
+        loadedInteractionDocumentsRef.current.add(doc);
+        if (supportsWordMarkers) {
+          applyWordMarkHighlights(doc, wordMarkWordsRef.current);
+        }
 
         // Context menu inside content
-        // foliate-js renders in iframes; clientX/Y are relative to the
-        // iframe viewport. Use frameElement to get the iframe's offset.
         doc.addEventListener("contextmenu", (ev: MouseEvent) => {
-          ev.preventDefault();
+          cancelPendingWordClick();
           if (!supportsSelection) return;
-          const sel = doc.getSelection?.();
-          const text = sel?.toString().trim();
-          if (text) {
-            const iframe = doc.defaultView?.frameElement as HTMLElement | null;
-            let offsetX = 0, offsetY = 0;
-            if (iframe) {
-              const rect = iframe.getBoundingClientRect();
-              offsetX = rect.left;
-              offsetY = rect.top;
-            }
-            // Extract surrounding context from the containing block element
-            let sentence = text;
-            if (sel.rangeCount > 0) {
-              const range = sel.getRangeAt(0);
-              let node: Node | null = range.startContainer;
-              // Walk up to the nearest block-level element
-              const blockTags = new Set(["P", "DIV", "LI", "BLOCKQUOTE", "TD", "TH", "H1", "H2", "H3", "H4", "H5", "H6", "SECTION", "ARTICLE", "ASIDE", "FIGCAPTION", "DT", "DD"]);
-              while (node && node !== doc.body && !(node.nodeType === 1 && blockTags.has((node as Element).tagName))) {
-                node = node.parentNode;
-              }
-              // Fall back to body if no block element found
-              const contextNode = node && node !== doc.body ? node : range.startContainer.parentElement;
-              if (contextNode) {
-                const blockText = (contextNode as Element).textContent?.trim() || "";
-                sentence = blockText.length > 500 ? blockText.slice(0, 500) : blockText;
-              }
-            }
-            setContextMenu({
-              x: ev.clientX + offsetX,
-              y: ev.clientY + offsetY,
-              text,
-              sentence,
-              cfiRange: selectedTextRef.current?.cfi,
-            });
-          }
+          const range = selectedRange(doc);
+          if (!range) return;
+          const text = range.toString().trim();
+          const location = view.getCFI(index, range);
+          if (!text || !location) return;
+          ev.preventDefault();
+          openLearningInteraction({
+            trigger: "selection-contextmenu",
+            kind: classifySelection(text, doc.documentElement.lang || undefined),
+            text,
+            normalizedText: normalizeInteractionText(text),
+            context: contextForRange(range, text),
+            location,
+            anchorRect: viewportRectForRange(range),
+            source: "foliate",
+            format: book.format === "pdf" ? "pdf" : "epub",
+            locale: doc.documentElement.lang || undefined,
+          });
         });
 
         // Keyboard navigation inside content docs
@@ -930,11 +1012,40 @@ export default function Reader() {
           }
         });
 
-        // Click to dismiss context menu and highlight toolbar
-        doc.addEventListener("click", () => {
+        // A short delay keeps single-click lookup from racing double-click
+        // selection and Foliate's existing-annotation activation.
+        doc.addEventListener("click", (ev: MouseEvent) => {
           setContextMenu(null);
           setHighlightToolbar(null);
+          cancelPendingWordClick();
+          if (!supportsSelection || ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.altKey || ev.shiftKey) return;
+          if (isInteractiveReaderTarget(ev.target)) return;
+          const selection = doc.getSelection?.();
+          if (selection && !selection.isCollapsed) return;
+          const range = wordRangeAtPoint(doc, ev.clientX, ev.clientY, doc.documentElement.lang || undefined);
+          if (!range) return;
+          const text = range.toString().trim();
+          const location = view.getCFI(index, range);
+          const normalizedText = normalizeInteractionText(text);
+          if (!text || !normalizedText || !location) return;
+          const interaction: ReaderInteraction = {
+            trigger: "word-click",
+            kind: "word",
+            text,
+            normalizedText,
+            context: contextForRange(range, text),
+            location,
+            anchorRect: viewportRectForRange(range),
+            source: "foliate",
+            format: book.format === "pdf" ? "pdf" : "epub",
+            locale: doc.documentElement.lang || undefined,
+          };
+          pendingWordClickRef.current = window.setTimeout(() => {
+            pendingWordClickRef.current = null;
+            openLearningInteraction(interaction);
+          }, 180);
         });
+        doc.addEventListener("dblclick", cancelPendingWordClick);
 
         // Cross-iframe deselect: each PDF page renders in its own iframe
         // with its own Selection object, so clicking on a neighbor page
@@ -1014,6 +1125,7 @@ export default function Reader() {
       }) as EventListener);
 
       view.addEventListener("show-annotation", ((e: CustomEvent) => {
+        cancelPendingWordClick();
         const { value, range } = e.detail;
         const marker = autoMarkersRef.current.get(value);
         if (marker) {
@@ -1102,8 +1214,10 @@ export default function Reader() {
       setBookReady(false);
     });
 
+    const loadedDocuments = loadedInteractionDocumentsRef.current;
     return () => {
       cancelled = true;
+      cancelPendingWordClick();
       if (backButtonTimerRef.current !== null) {
         window.clearTimeout(backButtonTimerRef.current);
         backButtonTimerRef.current = null;
@@ -1114,6 +1228,7 @@ export default function Reader() {
         viewRef.current.remove();
         viewRef.current = null;
       }
+      loadedDocuments.clear();
     };
     // PDFs need a fresh `view` element when reading mode flips because
     // `pdf-mode="scroll"` is read once inside view.js's renderer pick.
@@ -1165,6 +1280,24 @@ export default function Reader() {
   useEffect(() => {
     refreshAnnotations().catch(() => {});
   }, [bookReady, markerVisibility, refreshAnnotations]);
+
+  useEffect(() => {
+    if (!bookId || !supportsWordMarkers || isTextBook) return;
+    const refresh = (event: Event) => {
+      const detail = (event as CustomEvent<{ bookId?: string }>).detail;
+      if (detail?.bookId && detail.bookId !== bookId) return;
+      invoke<WordMarkRule[]>("list_word_marks", { bookId }).then((rules) => {
+        wordMarkWordsRef.current = rules
+          .filter((rule) => rule.enabled)
+          .map((rule) => rule.normalized_word);
+        for (const doc of loadedInteractionDocumentsRef.current) {
+          applyWordMarkHighlights(doc, wordMarkWordsRef.current);
+        }
+      }).catch(() => {});
+    };
+    window.addEventListener("word-mark-changed", refresh);
+    return () => window.removeEventListener("word-mark-changed", refresh);
+  }, [bookId, isTextBook, supportsWordMarkers]);
 
   useEffect(() => {
     const refreshForCurrentBook = (event: Event) => {
@@ -1274,6 +1407,27 @@ export default function Reader() {
     };
   }, [bookReady, book?.format]);
 
+  useEffect(() => {
+    const element = readerViewportRef.current;
+    if (!element) return;
+    let frame = 0;
+    const update = () => {
+      if (frame) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        setReaderRect(serializableRect(element.getBoundingClientRect()));
+      });
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    window.addEventListener("resize", update);
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      observer.disconnect();
+      window.removeEventListener("resize", update);
+    };
+  }, []);
+
   const togglePanel = (panel: "ai" | "bookmarks" | "vocab") => {
     setSidePanel((prev) => (prev === panel ? null : panel));
   };
@@ -1299,34 +1453,6 @@ export default function Reader() {
       document.removeEventListener("keydown", handleKeyDown);
     };
   }, [book?.format, handleZoom]);
-
-  const handleContextMenu = useCallback((e: React.MouseEvent) => {
-    const selection = window.getSelection();
-    const text = selection?.toString().trim();
-    if (text) {
-      e.preventDefault();
-      let sentence = text;
-      if (selection && selection.rangeCount > 0) {
-        const range = selection.getRangeAt(0);
-        let node: Node | null = range.startContainer;
-        const blockTags = new Set(["P", "DIV", "LI", "BLOCKQUOTE", "TD", "TH", "H1", "H2", "H3", "H4", "H5", "H6"]);
-        while (node && !(node.nodeType === 1 && blockTags.has((node as Element).tagName))) {
-          node = node.parentNode;
-        }
-        if (node) {
-          const blockText = (node as Element).textContent?.trim() || "";
-          sentence = blockText.length > 500 ? blockText.slice(0, 500) : blockText;
-        }
-      }
-      setContextMenu({
-        x: e.clientX,
-        y: e.clientY,
-        text,
-        sentence,
-        cfiRange: selectedTextRef.current?.cfi || undefined,
-      });
-    }
-  }, []);
 
   const panelRef = useRef<HTMLDivElement>(null);
   const panelWidthRef = useRef(panelWidth);
@@ -1459,18 +1585,16 @@ export default function Reader() {
     if (!isStandaloneWindow) navigate(location.pathname, { replace: true });
   }, [bookReady, location.state, location.pathname, navigate]);
 
-  // Handle navigation state from DictionaryPage ("Open in Reader")
-  // Supports both location.state (main window) and URL search params (standalone window)
+  // Handle source navigation and the optional vocabulary side panel.
+  // Supports both location.state (main window) and URL search params (standalone window).
   useEffect(() => {
     const state = location.state as { openVocab?: boolean; cfi?: string } | null;
     const searchParams = new URLSearchParams(window.location.search);
     const openVocab = state?.openVocab || searchParams.get("openVocab") === "true";
     const cfi = state?.cfi || searchParams.get("cfi") || undefined;
-    if (!openVocab || !bookReady) return;
-    if (supportsCfiNavigation) {
-      setSidePanel("vocab");
-      if (cfi) flashNavigationTarget(cfi).catch(() => {});
-    }
+    if (!bookReady || (!openVocab && !cfi)) return;
+    if (openVocab) setSidePanel("vocab");
+    if (cfi && supportsCfiNavigation) flashNavigationTarget(cfi).catch(() => {});
     // Clear the state so it doesn't re-trigger
     if (!isStandaloneWindow) navigate(location.pathname, { replace: true });
   }, [bookReady, flashNavigationTarget, location.state, location.pathname, navigate, supportsCfiNavigation]);
@@ -1641,7 +1765,7 @@ export default function Reader() {
                 <span className="text-[13px] text-text-muted leading-4">
                   {book.format === "pdf"
                     ? pageInfo ? t("reader.pageOf", { current: pageInfo.current, total: pageInfo.total }) : ""
-                    : chapters.length > 0 ? t("reader.chapterOf", { current: currentChapterIndex + 1, total: chapters.length }) : ""}
+                    : chapterCounter ? t("reader.chapterOf", chapterCounter) : ""}
                 </span>
               </div>
             </>
@@ -1657,7 +1781,7 @@ export default function Reader() {
             <span className="text-[12px] leading-4 opacity-60">
               {book.format === "pdf"
                 ? pageInfo ? t("reader.pageOf", { current: pageInfo.current, total: pageInfo.total }) : ""
-                : chapters.length > 0 ? t("reader.chapterOf", { current: currentChapterIndex + 1, total: chapters.length }) : ""}
+                : chapterCounter ? t("reader.chapterOf", chapterCounter) : ""}
             </span>
           </div>
         )}
@@ -1755,9 +1879,9 @@ export default function Reader() {
         />
         <div className="flex-1 flex flex-col min-w-0" style={{ backgroundColor: getThemeStyles(readerSettings.theme).body }}>
           <main
+            ref={readerViewportRef}
             className="flex-1 relative overflow-hidden"
             style={{ backgroundColor: getThemeStyles(readerSettings.theme).body }}
-            onContextMenu={handleContextMenu}
             onClick={() => {
               setSettingsOpen(false);
               // Clicks inside the iframe (text content) don't bubble out
@@ -1773,11 +1897,11 @@ export default function Reader() {
               <TextBookReader
                 key={`${book.id}:${readerRetry}`}
                 bookId={book.id}
-                initialLocation={book.current_cfi}
+                initialLocation={textInitialLocation}
                 settings={readerSettings}
                 onReady={handleTextBookReady}
                 onProgress={handleTextBookProgress}
-                onSelection={handleTextBookSelection}
+                onInteraction={openLearningInteraction}
                 onError={handleTextBookError}
                 onRegisterNavigation={registerTextBookNavigation}
                 onHighlightClick={handleTextHighlightClick}
@@ -1923,77 +2047,102 @@ export default function Reader() {
       {/* Context Menu */}
       {contextMenu && (
         <ReaderContextMenu
-          x={contextMenu.x}
-          y={contextMenu.y}
+          x={contextMenu.anchorRect.right}
+          y={contextMenu.anchorRect.top}
           text={contextMenu.text}
-          onClose={() => setContextMenu(null)}
+          kind={contextMenu.kind}
+          highlighted={contextSelectionFullyHighlighted}
+          order={learningCardConfig.selectionMenus[contextMenu.kind === "passage" ? "passage" : "phrase"]
+            .filter((item) => item.enabled)
+            .map((item) => readerMenuActionMap[item.id])}
+          onClose={() => {
+            contextMenuRequestRef.current += 1;
+            setContextMenu(null);
+          }}
           onCopy={() => {
             navigator.clipboard.writeText(contextMenu.text);
             setContextMenu(null);
           }}
           onExplain={() => {
-            const chapterTitle = currentChapterIndex >= 0 && currentChapterIndex < chapters.length
-              ? chapters[currentChapterIndex].title
-              : undefined;
-            setExplain({
-              x: contextMenu.x,
-              y: contextMenu.y,
-              text: contextMenu.text,
-              sentence: contextMenu.sentence,
-              bookTitle: book?.title,
-              chapter: chapterTitle,
-              cfi: contextMenu.cfiRange,
-            });
+            setLearningInteraction(contextMenu);
             setContextMenu(null);
           }}
           onQuote={() => {
             setAiContext({
               text: contextMenu.text,
-              cfi: contextMenu.cfiRange,
+              cfi: contextMenu.location,
             });
             setSidePanel("ai");
             setContextMenu(null);
           }}
           onLookup={() => {
-            const chapterTitle = currentChapterIndex >= 0 && currentChapterIndex < chapters.length
-              ? chapters[currentChapterIndex].title
-              : undefined;
-            setLookup({
-              x: contextMenu.x,
-              y: contextMenu.y,
-              word: contextMenu.text,
-              sentence: contextMenu.sentence,
-              bookTitle: book?.title,
-              chapter: chapterTitle,
-              cfi: contextMenu.cfiRange,
-            });
+            setLearningInteraction(contextMenu);
             setContextMenu(null);
           }}
           onTranslate={() => {
             setTranslation({
-              x: contextMenu.x,
-              y: contextMenu.y,
+              x: contextMenu.anchorRect.right,
+              y: contextMenu.anchorRect.top,
               text: contextMenu.text,
-              context: contextMenu.sentence,
-              cfi: contextMenu.cfiRange,
+              context: contextMenu.context,
+              cfi: contextMenu.location,
             });
             setContextMenu(null);
           }}
-          onHighlight={supportsManualAnnotations ? ((color) => {
-            const cfiRange = contextMenu.cfiRange;
-            if (cfiRange && bookId) {
-              invoke<Highlight>("add_highlight", {
+          onSave={() => {
+            if (!bookId) return;
+            invoke("add_vocab_word", {
+              bookId,
+              word: contextMenu.text,
+              definition: "",
+              contextSentence: contextMenu.context || null,
+              contextExplanation: null,
+              cfi: contextMenu.location || null,
+            }).then(() => {
+              window.dispatchEvent(new CustomEvent("vocab-changed", { detail: { bookId, cfi: contextMenu.location } }));
+            }).catch((error) => console.error("Failed to save selection:", error));
+            setContextMenu(null);
+          }}
+          onToggleHighlight={supportsManualAnnotations ? (() => {
+            const interaction = contextMenu;
+            contextMenuRequestRef.current += 1;
+            setContextMenu(null);
+            if (!interaction.location || !bookId) return;
+            invoke<Highlight[]>("list_highlights", { bookId }).then(async (highlights) => {
+              const plan = await getHighlightMutationPlan(interaction, highlights);
+              if (!plan) return;
+              return invoke<Highlight[]>("replace_highlights", {
                 bookId,
-                cfiRange,
-                color,
-                textContent: contextMenu.text,
+                removeIds: plan.removeIds,
+                additions: plan.additions,
               }).then(async () => {
                 window.dispatchEvent(new CustomEvent("highlight-changed", { detail: { bookId } }));
                 await refreshAnnotations();
-              }).catch((err) => console.error("Failed to add highlight:", err));
-            }
-            setContextMenu(null);
+              });
+            }).catch((err) => console.error("Failed to toggle highlight:", err));
           }) : undefined}
+        />
+      )}
+
+      {learningInteraction && bookId && (
+        <LearningCardController
+          key={`${learningInteraction.kind}:${learningInteraction.location}:${learningInteraction.text}`}
+          interaction={learningInteraction}
+          bookId={bookId}
+          bookTitle={book?.title}
+          chapter={currentChapterIndex >= 0 && currentChapterIndex < chapters.length
+            ? chapters[currentChapterIndex].title
+            : undefined}
+          config={learningCardConfig}
+          readerRect={readerRect}
+          onClose={() => setLearningInteraction(null)}
+          onAskAi={(quote, cfi) => {
+            setAiContext({ text: quote, cfi });
+            setSidePanel("ai");
+          }}
+          onViewAllNotes={() => {
+            invoke("open_library_on_main", { filter: "notes" }).catch(() => {});
+          }}
         />
       )}
 

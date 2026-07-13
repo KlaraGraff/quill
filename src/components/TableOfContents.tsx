@@ -46,6 +46,10 @@ export default function TableOfContents({
     }
     return result;
   }, [chapters]);
+  const readingUnitCount = useMemo(
+    () => rows.filter((row) => !row.hasChildren).length,
+    [rows],
+  );
 
   const rowsByPage = useMemo(() => new Map(rows.map((row) => [row.page, row])), [rows]);
 
@@ -54,7 +58,7 @@ export default function TableOfContents({
     let row = rowsByPage.get(currentPage);
     while (row) {
       path.push(row.page);
-      row = row.parentPage ? rowsByPage.get(row.parentPage) : undefined;
+      row = row.parentPage !== undefined ? rowsByPage.get(row.parentPage) : undefined;
     }
     return path;
   }, [currentPage, rowsByPage]);
@@ -78,7 +82,7 @@ export default function TableOfContents({
 
   const visibleRows = useMemo(() => rows.filter((row) => {
     let parentPage = row.parentPage;
-    while (parentPage) {
+    while (parentPage !== undefined) {
       if (!expandedPages.has(parentPage)) return false;
       parentPage = rowsByPage.get(parentPage)?.parentPage;
     }
@@ -112,7 +116,7 @@ export default function TableOfContents({
           {t("reader.tocTitle")}
         </h2>
         <p className="text-[12px] text-text-muted leading-4 mt-0.5">
-          {t("reader.tocCount", { count: chapters.length })}
+          {t("reader.tocCount", { count: readingUnitCount })}
         </p>
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto px-3 py-3">

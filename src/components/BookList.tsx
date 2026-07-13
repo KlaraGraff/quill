@@ -6,6 +6,7 @@ import { deleteBook, markFinished, retryTextBookPreparation, updateBookStatus } 
 import BookContextMenu from "./BookContextMenu";
 import EditMetadataModal from "./EditMetadataModal";
 import { useTranslation } from "react-i18next";
+import DeleteBookDialog, { type DeleteBookNotePolicy } from "./DeleteBookDialog";
 
 function CoverImage({ src, alt, title }: { src: string; alt: string; title: string }) {
   const [failed, setFailed] = useState(false);
@@ -43,6 +44,7 @@ export default function BookList({ books, hasMore, loadMore, loadingMore, active
     book: Book;
   } | null>(null);
   const [editBook, setEditBook] = useState<Book | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Book | null>(null);
 
   const handleContextMenu = (e: React.MouseEvent, book: Book) => {
     e.preventDefault();
@@ -174,12 +176,23 @@ export default function BookList({ books, hasMore, loadMore, loadingMore, active
             setEditBook(contextMenu.book);
             setContextMenu(null);
           }}
-          onDelete={async () => {
-            await deleteBook(contextMenu.book.id);
+          onDelete={() => {
+            setDeleteTarget(contextMenu.book);
             setContextMenu(null);
-            onBooksChanged?.();
           }}
           onBooksChanged={onBooksChanged}
+        />
+      )}
+
+      {deleteTarget && (
+        <DeleteBookDialog
+          title={deleteTarget.title}
+          onCancel={() => setDeleteTarget(null)}
+          onConfirm={async (policy: DeleteBookNotePolicy) => {
+            await deleteBook(deleteTarget.id, policy === "preserve");
+            setDeleteTarget(null);
+            onBooksChanged?.();
+          }}
         />
       )}
 

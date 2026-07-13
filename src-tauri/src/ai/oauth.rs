@@ -164,11 +164,7 @@ pub async fn exchange_code(code: &str, verifier: &str) -> AppResult<TokenRespons
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(AppError::Other(format!(
-            "Token exchange error {}: {}",
-            status, body
-        )));
+        return Err(AppError::Other(format!("Token exchange error {status}")));
     }
 
     resp.json::<TokenResponse>()
@@ -192,11 +188,7 @@ pub async fn refresh_access_token(refresh_token: &str) -> AppResult<TokenRespons
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(AppError::Other(format!(
-            "Token refresh error {}: {}",
-            status, body
-        )));
+        return Err(AppError::Other(format!("Token refresh error {status}")));
     }
 
     resp.json::<TokenResponse>()

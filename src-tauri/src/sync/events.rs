@@ -14,10 +14,39 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
-/// Schema version carried on every event. Bump when adding new fields that
-/// old clients cannot safely ignore.
-pub const EVENT_SCHEMA_VERSION: u32 = 1;
+/// Schema version written by this client. Version 2 introduces learning notes
+/// and whole-book word-marker rules. Readers retain v1 support so an existing
+/// log can be replayed after upgrading, while older clients reject the v2
+/// envelope instead of advancing their watermark past data they cannot apply.
+pub const EVENT_SCHEMA_VERSION: u32 = 2;
+pub const MIN_SUPPORTED_EVENT_SCHEMA_VERSION: u32 = 1;
+
+pub fn is_supported_event_schema_version(version: u32) -> bool {
+    (MIN_SUPPORTED_EVENT_SCHEMA_VERSION..=EVENT_SCHEMA_VERSION).contains(&version)
+}
+
+/// Canonical form shared by commands, event validation, and stable marker IDs.
+pub fn normalize_learning_term(value: &str) -> String {
+    value
+        .trim_matches(|character: char| !character.is_alphanumeric() && character != '\'')
+        .to_lowercase()
+}
+
+/// A word-marker rule is one logical entity across every device. Deriving its
+/// id from the natural key prevents concurrent first-lookups from minting two
+/// UUIDs for the same `(book, word, match_mode)` row.
+pub fn word_mark_rule_id(book_id: &str, normalized_word: &str, match_mode: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"quill-word-mark-rule-v1\0");
+    hasher.update(book_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(normalized_word.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(match_mode.as_bytes());
+    format!("word-mark-{:x}", hasher.finalize())
+}
 
 /// One log line. Fields after `v` come from the tagged body and any unknown
 /// future fields land in `extra`.
@@ -99,6 +128,16 @@ pub enum EventBody {
     },
     #[serde(rename = "vocab.delete")]
     VocabDelete { id: String },
+
+    #[serde(rename = "note.upsert")]
+    NoteUpsert(NotePayload),
+    #[serde(rename = "note.delete")]
+    NoteDelete { id: String },
+
+    #[serde(rename = "word_mark.upsert")]
+    WordMarkUpsert(WordMarkPayload),
+    #[serde(rename = "word_mark.delete")]
+    WordMarkDelete { id: String },
 
     // Legacy no-op: saved translations were removed in #263. Keep these
     // variants so old peer logs deserialize and replay harmlessly.
@@ -221,6 +260,32 @@ pub struct VocabPayload {
     // populate it (legacy rows, iOS clients pre-update).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_explanation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NotePayload {
+    pub id: String,
+    pub book_id: Option<String>,
+    pub anchor_kind: String,
+    pub normalized_word: Option<String>,
+    pub scope: String,
+    pub location: Option<String>,
+    pub selected_text: Option<String>,
+    pub content: String,
+    pub content_format: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WordMarkPayload {
+    pub id: String,
+    pub book_id: String,
+    pub normalized_word: String,
+    pub display_word: String,
+    pub match_mode: String,
+    pub color: String,
+    pub enabled: bool,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -369,6 +434,53 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_learning_tool_events() {
+        roundtrip(&mk(EventBody::NoteUpsert(NotePayload {
+            id: "note-1".into(),
+            book_id: Some("b1".into()),
+            anchor_kind: "word".into(),
+            normalized_word: Some("serendipity".into()),
+            scope: "global".into(),
+            location: Some("epubcfi(/6/4!)".into()),
+            selected_text: Some("serendipity".into()),
+            content: "Remember the positive connotation.".into(),
+            content_format: "plain_text".into(),
+            created_at: 1_714_770_000_000,
+        })));
+        roundtrip(&mk(EventBody::NoteDelete {
+            id: "note-1".into(),
+        }));
+
+        let normalized = normalize_learning_term("Serendipity");
+        let marker_id = word_mark_rule_id("b1", &normalized, "exact");
+        roundtrip(&mk(EventBody::WordMarkUpsert(WordMarkPayload {
+            id: marker_id.clone(),
+            book_id: "b1".into(),
+            normalized_word: normalized,
+            display_word: "Serendipity".into(),
+            match_mode: "exact".into(),
+            color: "lookup".into(),
+            enabled: true,
+            created_at: 1_714_770_000_000,
+        })));
+        roundtrip(&mk(EventBody::WordMarkDelete { id: marker_id }));
+    }
+
+    #[test]
+    fn word_mark_ids_are_stable_for_the_natural_key() {
+        let normalized = normalize_learning_term("  Interfaces, ");
+        assert_eq!(normalized, "interfaces");
+        assert_eq!(
+            word_mark_rule_id("book-1", &normalized, "exact"),
+            word_mark_rule_id("book-1", "interfaces", "exact")
+        );
+        assert_ne!(
+            word_mark_rule_id("book-1", "interfaces", "exact"),
+            word_mark_rule_id("book-2", "interfaces", "exact")
+        );
+    }
+
+    #[test]
     fn vocab_payload_decodes_without_context_explanation() {
         // Older clients (pre-#214) emit payloads without this field. Make sure
         // they decode and re-serialize without injecting a null key.
@@ -474,7 +586,7 @@ mod tests {
         let v: Value = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
         assert_eq!(v["type"], "book.delete");
         assert_eq!(v["payload"]["id"], "b1");
-        assert_eq!(v["v"], 1);
+        assert_eq!(v["v"], EVENT_SCHEMA_VERSION);
         assert_eq!(v["ts"], 1_714_770_000_000_i64);
     }
 

@@ -25,6 +25,7 @@ export default function SettingsModal({ open, onClose, initialSection = "general
   const [activeSection, setActiveSection] = useState<SettingsSection>(initialSection);
   const { settings, loading, save, saveBulk } = useSettings();
   const modalRef = useRef<HTMLDivElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
 
   // Toast state
   const [showToast, setShowToast] = useState(false);
@@ -43,11 +44,49 @@ export default function SettingsModal({ open, onClose, initialSection = "general
 
   useEffect(() => {
     if (!open) return;
+    previousFocusRef.current = document.activeElement as HTMLElement | null;
+    const modal = modalRef.current;
+    const focusableSelector = [
+      "button:not([disabled])",
+      "[href]",
+      "input:not([disabled])",
+      "select:not([disabled])",
+      "textarea:not([disabled])",
+      "[tabindex]:not([tabindex='-1'])",
+    ].join(",");
+    window.requestAnimationFrame(() => {
+      modal?.querySelector<HTMLElement>(focusableSelector)?.focus();
+    });
     const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+        return;
+      }
+      if (e.key !== "Tab" || !modal) return;
+      const focusable = Array.from(modal.querySelectorAll<HTMLElement>(focusableSelector))
+        .filter((element) => !element.hasAttribute("disabled") && element.getClientRects().length > 0);
+      if (focusable.length === 0) {
+        e.preventDefault();
+        modal.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
     };
     document.addEventListener("keydown", handler);
-    return () => document.removeEventListener("keydown", handler);
+    return () => {
+      document.removeEventListener("keydown", handler);
+      previousFocusRef.current?.focus();
+      previousFocusRef.current = null;
+    };
   }, [open, onClose]);
 
   // AI save state (must be before early return)
@@ -97,14 +136,25 @@ export default function SettingsModal({ open, onClose, initialSection = "general
     >
       <div
         ref={modalRef}
-        className="bg-white dark:bg-bg-surface rounded-2xl shadow-[0px_25px_50px_-12px_rgba(0,0,0,0.25)] border border-border w-[780px] h-[80vh] max-h-[720px] min-h-[480px] flex overflow-hidden"
+        role="dialog"
+        aria-modal="true"
+        aria-label={t("settings.title")}
+        tabIndex={-1}
+        className="flex max-h-[760px] flex-col overflow-hidden rounded-lg border border-border bg-white shadow-[0px_25px_50px_-12px_rgba(0,0,0,0.25)] transition-[width] dark:bg-bg-surface sm:flex-row"
+        style={{
+          width: activeSection === "tools"
+            ? "min(1400px, calc(100vw - 32px))"
+            : "min(780px, calc(100vw - 32px))",
+          height: "min(80dvh, 760px)",
+          minHeight: "min(480px, calc(100dvh - 32px))",
+        }}
       >
         {/* Sidebar */}
-        <div className="w-[220px] shrink-0 bg-bg-muted border-r border-border">
+        <div className="max-h-[148px] shrink-0 overflow-y-auto border-b border-border bg-bg-muted sm:max-h-none sm:w-[220px] sm:border-b-0 sm:border-r">
           <p className="text-[13px] font-semibold text-text-primary px-4 pt-4 pb-2">
             {t("settings.title")}
           </p>
-          <nav className="flex flex-col gap-0.5 px-2">
+          <nav className="grid grid-cols-2 gap-0.5 px-2 pb-2 sm:flex sm:flex-col sm:pb-0">
             {sections.map((section) => {
               const Icon = section.icon;
               const isActive = activeSection === section.id;
@@ -112,7 +162,7 @@ export default function SettingsModal({ open, onClose, initialSection = "general
                 <button
                   key={section.id}
                   onClick={() => setActiveSection(section.id)}
-                  className={`flex items-center gap-3 px-3 h-[56px] rounded-[10px] w-full cursor-pointer text-left transition-colors ${
+                  className={`flex h-[44px] w-full cursor-pointer items-center gap-2 rounded-[6px] px-2 text-left transition-colors sm:h-[56px] sm:gap-3 sm:rounded-[8px] sm:px-3 ${
                     isActive ? "bg-accent-bg" : "hover:bg-bg-input"
                   }`}
                 >
@@ -126,7 +176,7 @@ export default function SettingsModal({ open, onClose, initialSection = "general
                     }`}>
                       {section.label}
                     </p>
-                    <p className={`text-[11px] font-medium leading-[16px] tracking-[0.06px] truncate ${
+                    <p className={`hidden text-[11px] font-medium leading-[16px] tracking-[0.06px] truncate sm:block ${
                       isActive ? "text-accent-text/60" : "text-text-muted"
                     }`}>
                       {section.subtitle}
@@ -161,6 +211,8 @@ export default function SettingsModal({ open, onClose, initialSection = "general
             )}
             <button
               onClick={onClose}
+              aria-label={t("common.close")}
+              title={t("common.close")}
               className="size-7 flex items-center justify-center rounded-[10px] hover:bg-bg-input cursor-pointer"
             >
               <X size={16} className="text-text-muted" />

@@ -1,10 +1,11 @@
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::db::Db;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::sync::events::{BookmarkPayload, EventBody, HighlightPayload};
+use crate::sync::merge::{entity, insert_tombstone};
 use crate::sync::writer::SyncWriter;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -27,6 +28,16 @@ pub struct Highlight {
     pub text_content: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HighlightReplacement {
+    pub cfi_range: String,
+    pub color: String,
+    pub note: Option<String>,
+    pub text_content: Option<String>,
+    pub created_at: Option<i64>,
 }
 
 #[tauri::command]
@@ -167,6 +178,113 @@ pub fn remove_highlight(
         tx.execute("DELETE FROM highlights WHERE id = ?1", params![id])?;
         events.push(EventBody::HighlightDelete { id: id.clone() });
         Ok(())
+    })
+}
+
+/// Atomically replaces a set of manual highlight ranges. Range merging and
+/// subtraction are planned in the reader, while this command guarantees that
+/// every delete/add and its sync event commit as one operation.
+#[tauri::command]
+pub fn replace_highlights(
+    book_id: String,
+    remove_ids: Vec<String>,
+    additions: Vec<HighlightReplacement>,
+    db: State<'_, Db>,
+    sync: State<'_, SyncWriter>,
+) -> AppResult<Vec<Highlight>> {
+    if remove_ids.len() > 256 || additions.len() > 256 {
+        return Err(AppError::Other(
+            "HIGHLIGHT_REPLACEMENT_TOO_LARGE".to_string(),
+        ));
+    }
+    let unique_remove_ids: std::collections::HashSet<&str> =
+        remove_ids.iter().map(String::as_str).collect();
+    if unique_remove_ids.len() != remove_ids.len() {
+        return Err(AppError::Other(
+            "HIGHLIGHT_REPLACEMENT_DUPLICATE_ID".to_string(),
+        ));
+    }
+    if additions.iter().any(|addition| {
+        addition.cfi_range.trim().is_empty()
+            || addition.cfi_range.len() > 16_384
+            || addition.color.trim().is_empty()
+            || addition.color.len() > 64
+            || addition
+                .note
+                .as_deref()
+                .is_some_and(|value| value.len() > 100_000)
+            || addition
+                .text_content
+                .as_deref()
+                .is_some_and(|value| value.len() > 1_000_000)
+    }) {
+        return Err(AppError::Other("HIGHLIGHT_REPLACEMENT_INVALID".to_string()));
+    }
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let device = sync.self_device().to_string();
+    sync.with_tx(&db, now, |tx, events| {
+        for id in &remove_ids {
+            let owner: Option<String> = tx
+                .query_row(
+                    "SELECT book_id FROM highlights WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match owner.as_deref() {
+                Some(owner) if owner != book_id => {
+                    return Err(AppError::Other(
+                        "HIGHLIGHT_REPLACEMENT_BOOK_MISMATCH".to_string(),
+                    ));
+                }
+                Some(_) => {
+                    tx.execute("DELETE FROM highlights WHERE id = ?1", params![id])?;
+                    insert_tombstone(tx, entity::HIGHLIGHT, id, now)?;
+                    events.push(EventBody::HighlightDelete { id: id.clone() });
+                }
+                None => {}
+            }
+        }
+
+        let mut created = Vec::with_capacity(additions.len());
+        for addition in &additions {
+            let id = uuid::Uuid::new_v4().to_string();
+            let created_at = addition.created_at.unwrap_or(now).min(now).max(0);
+            tx.execute(
+                "INSERT INTO highlights (id, book_id, cfi_range, color, note, text_content, created_at, updated_at, updated_by_device)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
+                params![
+                    id,
+                    book_id,
+                    addition.cfi_range,
+                    addition.color,
+                    addition.note,
+                    addition.text_content,
+                    created_at,
+                    device,
+                ],
+            )?;
+            events.push(EventBody::HighlightAdd(HighlightPayload {
+                id: id.clone(),
+                book_id: book_id.clone(),
+                cfi_range: addition.cfi_range.clone(),
+                color: addition.color.clone(),
+                note: addition.note.clone(),
+                text_content: addition.text_content.clone(),
+            }));
+            created.push(Highlight {
+                id,
+                book_id: book_id.clone(),
+                cfi_range: addition.cfi_range.clone(),
+                color: addition.color.clone(),
+                note: addition.note.clone(),
+                text_content: addition.text_content.clone(),
+                created_at,
+                updated_at: now,
+            });
+        }
+        Ok(created)
     })
 }
 

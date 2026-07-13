@@ -20,6 +20,13 @@ pub struct LookupRecord {
     pub last_looked_up_at: i64,
     pub lookup_count: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_json: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub updated_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub book_title: Option<String>,
 }
 
@@ -52,11 +59,15 @@ fn row_to_lookup(row: &rusqlite::Row) -> rusqlite::Result<LookupRecord> {
         created_at: row.get(9)?,
         last_looked_up_at: row.get(10)?,
         lookup_count: row.get(11)?,
+        result_json: row.get(12)?,
+        provider_profile_id: row.get(13)?,
+        model: row.get(14)?,
+        updated_at: row.get(15)?,
         book_title: None,
     })
 }
 
-const SELECT_COLS: &str = "id, book_id, lookup_text, normalized_text, context_sentence, chapter, cfi, definition, context_explanation, created_at, last_looked_up_at, lookup_count";
+const SELECT_COLS: &str = "id, book_id, lookup_text, normalized_text, context_sentence, chapter, cfi, definition, context_explanation, created_at, last_looked_up_at, lookup_count, result_json, provider_profile_id, model, COALESCE(updated_at, last_looked_up_at)";
 
 fn configured_retention_days(conn: &rusqlite::Connection) -> Option<i64> {
     conn.query_row(
@@ -97,7 +108,11 @@ fn row_to_lookup_with_book(row: &rusqlite::Row) -> rusqlite::Result<LookupRecord
         created_at: row.get(9)?,
         last_looked_up_at: row.get(10)?,
         lookup_count: row.get(11)?,
-        book_title: row.get(12)?,
+        result_json: row.get(12)?,
+        provider_profile_id: row.get(13)?,
+        model: row.get(14)?,
+        updated_at: row.get(15)?,
+        book_title: row.get(16)?,
     })
 }
 
@@ -116,6 +131,9 @@ pub fn save_lookup_record(
     cfi: Option<String>,
     definition: String,
     context_explanation: Option<String>,
+    result_json: Option<String>,
+    provider_profile_id: Option<String>,
+    model: Option<String>,
     db: State<'_, Db>,
 ) -> AppResult<LookupRecord> {
     let normalized_text = normalize(&lookup_text);
@@ -138,8 +156,8 @@ pub fn save_lookup_record(
             .ok();
         if let Some(existing_id) = existing {
             conn.execute(
-                "UPDATE lookup_records SET lookup_text = ?1, context_sentence = ?2, chapter = ?3, definition = ?4, context_explanation = ?5, last_looked_up_at = ?6, lookup_count = lookup_count + 1 WHERE id = ?7",
-                params![lookup_text, context_sentence, chapter, definition, context_explanation, now, existing_id],
+                "UPDATE lookup_records SET lookup_text = ?1, context_sentence = ?2, chapter = ?3, definition = ?4, context_explanation = ?5, result_json = ?6, provider_profile_id = ?7, model = ?8, last_looked_up_at = ?9, updated_at = ?9, lookup_count = lookup_count + 1 WHERE id = ?10",
+                params![lookup_text, context_sentence, chapter, definition, context_explanation, result_json, provider_profile_id, model, now, existing_id],
             )?;
             prune_lookup_records_conn(&conn, configured_retention_days(&conn))?;
             return conn
@@ -153,8 +171,8 @@ pub fn save_lookup_record(
     }
 
     conn.execute(
-        "INSERT INTO lookup_records (id, book_id, lookup_text, normalized_text, context_sentence, chapter, cfi, definition, context_explanation, created_at, last_looked_up_at, lookup_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, 1)",
-        params![id, book_id, lookup_text, normalized_text, context_sentence, chapter, cfi, definition, context_explanation, now],
+        "INSERT INTO lookup_records (id, book_id, lookup_text, normalized_text, context_sentence, chapter, cfi, definition, context_explanation, result_json, provider_profile_id, model, created_at, last_looked_up_at, updated_at, lookup_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?13, 1)",
+        params![id, book_id, lookup_text, normalized_text, context_sentence, chapter, cfi, definition, context_explanation, result_json, provider_profile_id, model, now],
     )?;
     prune_lookup_records_conn(&conn, configured_retention_days(&conn))?;
     conn.query_row(
@@ -257,7 +275,7 @@ pub fn list_all_lookup_records(
         format!(" WHERE {}", conditions.join(" AND "))
     };
     let sql = format!(
-        "SELECT l.id, l.book_id, l.lookup_text, l.normalized_text, l.context_sentence, l.chapter, l.cfi, l.definition, l.context_explanation, l.created_at, l.last_looked_up_at, l.lookup_count, b.title FROM lookup_records l LEFT JOIN books b ON l.book_id = b.id{where_clause} ORDER BY l.last_looked_up_at DESC, l.id ASC LIMIT ?"
+        "SELECT l.id, l.book_id, l.lookup_text, l.normalized_text, l.context_sentence, l.chapter, l.cfi, l.definition, l.context_explanation, l.created_at, l.last_looked_up_at, l.lookup_count, l.result_json, l.provider_profile_id, l.model, COALESCE(l.updated_at, l.last_looked_up_at), b.title FROM lookup_records l LEFT JOIN books b ON l.book_id = b.id{where_clause} ORDER BY l.last_looked_up_at DESC, l.id ASC LIMIT ?"
     );
     values.push(Box::new((page_size + 1) as i64));
     let refs: Vec<&dyn rusqlite::types::ToSql> =
