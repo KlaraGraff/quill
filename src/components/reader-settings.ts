@@ -46,6 +46,17 @@ export function getReaderCapabilities(format?: string): ReaderCapabilities {
         supportsContinuousScroll: true,
         supportsZoom: false,
       };
+    case "text":
+      return {
+        supportsSelection: true,
+        supportsManualAnnotations: true,
+        supportsWordMarkers: false,
+        supportsCfiNavigation: true,
+        supportsReflowSettings: true,
+        supportsSpread: false,
+        supportsContinuousScroll: false,
+        supportsZoom: false,
+      };
     case "pdf":
       return {
         supportsSelection: true,

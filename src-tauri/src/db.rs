@@ -43,6 +43,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../migrations/018_book_source_metadata.sql"),
     ),
     (19, include_str!("../migrations/019_vocab_fsrs.sql")),
+    (
+        20,
+        include_str!("../migrations/020_text_reader_preparation.sql"),
+    ),
 ];
 
 /// SQLite handle for the local materialized view.
@@ -1032,5 +1036,50 @@ mod tests {
             v, 8,
             "schema_version should not advance on failed migration"
         );
+    }
+
+    #[test]
+    fn test_migration_020_rebuilds_legacy_text_books_from_source() {
+        let dir = TempDir::new().unwrap();
+        let conn = Connection::open(dir.path().join("quill.db")).unwrap();
+        Db::run_migrations_up_to(&conn, 19).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO books
+             (id, title, author, file_path, format, source_format, render_format, source_file_path, status, progress, created_at, updated_at)
+             VALUES ('text-book', 'Text', 'Author', 'books/legacy.epub', 'epub', 'txt', 'epub', 'sources/text-book.txt', 'unread', 0, ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO books
+             (id, title, author, file_path, format, source_format, render_format, status, progress, created_at, updated_at)
+             VALUES ('epub-book', 'EPUB', 'Author', 'books/epub.epub', 'epub', 'epub', 'epub', 'unread', 0, ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+
+        Db::run_migrations_up_to(&conn, 20).unwrap();
+
+        let text: (String, String, String, Option<String>) = conn
+            .query_row(
+                "SELECT file_path, render_format, preparation_state, preparation_error FROM books WHERE id = 'text-book'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(text.0, "sources/text-book.txt");
+        assert_eq!(text.1, "text");
+        assert_eq!(text.2, "pending");
+        assert_eq!(text.3, None);
+
+        let epub_state: String = conn
+            .query_row(
+                "SELECT preparation_state FROM books WHERE id = 'epub-book'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(epub_state, "ready");
     }
 }

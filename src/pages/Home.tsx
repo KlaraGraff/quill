@@ -207,6 +207,15 @@ export default function Home() {
     };
   }, []);
 
+  // Text imports are prepared in the background after their source file has
+  // been copied. Refresh their card state as each task starts or finishes.
+  useEffect(() => {
+    const unlisten = listen("book-preparation-changed", () => {
+      refreshRef.current();
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
+
   // Listen for Tauri file drag-and-drop events
   useEffect(() => {
     let cancelled = false;

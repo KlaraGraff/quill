@@ -29,6 +29,8 @@
   "home.importing": "Importing book...",
   "home.importingSlow": "Still working—this file is taking longer than usual",
   "home.importError": "Couldn't import book",
+  "book.preparing": "Preparing for reading",
+  "book.preparationFailed": "Preparation failed. Click to retry.",
 
   "reader.pageOf": "Page {{current}} of {{total}}",
   "reader.chapterOf": "Chapter {{current}} of {{total}}",

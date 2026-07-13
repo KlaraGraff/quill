@@ -27,6 +27,8 @@ import ExplainPopover from "../components/ExplainPopover";
 import DictionaryPanel from "../components/DictionaryPanel";
 import TranslationPopover from "../components/TranslationPopover";
 import TableOfContents from "../components/TableOfContents";
+import TextBookReader from "../components/TextBookReader";
+import { textLocation, type TextBookDocument } from "../components/text-book-location";
 import { getBook, updateReadingProgress, checkBookAvailable, type Book, type BookAvailabilityStatus } from "../hooks/useBooks";
 import { getAllSettings } from "../hooks/useSettings";
 import type { Highlight } from "../hooks/useBookmarks";
@@ -282,7 +284,11 @@ export default function Reader() {
   const location = useLocation();
   const { t } = useTranslation();
   const [book, setBook] = useState<Book | null>(null);
-  const capabilities = useMemo(() => getReaderCapabilities(book?.format), [book?.format]);
+  const isTextBook = book?.render_format === "text";
+  const capabilities = useMemo(
+    () => getReaderCapabilities(book?.render_format || book?.format),
+    [book?.format, book?.render_format],
+  );
   const supportsSelection = capabilities.supportsSelection;
   const supportsManualAnnotations = capabilities.supportsManualAnnotations;
   const supportsWordMarkers = capabilities.supportsWordMarkers;
@@ -374,6 +380,8 @@ export default function Reader() {
   const appliedAnnotationsRef = useRef(new Map<string, string>());
   const navigationFlashRef = useRef(new Map<string, number>());
   const pendingNavigationRef = useRef<ReaderNavigation | null>(null);
+  const textReaderNavigateRef = useRef<((location: string, flash?: boolean) => void) | null>(null);
+  const [textNavigationRegistration, setTextNavigationRegistration] = useState(0);
   const markerSnapshotRef = useRef<{
     highlights: Highlight[];
     lookups: LookupRecord[];
@@ -382,6 +390,50 @@ export default function Reader() {
   const isDragging = useRef(false);
   const chaptersRef = useRef<TocChapter[]>([]);
   const selectedTextRef = useRef<{ text: string; cfi: string } | null>(null);
+
+  const handleTextBookReady = useCallback((document: TextBookDocument) => {
+    const textChapters = document.chapters.map((chapter, index) => ({
+      title: chapter.title,
+      href: textLocation(index, 0, 0),
+      targetHref: textLocation(index, 0, 0),
+      depth: 0,
+    }));
+    chaptersRef.current = textChapters;
+    setChapters(textChapters);
+    setBookReady(true);
+    setReaderError(null);
+  }, []);
+
+  const handleTextBookProgress = useCallback((nextProgress: number, textLocationValue: string, chapterIndex: number) => {
+    setProgress(nextProgress);
+    currentCfiRef.current = textLocationValue;
+    setCurrentChapterIndex(chapterIndex);
+    if (bookId) updateReadingProgress(bookId, nextProgress, textLocationValue).catch(() => {});
+  }, [bookId]);
+
+  const handleTextBookSelection = useCallback(({ text, location: textLocationValue }: { text: string; location: string }) => {
+    selectedTextRef.current = { text, cfi: textLocationValue };
+  }, []);
+
+  const handleTextBookError = useCallback((error: string) => {
+    setReaderError(error);
+    setBookReady(false);
+  }, []);
+
+  const registerTextBookNavigation = useCallback((navigateText: (location: string, flash?: boolean) => void) => {
+    textReaderNavigateRef.current = navigateText;
+    setTextNavigationRegistration((value) => value + 1);
+  }, []);
+
+  const handleTextHighlightClick = useCallback((highlight: Highlight, rect: DOMRect) => {
+    setHighlightToolbar({
+      x: rect.left + rect.width / 2,
+      y: rect.top,
+      highlightId: highlight.id,
+      cfiRange: highlight.cfi_range,
+      color: highlight.color,
+    });
+  }, []);
 
   useEffect(() => {
     readerSettingsRef.current = readerSettings;
@@ -455,6 +507,10 @@ export default function Reader() {
   }, [supportsManualAnnotations, supportsWordMarkers]);
 
   const flashNavigationTarget = useCallback(async (cfi: string) => {
+    if (isTextBook) {
+      textReaderNavigateRef.current?.(cfi, true);
+      return;
+    }
     const view = viewRef.current;
     if (!view || !supportsCfiNavigation) return;
     await view.goTo(cfi);
@@ -468,9 +524,10 @@ export default function Reader() {
       const color = appliedAnnotationsRef.current.get(cfi);
       if (color) await view.addAnnotation({ value: cfi, color }).catch(() => {});
     }, 3000);
-  }, [supportsCfiNavigation]);
+  }, [isTextBook, supportsCfiNavigation]);
 
   const refreshAnnotations = useCallback(async (reapplyVisible = false) => {
+    if (isTextBook) return;
     if (!bookId || !viewRef.current || !supportsManualAnnotations) return;
     const highlights = await invoke<Highlight[]>("list_highlights", { bookId });
     const [lookups, vocab] = supportsWordMarkers
@@ -481,7 +538,7 @@ export default function Reader() {
       : [[], []] as [LookupRecord[], VocabMarker[]];
     markerSnapshotRef.current = { highlights, lookups, vocab };
     await applyAnnotations(reapplyVisible);
-  }, [applyAnnotations, bookId, supportsManualAnnotations, supportsWordMarkers]);
+  }, [applyAnnotations, bookId, isTextBook, supportsManualAnnotations, supportsWordMarkers]);
 
   // Load book metadata and default settings from DB
   useEffect(() => {
@@ -626,7 +683,7 @@ export default function Reader() {
 
   // Initialize foliate-js when book data is loaded
   useEffect(() => {
-    if (!book || !viewerRef.current || book.available === false) return;
+    if (!book || !viewerRef.current || book.available === false || isTextBook) return;
 
     const container = viewerRef.current;
     container.innerHTML = "";
@@ -1064,7 +1121,7 @@ export default function Reader() {
     // below, so the derived dep stays `null` for them and the effect won't
     // re-run.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [book, book?.format === "pdf" ? readerSettings.readingMode : null, applyAnnotations, capabilities, supportsManualAnnotations, supportsSelection, readerRetry]);
+  }, [book, book?.format === "pdf" ? readerSettings.readingMode : null, applyAnnotations, capabilities, isTextBook, supportsManualAnnotations, supportsSelection, readerRetry]);
 
   // Apply reader settings reactively
   useEffect(() => {
@@ -1128,12 +1185,15 @@ export default function Reader() {
 
   useEffect(() => {
     const applyNavigation = async (target: ReaderNavigation) => {
-      if (!bookReady || !viewRef.current) {
+      if (!bookReady || (!isTextBook && !viewRef.current) || (isTextBook && !textReaderNavigateRef.current)) {
         pendingNavigationRef.current = target;
         return;
       }
       pendingNavigationRef.current = null;
-      if (target.cfi && supportsCfiNavigation) await viewRef.current.goTo(target.cfi);
+      if (target.cfi && supportsCfiNavigation) {
+        if (isTextBook) textReaderNavigateRef.current?.(target.cfi, true);
+        else await viewRef.current?.goTo(target.cfi);
+      }
       if (target.openVocab && supportsCfiNavigation) setSidePanel("vocab");
       if (target.openChat) {
         setSidePanel("ai");
@@ -1160,7 +1220,7 @@ export default function Reader() {
     const pending = pendingNavigationRef.current;
     if (pending) applyNavigation(pending).catch(() => {});
     return () => { unlisten.then((fns) => fns.forEach((fn) => fn())).catch(() => {}); };
-  }, [bookId, bookReady, refreshAnnotations, supportsCfiNavigation]);
+  }, [bookId, bookReady, isTextBook, refreshAnnotations, supportsCfiNavigation, textNavigationRegistration]);
 
   // Track the current fit-width scale so +/- from fit mode lands near the
   // visible size. Observes the renderer and sums the natural widths of the
@@ -1377,12 +1437,14 @@ export default function Reader() {
   }, []);
 
   const navigateToChapter = useCallback((href: string) => {
-    viewRef.current?.goTo(href);
-  }, []);
+    if (isTextBook) textReaderNavigateRef.current?.(href);
+    else viewRef.current?.goTo(href);
+  }, [isTextBook]);
 
   const navigateToCfi = useCallback((cfi: string) => {
-    viewRef.current?.goTo(cfi);
-  }, []);
+    if (isTextBook) textReaderNavigateRef.current?.(cfi);
+    else viewRef.current?.goTo(cfi);
+  }, [isTextBook]);
 
   // Handle navigation state from ChatsPage ("Open in Reader")
   // Supports both location.state (main window) and URL search params (standalone window)
@@ -1444,7 +1506,24 @@ export default function Reader() {
         <p className="text-text-primary text-[16px] font-medium">{t("reader.initializationFailed")}</p>
         <p className="text-text-muted text-[13px] max-w-[520px] break-words">{readerError}</p>
         <div className="flex items-center gap-2">
-          <Button variant="secondary" size="sm" onClick={() => setReaderRetry((value) => value + 1)}>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => {
+              if (isTextBook && bookId) {
+                invoke("retry_text_book_preparation", { bookId })
+                  .then(() => getBook(bookId))
+                  .then((updated) => {
+                    setBook(updated);
+                    setReaderError(null);
+                    setReaderRetry((value) => value + 1);
+                  })
+                  .catch((error) => setReaderError(error instanceof Error ? error.message : String(error)));
+                return;
+              }
+              setReaderRetry((value) => value + 1);
+            }}
+          >
             {t("reader.retry")}
           </Button>
           <Button variant="ghost" size="sm" onClick={returnToLibrary}>
@@ -1690,11 +1769,26 @@ export default function Reader() {
               setHighlightToolbar(null);
             }}
           >
-            <div
-              ref={viewerRef}
-              className="w-full h-full"
-              style={book.format === "pdf" ? { backgroundColor: "#ffffff" } : undefined}
-            />
+            {isTextBook ? (
+              <TextBookReader
+                key={`${book.id}:${readerRetry}`}
+                bookId={book.id}
+                initialLocation={book.current_cfi}
+                settings={readerSettings}
+                onReady={handleTextBookReady}
+                onProgress={handleTextBookProgress}
+                onSelection={handleTextBookSelection}
+                onError={handleTextBookError}
+                onRegisterNavigation={registerTextBookNavigation}
+                onHighlightClick={handleTextHighlightClick}
+              />
+            ) : (
+              <div
+                ref={viewerRef}
+                className="w-full h-full"
+                style={book.format === "pdf" ? { backgroundColor: "#ffffff" } : undefined}
+              />
+            )}
             {book.format === "pdf" && (() => {
               const overlay = getPdfOverlays(readerSettings.theme);
               if (!overlay) return null;
@@ -1894,6 +1988,7 @@ export default function Reader() {
                 color,
                 textContent: contextMenu.text,
               }).then(async () => {
+                window.dispatchEvent(new CustomEvent("highlight-changed", { detail: { bookId } }));
                 await refreshAnnotations();
               }).catch((err) => console.error("Failed to add highlight:", err));
             }
@@ -1954,6 +2049,7 @@ export default function Reader() {
           onChangeColor={(color) => {
             invoke("update_highlight_color", { id: highlightToolbar.highlightId, color })
               .then(async () => {
+                window.dispatchEvent(new CustomEvent("highlight-changed", { detail: { bookId } }));
                 await refreshAnnotations();
                 setHighlightToolbar((prev) => prev ? { ...prev, color } : null);
               })
@@ -1962,6 +2058,7 @@ export default function Reader() {
           onDelete={() => {
             invoke("remove_highlight", { id: highlightToolbar.highlightId })
               .then(async () => {
+                window.dispatchEvent(new CustomEvent("highlight-changed", { detail: { bookId } }));
                 await refreshAnnotations();
                 setHighlightToolbar(null);
               })

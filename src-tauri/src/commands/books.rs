@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::Cursor;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
@@ -8,14 +8,13 @@ use image::ImageFormat;
 use pdfium_render::prelude::*;
 use pulldown_cmark::{
     Event as MarkdownEvent, Options as MarkdownOptions, Parser as MarkdownParser,
+    TagEnd as MarkdownTagEnd,
 };
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::State;
+use tauri::{AppHandle, Emitter, Manager, State};
 use zip::read::ZipArchive;
-use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipWriter};
 
 use crate::db::Db;
 use crate::epub;
@@ -24,6 +23,7 @@ use crate::icloud;
 use crate::pdfium;
 use crate::sync::events::{BookImportPayload, EventBody};
 use crate::sync::writer::SyncWriter;
+use crate::LocalDir;
 
 fn cover_blob_to_data_uri(bytes: &[u8]) -> String {
     let mime = if bytes.starts_with(b"\x89PNG") {
@@ -49,9 +49,28 @@ struct PdfExtracted {
     cover: Option<Vec<u8>>,
 }
 
-const TEXT_CONVERSION_VERSION: i32 = 2;
+const TEXT_DOCUMENT_VERSION: i32 = 1;
 const MAX_TEXT_IMPORT_BYTES: u64 = 25 * 1024 * 1024;
 const TXT_CHAPTER_TARGET_CHARS: usize = 24_000;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TextBookChapter {
+    pub title: String,
+    pub paragraphs: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TextBookDocument {
+    pub version: i32,
+    pub source_sha256: Option<String>,
+    pub chapters: Vec<TextBookChapter>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct TextPreparationChanged {
+    book_id: String,
+    state: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImportFormat {
@@ -223,12 +242,6 @@ fn decode_txt(bytes: &[u8]) -> AppResult<String> {
     Ok(text.into_owned())
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
-}
-
 fn source_sha256(path: &Path) -> AppResult<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -243,15 +256,6 @@ fn source_sha256(path: &Path) -> AppResult<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
 fn markdown_to_text(markdown: &str) -> String {
     let options = MarkdownOptions::ENABLE_STRIKETHROUGH
         | MarkdownOptions::ENABLE_TABLES
@@ -261,6 +265,14 @@ fn markdown_to_text(markdown: &str) -> String {
         match event {
             MarkdownEvent::Text(value) | MarkdownEvent::Code(value) => text.push_str(&value),
             MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => text.push('\n'),
+            MarkdownEvent::End(
+                MarkdownTagEnd::Paragraph
+                | MarkdownTagEnd::Heading(_)
+                | MarkdownTagEnd::BlockQuote(_)
+                | MarkdownTagEnd::CodeBlock
+                | MarkdownTagEnd::Item
+                | MarkdownTagEnd::TableRow,
+            ) => text.push('\n'),
             _ => {}
         }
     }
@@ -276,18 +288,20 @@ fn html_to_text(html: &str) -> String {
         .join("\n")
 }
 
-fn text_chapters(text: &str) -> Vec<(String, Vec<String>)> {
+fn text_chapters(text: &str) -> Vec<TextBookChapter> {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    let mut chapters = Vec::<(String, Vec<String>)>::new();
+    let mut chapters = Vec::<TextBookChapter>::new();
     let mut current_title = "Reading".to_string();
     let mut current = Vec::<String>::new();
-    let flush = |chapters: &mut Vec<(String, Vec<String>)>,
-                 title: &mut String,
-                 current: &mut Vec<String>| {
-        if !current.is_empty() {
-            chapters.push((std::mem::take(title), std::mem::take(current)));
-        }
-    };
+    let flush =
+        |chapters: &mut Vec<TextBookChapter>, title: &mut String, current: &mut Vec<String>| {
+            if !current.is_empty() {
+                chapters.push(TextBookChapter {
+                    title: std::mem::take(title),
+                    paragraphs: std::mem::take(current),
+                });
+            }
+        };
     for line in normalized.lines() {
         let line = line.trim();
         let chapter_title = line.len() < 100
@@ -307,76 +321,62 @@ fn text_chapters(text: &str) -> Vec<(String, Vec<String>)> {
     }
     flush(&mut chapters, &mut current_title, &mut current);
     if chapters.is_empty() {
-        chapters.push(("Reading".to_string(), vec!["".to_string()]));
+        chapters.push(TextBookChapter {
+            title: "Reading".to_string(),
+            paragraphs: vec!["".to_string()],
+        });
     }
     chapters
 }
 
-fn write_internal_epub(path: &Path, title: &str, text: &str, source_sha256: &str) -> AppResult<()> {
-    let file = fs::File::create(path)?;
-    let mut zip = ZipWriter::new(file);
-    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-    let chapters = text_chapters(text);
-    zip.start_file("mimetype", stored)
-        .map_err(|error| AppError::Other(format!("CONVERSION_FAILED: {error}")))?;
-    zip.write_all(b"application/epub+zip")?;
-    zip.start_file("META-INF/container.xml", deflated)
-        .map_err(|error| AppError::Other(format!("CONVERSION_FAILED: {error}")))?;
-    zip.write_all(br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#)?;
-    for (index, (chapter_title, paragraphs)) in chapters.iter().enumerate() {
-        zip.start_file(format!("OEBPS/chapter-{:04}.xhtml", index + 1), deflated)
-            .map_err(|error| AppError::Other(format!("CONVERSION_FAILED: {error}")))?;
-        let body = paragraphs
-            .iter()
-            .map(|paragraph| format!("<p>{}</p>", xml_escape(paragraph)))
-            .collect::<String>();
-        let html = format!(
-            r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{}</title><link rel="stylesheet" type="text/css" href="style.css"/></head><body><h1>{}</h1>{}</body></html>"#,
-            xml_escape(chapter_title),
-            xml_escape(chapter_title),
-            body
-        );
-        zip.write_all(html.as_bytes())?;
+fn prepare_text_document(
+    source_path: &Path,
+    source_format: &str,
+    source_sha256: Option<String>,
+) -> AppResult<TextBookDocument> {
+    let decoded = decode_txt(&fs::read(source_path)?)?;
+    let text = match source_format {
+        "markdown" => markdown_to_text(&decoded),
+        "html" => html_to_text(&decoded),
+        _ => decoded,
+    };
+    if text.trim().is_empty() {
+        return Err(AppError::Other("EMPTY_BOOK".to_string()));
     }
-    zip.start_file("OEBPS/style.css", deflated)
-        .map_err(|error| AppError::Other(format!("CONVERSION_FAILED: {error}")))?;
-    zip.write_all(
-        b"body { line-height: 1.65; } p { margin: 0 0 1em; } h1 { page-break-before: always; }",
-    )?;
-    zip.start_file("OEBPS/nav.xhtml", deflated)
-        .map_err(|error| AppError::Other(format!("CONVERSION_FAILED: {error}")))?;
-    let nav_items = chapters
-        .iter()
-        .enumerate()
-        .map(|(index, (chapter_title, _))| {
-            format!(
-                r#"<li><a href="chapter-{:04}.xhtml">{}</a></li>"#,
-                index + 1,
-                xml_escape(chapter_title)
-            )
-        })
-        .collect::<String>();
-    zip.write_all(format!(r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>Contents</title></head><body><nav epub:type="toc"><ol>{}</ol></nav></body></html>"#, nav_items).as_bytes())?;
-    zip.start_file("OEBPS/content.opf", deflated)
-        .map_err(|error| AppError::Other(format!("CONVERSION_FAILED: {error}")))?;
-    let manifest = chapters.iter().enumerate().map(|(index, _)| format!(r#"<item id="chapter-{}" href="chapter-{:04}.xhtml" media-type="application/xhtml+xml"/>"#, index + 1, index + 1)).collect::<String>();
-    let spine = chapters
-        .iter()
-        .enumerate()
-        .map(|(index, _)| format!(r#"<itemref idref="chapter-{}"/>"#, index + 1))
-        .collect::<String>();
-    let opf = format!(
-        r#"<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="book-id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="book-id">urn:uuid:{}</dc:identifier><dc:title>{}</dc:title><dc:creator>Unknown Author</dc:creator><dc:language>en</dc:language></metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="style" href="style.css" media-type="text/css"/>{}</manifest><spine>{}</spine></package>"#,
+    Ok(TextBookDocument {
+        version: TEXT_DOCUMENT_VERSION,
         source_sha256,
-        xml_escape(title),
-        manifest,
-        spine
-    );
-    zip.write_all(opf.as_bytes())?;
-    zip.finish()
-        .map_err(|error| AppError::Other(format!("CONVERSION_FAILED: {error}")))?;
-    Ok(())
+        chapters: text_chapters(&text),
+    })
+}
+
+fn prepared_document_path(local_dir: &Path, book_id: &str) -> PathBuf {
+    local_dir.join("prepared").join(format!("{book_id}.json"))
+}
+
+fn write_prepared_document(path: &Path, document: &TextBookDocument) -> AppResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Other("PREPARATION_PATH_INVALID".to_string()))?;
+    fs::create_dir_all(parent)?;
+    let temporary_path = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("document"),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| -> AppResult<()> {
+        let bytes = serde_json::to_vec(document)
+            .map_err(|error| AppError::Other(format!("PREPARATION_SERIALIZE_FAILED: {error}")))?;
+        fs::write(&temporary_path, bytes)?;
+        fs::rename(&temporary_path, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result
 }
 
 /// Single pdfium pass: load the doc once (streaming via `Read + Seek`
@@ -538,6 +538,10 @@ pub struct Book {
     pub source_sha256: Option<String>,
     #[serde(default)]
     pub conversion_version: i32,
+    #[serde(default = "default_preparation_state")]
+    pub preparation_state: String,
+    #[serde(default)]
+    pub preparation_error: Option<String>,
     pub genre: Option<String>,
     pub pages: Option<i32>,
     pub status: String,
@@ -561,6 +565,10 @@ pub struct BookAvailability {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_preparation_state() -> String {
+    "ready".to_string()
 }
 
 struct ImportFileCleanup {
@@ -615,6 +623,170 @@ fn resolve_book_paths(book: &mut Book, db: &Db) -> AppResult<()> {
     Ok(())
 }
 
+fn update_text_preparation_state(
+    db: &Db,
+    book_id: &str,
+    state: &str,
+    error: Option<&str>,
+    pages: Option<i32>,
+) -> AppResult<()> {
+    let conn = db
+        .conn
+        .lock()
+        .map_err(|error| AppError::Other(error.to_string()))?;
+    conn.execute(
+        "UPDATE books
+         SET preparation_state = ?1,
+             preparation_error = ?2,
+             pages = COALESCE(?3, pages)
+         WHERE id = ?4 AND render_format = 'text'",
+        params![state, error, pages, book_id],
+    )?;
+    Ok(())
+}
+
+fn emit_text_preparation_changed(app: &AppHandle, book_id: &str, state: &str) {
+    let _ = app.emit(
+        "book-preparation-changed",
+        TextPreparationChanged {
+            book_id: book_id.to_string(),
+            state: state.to_string(),
+        },
+    );
+}
+
+fn run_text_preparation(app: &AppHandle, book_id: &str) -> AppResult<()> {
+    crate::sync::validation::validate_entity_id(book_id)?;
+    let db = app.state::<Db>();
+    let local_dir = app.state::<LocalDir>();
+    let source = {
+        let conn = db
+            .conn
+            .lock()
+            .map_err(|error| AppError::Other(error.to_string()))?;
+        let changed = conn.execute(
+            "UPDATE books
+             SET preparation_state = 'preparing', preparation_error = NULL
+             WHERE id = ?1 AND render_format = 'text' AND preparation_state = 'pending'",
+            params![book_id],
+        )?;
+        if changed == 0 {
+            return Ok(());
+        }
+        conn.query_row(
+            "SELECT source_file_path, source_format, source_sha256 FROM books WHERE id = ?1",
+            params![book_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )?
+    };
+    emit_text_preparation_changed(app, book_id, "preparing");
+
+    let (source_file_path, source_format, source_sha256) = source;
+    let Some(source_file_path) = source_file_path else {
+        update_text_preparation_state(&db, book_id, "failed", Some("TEXT_SOURCE_MISSING"), None)?;
+        emit_text_preparation_changed(app, book_id, "failed");
+        return Ok(());
+    };
+    let source_path = db.resolve_path(&source_file_path)?;
+    match icloud::file_availability(&source_path) {
+        icloud::FileAvailability::Available => {}
+        icloud::FileAvailability::ICloudPlaceholder => {
+            icloud::trigger_download_file(&source_path);
+            update_text_preparation_state(&db, book_id, "pending", None, None)?;
+            emit_text_preparation_changed(app, book_id, "pending");
+            return Ok(());
+        }
+        icloud::FileAvailability::Missing => {
+            update_text_preparation_state(
+                &db,
+                book_id,
+                "failed",
+                Some("TEXT_SOURCE_UNAVAILABLE"),
+                None,
+            )?;
+            emit_text_preparation_changed(app, book_id, "failed");
+            return Ok(());
+        }
+    }
+
+    let result = prepare_text_document(
+        &source_path,
+        source_format.as_deref().unwrap_or("txt"),
+        source_sha256,
+    )
+    .and_then(|document| {
+        let pages = i32::try_from(document.chapters.len())
+            .map_err(|_| AppError::Other("TEXT_BOOK_TOO_LARGE".to_string()))?;
+        write_prepared_document(&prepared_document_path(&local_dir.0, book_id), &document)?;
+        update_text_preparation_state(&db, book_id, "ready", None, Some(pages))?;
+        Ok(())
+    });
+
+    match result {
+        Ok(()) => emit_text_preparation_changed(app, book_id, "ready"),
+        Err(error) => {
+            let message = error.to_string();
+            update_text_preparation_state(&db, book_id, "failed", Some(&message), None)?;
+            emit_text_preparation_changed(app, book_id, "failed");
+            log::warn!("text preparation failed for {book_id}: {message}");
+        }
+    }
+    Ok(())
+}
+
+pub fn schedule_text_book_preparation(app: AppHandle, book_id: String) {
+    let thread_name = format!("text-prep-{}", &book_id[..book_id.len().min(8)]);
+    let _ = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            if let Err(error) = run_text_preparation(&app, &book_id) {
+                log::warn!("text preparation task failed for {book_id}: {error}");
+                let db = app.state::<Db>();
+                let message = error.to_string();
+                let _ =
+                    update_text_preparation_state(&db, &book_id, "failed", Some(&message), None);
+                emit_text_preparation_changed(&app, &book_id, "failed");
+            }
+        });
+}
+
+pub fn schedule_pending_text_book_preparations(app: AppHandle) {
+    let db = app.state::<Db>();
+    let pending = (|| -> AppResult<Vec<String>> {
+        let conn = db
+            .conn
+            .lock()
+            .map_err(|error| AppError::Other(error.to_string()))?;
+        conn.execute(
+            "UPDATE books SET preparation_state = 'pending', preparation_error = NULL
+             WHERE render_format = 'text' AND preparation_state = 'preparing'",
+            [],
+        )?;
+        let mut statement = conn.prepare(
+            "SELECT id FROM books WHERE render_format = 'text' AND preparation_state = 'pending'",
+        )?;
+        let book_ids = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(AppError::from)?;
+        Ok(book_ids)
+    })();
+    match pending {
+        Ok(book_ids) => {
+            for book_id in book_ids {
+                schedule_text_book_preparation(app.clone(), book_id);
+            }
+        }
+        Err(error) => log::warn!("text preparation startup scan failed: {error}"),
+    }
+}
+
 pub(crate) fn do_import_epub(file_path: &str, db: &Db, sync: &SyncWriter) -> AppResult<Book> {
     let data_dir = db
         .data_dir
@@ -656,6 +828,8 @@ pub(crate) fn do_import_epub(file_path: &str, db: &Db, sync: &SyncWriter) -> App
         source_file_path: Some(rel_file_path.clone()),
         source_sha256: Some(source_sha256),
         conversion_version: 0,
+        preparation_state: default_preparation_state(),
+        preparation_error: None,
         genre: None,
         pages: Some(pages),
         status: "unread".to_string(),
@@ -685,17 +859,7 @@ pub(crate) fn do_import_text(
     sync: &SyncWriter,
 ) -> AppResult<Book> {
     let source = Path::new(file_path);
-    let bytes = fs::read(source)?;
-    let source_hash = sha256_hex(&bytes);
-    let decoded = decode_txt(&bytes)?;
-    let text = match source_format {
-        "markdown" => markdown_to_text(&decoded),
-        "html" => html_to_text(&decoded),
-        _ => decoded,
-    };
-    if text.trim().is_empty() {
-        return Err(AppError::Other("EMPTY_BOOK".to_string()));
-    }
+    let source_hash = source_sha256(source)?;
     let title = source
         .file_stem()
         .and_then(|value| value.to_str())
@@ -707,14 +871,9 @@ pub(crate) fn do_import_text(
         .lock()
         .map_err(|e| AppError::Other(e.to_string()))?
         .clone();
-    let books_dir = data_dir.join("books");
     let sources_dir = data_dir.join("sources");
-    fs::create_dir_all(&books_dir)?;
     fs::create_dir_all(&sources_dir)?;
     let book_id = uuid::Uuid::new_v4().to_string();
-    let filename = book_filename(title, &book_id, "epub");
-    let final_path = books_dir.join(&filename);
-    let temporary_path = books_dir.join(format!(".{filename}.tmp"));
     let source_extension = source
         .extension()
         .and_then(|value| value.to_str())
@@ -722,15 +881,8 @@ pub(crate) fn do_import_text(
         .to_ascii_lowercase();
     let source_filename = book_filename(title, &book_id, &source_extension);
     let source_path = sources_dir.join(&source_filename);
-    let cleanup = ImportFileCleanup::new([
-        temporary_path.clone(),
-        final_path.clone(),
-        source_path.clone(),
-    ]);
+    let cleanup = ImportFileCleanup::new([source_path.clone()]);
     fs::copy(source, &source_path)?;
-    write_internal_epub(&temporary_path, title, &text, &source_hash)?;
-    epub::extract_metadata(&temporary_path)?;
-    fs::rename(&temporary_path, &final_path)?;
     let now = chrono::Utc::now().timestamp_millis();
     let book = Book {
         id: book_id,
@@ -738,15 +890,17 @@ pub(crate) fn do_import_text(
         author: "Unknown Author".to_string(),
         description: None,
         cover_path: None,
-        file_path: format!("books/{filename}"),
-        format: "epub".to_string(),
+        file_path: format!("sources/{source_filename}"),
+        format: "text".to_string(),
         source_format: Some(source_format.to_string()),
-        render_format: Some("epub".to_string()),
+        render_format: Some("text".to_string()),
         source_file_path: Some(format!("sources/{source_filename}")),
         source_sha256: Some(source_hash),
-        conversion_version: TEXT_CONVERSION_VERSION,
+        conversion_version: TEXT_DOCUMENT_VERSION,
+        preparation_state: "pending".to_string(),
+        preparation_error: None,
         genre: None,
-        pages: Some(text_chapters(&text).len() as i32),
+        pages: None,
         status: "unread".to_string(),
         progress: 0,
         current_cfi: None,
@@ -810,6 +964,8 @@ fn do_import_native(
         source_file_path: Some(format!("books/{filename}")),
         source_sha256: Some(source_sha256),
         conversion_version: 0,
+        preparation_state: default_preparation_state(),
+        preparation_error: None,
         genre: None,
         pages: None,
         status: "unread".to_string(),
@@ -875,6 +1031,8 @@ pub(crate) fn do_import_pdf(file_path: &str, db: &Db, sync: &SyncWriter) -> AppR
         source_file_path: Some(rel_file_path.clone()),
         source_sha256: Some(source_sha256),
         conversion_version: 0,
+        preparation_state: default_preparation_state(),
+        preparation_error: None,
         genre: None,
         pages: Some(extracted.pages),
         status: "unread".to_string(),
@@ -910,8 +1068,8 @@ fn do_insert_book(
     let device = sync.self_device().to_string();
     sync.with_tx(db, now, |tx, events| {
         tx.execute(
-            "INSERT INTO books (id, title, author, description, cover_path, file_path, format, source_format, render_format, source_file_path, source_sha256, conversion_version, genre, pages, status, progress, current_cfi, created_at, updated_at, updated_by_device, cover_data)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+            "INSERT INTO books (id, title, author, description, cover_path, file_path, format, source_format, render_format, source_file_path, source_sha256, conversion_version, preparation_state, preparation_error, genre, pages, status, progress, current_cfi, created_at, updated_at, updated_by_device, cover_data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             params![
                 book.id,
                 book.title,
@@ -925,6 +1083,8 @@ fn do_insert_book(
                 book.source_file_path,
                 book.source_sha256,
                 book.conversion_version,
+                book.preparation_state,
+                book.preparation_error,
                 book.genre,
                 book.pages,
                 book.status,
@@ -965,8 +1125,12 @@ pub async fn import_book(
     file_path: String,
     db: State<'_, Db>,
     sync: State<'_, SyncWriter>,
+    app: AppHandle,
 ) -> AppResult<Book> {
     let mut book = do_import_from_path(&file_path, &db, &sync)?;
+    if book.render_format.as_deref() == Some("text") {
+        schedule_text_book_preparation(app, book.id.clone());
+    }
     resolve_book_paths(&mut book, &db)?;
     Ok(book)
 }
@@ -1126,7 +1290,7 @@ pub(crate) fn query_books(
 
     // Main query with cursor + limit.
     let sql = format!(
-        "SELECT books.id, books.title, books.author, books.description, books.cover_path, books.file_path, books.format, books.source_format, books.render_format, books.source_file_path, books.source_sha256, books.conversion_version, books.genre, books.pages, books.status, books.progress, books.current_cfi, books.created_at, books.updated_at, books.cover_data FROM {from_clause}{where_clause} ORDER BY books.updated_at DESC, books.id ASC LIMIT ?",
+        "SELECT books.id, books.title, books.author, books.description, books.cover_path, books.file_path, books.format, books.source_format, books.render_format, books.source_file_path, books.source_sha256, books.conversion_version, books.genre, books.pages, books.status, books.progress, books.current_cfi, books.created_at, books.updated_at, books.cover_data, books.preparation_state, books.preparation_error FROM {from_clause}{where_clause} ORDER BY books.updated_at DESC, books.id ASC LIMIT ?",
     );
     param_values.push(Box::new((limit + 1) as i64));
 
@@ -1150,6 +1314,8 @@ pub(crate) fn query_books(
                 source_file_path: row.get(9)?,
                 source_sha256: row.get(10)?,
                 conversion_version: row.get::<_, Option<i32>>(11)?.unwrap_or(0),
+                preparation_state: row.get(20)?,
+                preparation_error: row.get(21)?,
                 genre: row.get(12)?,
                 pages: row.get(13)?,
                 status: row.get(14)?,
@@ -1185,7 +1351,7 @@ pub(crate) fn query_books(
 pub(crate) fn query_book(db: &Db, id: &str) -> AppResult<Book> {
     let conn = db.reader();
     let book = conn.query_row(
-        "SELECT id, title, author, description, cover_path, file_path, format, source_format, render_format, source_file_path, source_sha256, conversion_version, genre, pages, status, progress, current_cfi, created_at, updated_at, cover_data FROM books WHERE id = ?1",
+        "SELECT id, title, author, description, cover_path, file_path, format, source_format, render_format, source_file_path, source_sha256, conversion_version, genre, pages, status, progress, current_cfi, created_at, updated_at, cover_data, preparation_state, preparation_error FROM books WHERE id = ?1",
         params![id],
         |row| {
             let cover_blob: Option<Vec<u8>> = row.get(19)?;
@@ -1202,6 +1368,8 @@ pub(crate) fn query_book(db: &Db, id: &str) -> AppResult<Book> {
                 source_file_path: row.get(9)?,
                 source_sha256: row.get(10)?,
                 conversion_version: row.get::<_, Option<i32>>(11)?.unwrap_or(0),
+                preparation_state: row.get(20)?,
+                preparation_error: row.get(21)?,
                 genre: row.get(12)?,
                 pages: row.get(13)?,
                 status: row.get(14)?,
@@ -1259,7 +1427,7 @@ pub(crate) fn query_books_lite(
     };
 
     let sql = format!(
-        "SELECT id, title, author, description, cover_path, file_path, format, source_format, render_format, source_file_path, source_sha256, conversion_version, genre, pages, status, progress, current_cfi, created_at, updated_at, (cover_data IS NOT NULL AND LENGTH(cover_data) > 0) AS has_cover FROM books{where_clause} ORDER BY updated_at DESC LIMIT ?",
+        "SELECT id, title, author, description, cover_path, file_path, format, source_format, render_format, source_file_path, source_sha256, conversion_version, genre, pages, status, progress, current_cfi, created_at, updated_at, (cover_data IS NOT NULL AND LENGTH(cover_data) > 0) AS has_cover, preparation_state, preparation_error FROM books{where_clause} ORDER BY updated_at DESC LIMIT ?",
     );
     param_values.push(Box::new(limit as i64));
     let params_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -1282,6 +1450,8 @@ pub(crate) fn query_books_lite(
                 source_file_path: row.get(9)?,
                 source_sha256: row.get(10)?,
                 conversion_version: row.get::<_, Option<i32>>(11)?.unwrap_or(0),
+                preparation_state: row.get(20)?,
+                preparation_error: row.get(21)?,
                 genre: row.get(12)?,
                 pages: row.get(13)?,
                 status: row.get(14)?,
@@ -1362,6 +1532,63 @@ pub fn get_book(id: String, db: State<'_, Db>) -> AppResult<Book> {
     Ok(book)
 }
 
+#[tauri::command]
+pub fn get_text_book_document(
+    book_id: String,
+    db: State<'_, Db>,
+    local_dir: State<'_, LocalDir>,
+    app: AppHandle,
+) -> AppResult<TextBookDocument> {
+    crate::sync::validation::validate_entity_id(&book_id)?;
+    let state: (String, Option<String>) = {
+        let conn = db.reader();
+        conn.query_row(
+            "SELECT preparation_state, preparation_error FROM books WHERE id = ?1 AND render_format = 'text'",
+            params![book_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?
+    };
+    match state.0.as_str() {
+        "ready" => {
+            let path = prepared_document_path(&local_dir.0, &book_id);
+            match fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<TextBookDocument>(&bytes).ok())
+            {
+                Some(document) if document.version == TEXT_DOCUMENT_VERSION => Ok(document),
+                _ => {
+                    update_text_preparation_state(&db, &book_id, "pending", None, None)?;
+                    schedule_text_book_preparation(app, book_id);
+                    Err(AppError::Other("TEXT_PREPARATION_PENDING".to_string()))
+                }
+            }
+        }
+        "pending" => {
+            schedule_text_book_preparation(app, book_id);
+            Err(AppError::Other("TEXT_PREPARATION_PENDING".to_string()))
+        }
+        "preparing" => Err(AppError::Other("TEXT_PREPARATION_PENDING".to_string())),
+        "failed" => Err(AppError::Other(format!(
+            "TEXT_PREPARATION_FAILED:{}",
+            state.1.unwrap_or_else(|| "UNKNOWN".to_string())
+        ))),
+        _ => Err(AppError::Other("TEXT_PREPARATION_PENDING".to_string())),
+    }
+}
+
+#[tauri::command]
+pub fn retry_text_book_preparation(
+    book_id: String,
+    db: State<'_, Db>,
+    app: AppHandle,
+) -> AppResult<()> {
+    crate::sync::validation::validate_entity_id(&book_id)?;
+    update_text_preparation_state(&db, &book_id, "pending", None, None)?;
+    emit_text_preparation_changed(&app, &book_id, "pending");
+    schedule_text_book_preparation(app, book_id);
+    Ok(())
+}
+
 /// Check a book's local file state and trigger iCloud download only for an
 /// actual evicted placeholder. A missing local file is not an iCloud retry.
 #[tauri::command]
@@ -1429,8 +1656,15 @@ pub(crate) fn do_delete_book(id: &str, db: &Db, sync: &SyncWriter) -> AppResult<
 }
 
 #[tauri::command]
-pub fn delete_book(id: String, db: State<'_, Db>, sync: State<'_, SyncWriter>) -> AppResult<()> {
-    do_delete_book(&id, &db, &sync)
+pub fn delete_book(
+    id: String,
+    db: State<'_, Db>,
+    sync: State<'_, SyncWriter>,
+    local_dir: State<'_, LocalDir>,
+) -> AppResult<()> {
+    do_delete_book(&id, &db, &sync)?;
+    let _ = fs::remove_file(prepared_document_path(&local_dir.0, &id));
+    Ok(())
 }
 
 #[tauri::command]
@@ -1646,6 +1880,69 @@ mod tests {
         assert_eq!(decode_txt(&fs::read(&path).unwrap()).unwrap(), "Hi");
     }
 
+    #[test]
+    fn text_import_copies_source_and_defers_preparation() {
+        let (dir, db) = setup();
+        let source = dir.path().join("reader.txt");
+        fs::write(&source, "Chapter 1\n\nFirst paragraph.").unwrap();
+        let sync = SyncWriter::new("dev-A".to_string());
+
+        let book = do_import_text(source.to_str().unwrap(), "txt", &db, &sync).unwrap();
+
+        assert_eq!(book.format, "text");
+        assert_eq!(book.render_format.as_deref(), Some("text"));
+        assert_eq!(book.preparation_state, "pending");
+        assert!(book.pages.is_none());
+        assert!(db.resolve_path(&book.file_path).unwrap().is_file());
+        assert!(dir
+            .path()
+            .join("books")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn text_preparation_normalizes_markdown_and_html() {
+        let dir = TempDir::new().unwrap();
+        let markdown = dir.path().join("book.md");
+        let html = dir.path().join("book.html");
+        fs::write(&markdown, "# Chapter One\n\nHello **reader**.").unwrap();
+        fs::write(&html, "<h1>Chapter Two</h1><p>Hello <em>reader</em>.</p>").unwrap();
+
+        let markdown_document = prepare_text_document(&markdown, "markdown", None).unwrap();
+        let html_document = prepare_text_document(&html, "html", None).unwrap();
+
+        assert_eq!(markdown_document.version, TEXT_DOCUMENT_VERSION);
+        assert!(markdown_document.chapters[0]
+            .paragraphs
+            .join(" ")
+            .contains("Hello reader"));
+        assert!(html_document.chapters[0]
+            .paragraphs
+            .join(" ")
+            .contains("Hello reader"));
+    }
+
+    #[test]
+    fn prepared_document_write_is_readable() {
+        let dir = TempDir::new().unwrap();
+        let document = TextBookDocument {
+            version: TEXT_DOCUMENT_VERSION,
+            source_sha256: Some("abc".to_string()),
+            chapters: vec![TextBookChapter {
+                title: "Reading".to_string(),
+                paragraphs: vec!["A paragraph".to_string()],
+            }],
+        };
+        let path = prepared_document_path(dir.path(), "book-id");
+        write_prepared_document(&path, &document).unwrap();
+
+        let restored: TextBookDocument = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(restored.chapters[0].paragraphs, ["A paragraph"]);
+    }
+
     fn setup() -> (TempDir, Db) {
         let dir = TempDir::new().unwrap();
         let db = Db::init(dir.path()).unwrap();
@@ -1760,7 +2057,7 @@ mod tests {
 
         let conn = db.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-        "SELECT id, title, author, description, cover_path, file_path, format, source_format, render_format, source_file_path, source_sha256, conversion_version, genre, pages, status, progress, current_cfi, created_at, updated_at FROM books ORDER BY id",
+        "SELECT id, title, author, description, cover_path, file_path, format, source_format, render_format, source_file_path, source_sha256, conversion_version, genre, pages, status, progress, current_cfi, created_at, updated_at, preparation_state, preparation_error FROM books ORDER BY id",
         ).unwrap();
         let books: Vec<Book> = stmt
             .query_map([], |row| {
@@ -1777,6 +2074,8 @@ mod tests {
                     source_file_path: row.get(9)?,
                     source_sha256: row.get(10)?,
                     conversion_version: row.get::<_, Option<i32>>(11)?.unwrap_or(0),
+                    preparation_state: row.get(19)?,
+                    preparation_error: row.get(20)?,
                     genre: row.get(12)?,
                     pages: row.get(13)?,
                     status: row.get(14)?,
@@ -1954,13 +2253,14 @@ mod tests {
 
         let conn = db.conn.lock().unwrap();
         let book: Book = conn.query_row(
-            "SELECT id, title, author, description, cover_path, file_path, format, source_format, render_format, source_file_path, source_sha256, conversion_version, genre, pages, status, progress, current_cfi, created_at, updated_at FROM books WHERE id = 'b1'",
+            "SELECT id, title, author, description, cover_path, file_path, format, source_format, render_format, source_file_path, source_sha256, conversion_version, genre, pages, status, progress, current_cfi, created_at, updated_at, preparation_state, preparation_error FROM books WHERE id = 'b1'",
             [],
             |row| Ok(Book {
                 id: row.get(0)?, title: row.get(1)?, author: row.get(2)?,
                 description: row.get(3)?, cover_path: row.get(4)?, file_path: row.get(5)?,
                 format: row.get(6)?, source_format: row.get(7)?, render_format: row.get(8)?,
                 source_file_path: row.get(9)?, source_sha256: row.get(10)?, conversion_version: row.get::<_, Option<i32>>(11)?.unwrap_or(0),
+                preparation_state: row.get(19)?, preparation_error: row.get(20)?,
                 genre: row.get(12)?, pages: row.get(13)?, status: row.get(14)?, progress: row.get(15)?, current_cfi: row.get(16)?,
                 created_at: row.get(17)?, updated_at: row.get(18)?, available: true, cover_data: None,
             }),

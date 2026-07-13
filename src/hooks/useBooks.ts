@@ -9,11 +9,13 @@ export interface Book {
   description: string | null;
   cover_path: string | null;
   file_path: string;
-  // Text-like source files render as EPUB; native Foliate formats retain
-  // their original extension so its built-in detector selects the parser.
-  format: "epub" | "pdf" | "mobi" | "azw" | "azw3" | "fb2" | "fbz" | "cbz";
+  // Text-like source files are prepared into a local reader document. Native
+  // formats retain their source extension for Foliate's parser selection.
+  format: "epub" | "pdf" | "text" | "mobi" | "azw" | "azw3" | "fb2" | "fbz" | "cbz";
   source_format: string | null;
   render_format: string | null;
+  preparation_state: "pending" | "preparing" | "ready" | "failed";
+  preparation_error: string | null;
   genre: string | null;
   pages: number | null;
   status: "reading" | "finished" | "unread";
@@ -146,4 +148,8 @@ export async function updateBookMetadata(
 
 export async function checkBookAvailable(id: string): Promise<BookAvailability> {
   return invoke<BookAvailability>("check_book_available", { id });
+}
+
+export async function retryTextBookPreparation(id: string): Promise<void> {
+  return invoke("retry_text_book_preparation", { bookId: id });
 }

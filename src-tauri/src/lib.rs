@@ -352,6 +352,10 @@ fn boot_sync_engine(
             }
             let bg_writer: tauri::State<SyncWriter> = bg_handle.state();
             bg_writer.backfill_cover_files(&bg_db);
+            // Peer imports can add text books after the startup scan ran.
+            // Their source blobs are now reconciled, so build local reader
+            // caches without holding the sync worker or UI thread.
+            commands::books::schedule_pending_text_book_preparations(bg_handle.clone());
             let _ = bg_handle.emit("sync-initial-tick-done", ());
         })
         .ok();
@@ -480,6 +484,8 @@ pub fn run() {
             };
             migrate_legacy_app_data(&local_dir).expect("failed to migrate legacy app data");
             std::fs::create_dir_all(&local_dir).expect("failed to create app data dir");
+            std::fs::create_dir_all(local_dir.join("prepared"))
+                .expect("failed to create text preparation cache");
 
             // Self-heal: if .sync_setting survived but quill.db
             // was deleted (e.g. user cleared app data via Finder, which
@@ -576,6 +582,12 @@ pub fn run() {
             app.manage(sync_writer);
             app.manage(SyncState::new(None, None));
 
+            // TXT, Markdown, and HTML books keep their source files in the
+            // library, while their reader documents are local derived caches.
+            // Resume any interrupted work after managed state is available;
+            // this deliberately runs away from setup's UI-critical path.
+            commands::books::schedule_pending_text_book_preparations(app.handle().clone());
+
             // Boot the sync engine on a background thread. Everything
             // that touches iCloud paths (EventLog::open, watcher::spawn,
             // initial tick) runs here so setup() is never blocked by
@@ -641,6 +653,8 @@ pub fn run() {
             commands::books::update_book_pages,
             commands::books::check_book_available,
             commands::books::update_book_metadata,
+            commands::books::get_text_book_document,
+            commands::books::retry_text_book_preparation,
             // Settings
             commands::settings::get_all_settings,
             commands::settings::ai_api_key_configured,
