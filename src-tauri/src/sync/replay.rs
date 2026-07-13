@@ -1248,7 +1248,7 @@ mod tests {
     #[test]
     fn malformed_event_is_skipped_and_good_events_still_apply() {
         let env = setup("self");
-        let events = vec![
+        let events = [
             ev(1000, "peer-A", import("b1")),
             ev(
                 2000,
@@ -1276,7 +1276,7 @@ mod tests {
     #[test]
     fn failed_event_does_not_advance_peer_watermark_past_it() {
         let env = setup("self");
-        let events = vec![
+        let events = [
             ev(1000, "peer-A", import("b1")),
             ev(
                 2000,

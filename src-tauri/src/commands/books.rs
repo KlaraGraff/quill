@@ -171,6 +171,23 @@ fn detect_import_format(path: &Path) -> AppResult<ImportFormat> {
     {
         return Ok(ImportFormat::Fb2);
     }
+    let is_text_extension = || {
+        ext.eq_ignore_ascii_case("txt")
+            || ext.eq_ignore_ascii_case("md")
+            || ext.eq_ignore_ascii_case("markdown")
+            || ext.eq_ignore_ascii_case("html")
+            || ext.eq_ignore_ascii_case("htm")
+    };
+    // UTF-16 text contains NUL bytes by design. Inspect the BOM before the
+    // generic binary guard so decode_txt can handle UTF-16 LE/BE correctly.
+    if encoding_rs::Encoding::for_bom(header).is_some() && is_text_extension() {
+        return match ext.to_ascii_lowercase().as_str() {
+            "txt" => Ok(ImportFormat::Txt),
+            "md" | "markdown" => Ok(ImportFormat::Markdown),
+            "html" | "htm" => Ok(ImportFormat::Html),
+            _ => Err(unsupported_format()),
+        };
+    }
     if !header.contains(&0) {
         if ext.eq_ignore_ascii_case("txt") {
             return Ok(ImportFormat::Txt);
@@ -536,6 +553,12 @@ pub struct Book {
     pub cover_data: Option<String>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+pub struct BookAvailability {
+    pub status: String,
+    pub available: bool,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -670,6 +693,9 @@ pub(crate) fn do_import_text(
         "html" => html_to_text(&decoded),
         _ => decoded,
     };
+    if text.trim().is_empty() {
+        return Err(AppError::Other("EMPTY_BOOK".to_string()));
+    }
     let title = source
         .file_stem()
         .and_then(|value| value.to_str())
@@ -1336,9 +1362,10 @@ pub fn get_book(id: String, db: State<'_, Db>) -> AppResult<Book> {
     Ok(book)
 }
 
-/// Check if a book's file is locally available and trigger iCloud download if not.
+/// Check a book's local file state and trigger iCloud download only for an
+/// actual evicted placeholder. A missing local file is not an iCloud retry.
 #[tauri::command]
-pub fn check_book_available(id: String, db: State<'_, Db>) -> AppResult<bool> {
+pub fn check_book_available(id: String, db: State<'_, Db>) -> AppResult<BookAvailability> {
     let conn = db.reader();
     let file_path: String = conn.query_row(
         "SELECT file_path FROM books WHERE id = ?1",
@@ -1347,13 +1374,14 @@ pub fn check_book_available(id: String, db: State<'_, Db>) -> AppResult<bool> {
     )?;
 
     let abs_path = db.resolve_path(&file_path)?;
-    let available = icloud::is_file_downloaded(&abs_path);
-
-    if !available {
+    let availability = icloud::file_availability(&abs_path);
+    if availability == icloud::FileAvailability::ICloudPlaceholder {
         icloud::trigger_download_file(&abs_path);
     }
-
-    Ok(available)
+    Ok(BookAvailability {
+        status: availability.as_str().to_string(),
+        available: availability == icloud::FileAvailability::Available,
+    })
 }
 
 pub(crate) fn do_delete_book(id: &str, db: &Db, sync: &SyncWriter) -> AppResult<()> {
@@ -1607,6 +1635,15 @@ mod tests {
         assert!(slug.len() <= 60);
         assert!(slug.starts_with("the-quick-brown-fox"));
         assert!(!slug.ends_with('-'));
+    }
+
+    #[test]
+    fn detect_import_format_accepts_utf16_txt_bom() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("utf16.txt");
+        fs::write(&path, [0xff, 0xfe, b'H', 0, b'i', 0]).unwrap();
+        assert_eq!(detect_import_format(&path).unwrap(), ImportFormat::Txt);
+        assert_eq!(decode_txt(&fs::read(&path).unwrap()).unwrap(), "Hi");
     }
 
     fn setup() -> (TempDir, Db) {

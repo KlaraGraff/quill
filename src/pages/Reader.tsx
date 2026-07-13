@@ -27,7 +27,7 @@ import ExplainPopover from "../components/ExplainPopover";
 import DictionaryPanel from "../components/DictionaryPanel";
 import TranslationPopover from "../components/TranslationPopover";
 import TableOfContents from "../components/TableOfContents";
-import { getBook, updateReadingProgress, checkBookAvailable, type Book } from "../hooks/useBooks";
+import { getBook, updateReadingProgress, checkBookAvailable, type Book, type BookAvailabilityStatus } from "../hooks/useBooks";
 import { getAllSettings } from "../hooks/useSettings";
 import type { Highlight } from "../hooks/useBookmarks";
 
@@ -258,6 +258,24 @@ function getPdfStartCfi(progress: number, pageCount: number | null | undefined):
   return `epubcfi(/6/${(idx + 1) * 2})`;
 }
 
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, code: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(code)), timeoutMs);
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        window.clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+type ReaderAvailability = BookAvailabilityStatus | "checking" | "timeout" | "error";
+
 export default function Reader() {
   const { bookId } = useParams();
   const navigate = useNavigate();
@@ -283,8 +301,10 @@ export default function Reader() {
   const [bookReady, setBookReady] = useState(false);
   const [canGoBack, setCanGoBack] = useState(false);
   const backButtonTimerRef = useRef<number | null>(null);
-  const [icloudDownloading, setIcloudDownloading] = useState(false);
-  const [icloudTimeout, setIcloudTimeout] = useState(false);
+  const [availabilityState, setAvailabilityState] = useState<ReaderAvailability | null>(null);
+  const [availabilityRetry, setAvailabilityRetry] = useState(0);
+  const [readerError, setReaderError] = useState<string | null>(null);
+  const [readerRetry, setReaderRetry] = useState(0);
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
@@ -558,36 +578,51 @@ export default function Reader() {
     };
   }, [bookId]);
 
-  // Wait for iCloud download if book is not locally available
+  // Wait for an evicted iCloud book, but fail fast for missing local files.
   useEffect(() => {
-    if (!book || book.available !== false) return;
+    if (!book || book.available !== false) {
+      setAvailabilityState(null);
+      return;
+    }
 
-    setIcloudDownloading(true);
-    setIcloudTimeout(false);
+    setAvailabilityState("checking");
     let cancelled = false;
     const startTime = Date.now();
 
     const poll = async () => {
       while (!cancelled) {
-        if (Date.now() - startTime > 60_000) {
-          setIcloudTimeout(true);
+        if (Date.now() - startTime >= 60_000) {
+          setAvailabilityState("timeout");
           return;
         }
-        const available = await checkBookAvailable(book.id).catch(() => false);
-        if (available) {
+        const result = await checkBookAvailable(book.id).catch(() => null);
+        if (!result) {
+          setAvailabilityState("error");
+          return;
+        }
+        if (result.available) {
           // Re-fetch book to get updated available flag
           const updated = await getBook(book.id).catch(() => null);
-          if (updated) setBook(updated);
-          setIcloudDownloading(false);
+          if (updated?.available !== false) {
+            setBook(updated);
+            setAvailabilityState(null);
+          } else {
+            setAvailabilityState("error");
+          }
           return;
         }
+        if (result.status === "missing") {
+          setAvailabilityState("missing");
+          return;
+        }
+        setAvailabilityState("icloud_placeholder");
         await new Promise((r) => setTimeout(r, 2000));
       }
     };
 
     poll();
     return () => { cancelled = true; };
-  }, [book]);
+  }, [book, availabilityRetry]);
 
   // Initialize foliate-js when book data is loaded
   useEffect(() => {
@@ -596,27 +631,30 @@ export default function Reader() {
     const container = viewerRef.current;
     container.innerHTML = "";
     setBookReady(false);
+    setReaderError(null);
 
     let cancelled = false;
+    let activeView: FoliateView | null = null;
 
     const initFoliate = async () => {
       // Load foliate-js web components (from public/ dir, loaded as native ES module)
       if (!customElements.get("foliate-view")) {
-        await new Promise<void>((resolve, reject) => {
+        await withTimeout(new Promise<void>((resolve, reject) => {
           const script = document.createElement("script");
           script.type = "module";
           script.src = "/foliate-js/view.js";
           script.onload = () => resolve();
           script.onerror = () => reject(new Error("Failed to load foliate-js"));
           document.head.appendChild(script);
-        });
+        }), 15_000, "READER_SCRIPT_TIMEOUT");
         // Wait for custom element to be defined
-        await customElements.whenDefined("foliate-view");
+        await withTimeout(customElements.whenDefined("foliate-view"), 15_000, "READER_ELEMENT_TIMEOUT");
       }
 
       if (cancelled) return;
 
       const view = document.createElement("foliate-view") as FoliateView;
+      activeView = view;
       view.style.display = "block";
       view.style.width = "100%";
       view.style.height = "100%";
@@ -630,8 +668,11 @@ export default function Reader() {
 
       // Preserve the stored source extension so Foliate selects its native parser.
       const fileUrl = convertFileSrc(book.file_path);
-      const response = await fetch(fileUrl);
-      const extension = book.source_format || book.format;
+      const response = await withTimeout(fetch(fileUrl), 30_000, "READER_FILE_TIMEOUT");
+      if (!response.ok) {
+        throw new Error(`READER_FILE_${response.status}`);
+      }
+      const extension = (book.render_format || book.format || "epub").toLowerCase();
       const mime = {
         epub: "application/epub+zip",
         pdf: "application/pdf",
@@ -642,8 +683,12 @@ export default function Reader() {
         fbz: "application/x-zip-compressed-fb2",
         cbz: "application/vnd.comicbook+zip",
       }[extension] || "application/octet-stream";
-      const blob = new File([await response.blob()], `book.${extension}`, { type: mime });
-      await view.open(blob);
+      const blob = new File(
+        [await withTimeout(response.blob(), 30_000, "READER_FILE_READ_TIMEOUT")],
+        `book.${extension}`,
+        { type: mime },
+      );
+      await withTimeout(view.open(blob), 45_000, "READER_OPEN_TIMEOUT");
 
       if (cancelled) return;
 
@@ -974,7 +1019,11 @@ export default function Reader() {
         const pageCount = view.book?.sections?.length ?? book.pages;
         startLocation = getPdfStartCfi(book.progress, pageCount);
       }
-      await view.init({ lastLocation: startLocation, showTextStart: !startLocation });
+      await withTimeout(
+        view.init({ lastLocation: startLocation, showTextStart: !startLocation }),
+        45_000,
+        "READER_INIT_TIMEOUT",
+      );
 
       if (cancelled) return;
 
@@ -987,8 +1036,13 @@ export default function Reader() {
     };
 
     initFoliate().catch((err) => {
+      if (cancelled) return;
       console.error("Failed to initialize foliate-js:", err);
-      setBookReady(true); // Remove loading overlay even on error
+      activeView?.close();
+      activeView?.remove();
+      if (viewRef.current === activeView) viewRef.current = null;
+      setReaderError(err instanceof Error ? err.message : "READER_INIT_FAILED");
+      setBookReady(false);
     });
 
     return () => {
@@ -1010,7 +1064,7 @@ export default function Reader() {
     // below, so the derived dep stays `null` for them and the effect won't
     // re-run.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [book, book?.format === "pdf" ? readerSettings.readingMode : null, applyAnnotations, capabilities, supportsManualAnnotations, supportsSelection]);
+  }, [book, book?.format === "pdf" ? readerSettings.readingMode : null, applyAnnotations, capabilities, supportsManualAnnotations, supportsSelection, readerRetry]);
 
   // Apply reader settings reactively
   useEffect(() => {
@@ -1376,16 +1430,57 @@ export default function Reader() {
     );
   }
 
-  if (icloudDownloading) {
+  const returnToLibrary = () => {
+    if (isStandaloneWindow) {
+      appWindow.close().catch(() => navigate("/"));
+    } else {
+      navigate("/");
+    }
+  };
+
+  if (readerError) {
     return (
-      <div className="flex flex-col items-center justify-center h-screen gap-3">
-        {icloudTimeout ? (
-          <p className="text-text-muted text-[14px]">{t("reader.downloadTimeout")}</p>
-        ) : (
-          <>
-            <Loader2 size={24} className="animate-spin text-text-muted" />
-            <p className="text-text-muted text-[14px]">{t("reader.downloadingFromICloud")}</p>
-          </>
+      <div className="flex flex-col items-center justify-center h-screen gap-4 px-6 text-center">
+        <p className="text-text-primary text-[16px] font-medium">{t("reader.initializationFailed")}</p>
+        <p className="text-text-muted text-[13px] max-w-[520px] break-words">{readerError}</p>
+        <div className="flex items-center gap-2">
+          <Button variant="secondary" size="sm" onClick={() => setReaderRetry((value) => value + 1)}>
+            {t("reader.retry")}
+          </Button>
+          <Button variant="ghost" size="sm" onClick={returnToLibrary}>
+            <ArrowLeft size={14} />
+            {t("reader.returnToLibrary")}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  if (availabilityState) {
+    const waitingForCloud = availabilityState === "checking" || availabilityState === "icloud_placeholder";
+    const message = availabilityState === "missing"
+      ? t("reader.fileUnavailable")
+      : availabilityState === "error"
+        ? t("reader.fileCheckFailed")
+        : availabilityState === "timeout"
+          ? t("reader.downloadTimeout")
+          : waitingForCloud
+            ? t("reader.downloadingFromICloud")
+            : t("reader.fileCheckFailed");
+    return (
+      <div className="flex flex-col items-center justify-center h-screen gap-4 px-6 text-center">
+        {waitingForCloud && <Loader2 size={24} className="animate-spin text-text-muted" />}
+        <p className="text-text-muted text-[14px] max-w-[420px]">{message}</p>
+        {!waitingForCloud && (
+          <div className="flex items-center gap-2">
+            <Button variant="secondary" size="sm" onClick={() => setAvailabilityRetry((value) => value + 1)}>
+              {t("reader.retry")}
+            </Button>
+            <Button variant="ghost" size="sm" onClick={returnToLibrary}>
+              <ArrowLeft size={14} />
+              {t("reader.returnToLibrary")}
+            </Button>
+          </div>
         )}
       </div>
     );

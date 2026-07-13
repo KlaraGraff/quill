@@ -10,16 +10,42 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSFileManager, NSString};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileAvailability {
+    Available,
+    ICloudPlaceholder,
+    Missing,
+}
+
+impl FileAvailability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::ICloudPlaceholder => "icloud_placeholder",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+/// Classify a book path without treating every missing path as an iCloud
+/// download. A missing local file needs a different recovery path from an
+/// evicted iCloud item.
+pub fn file_availability(path: &Path) -> FileAvailability {
+    if path.exists() {
+        FileAvailability::Available
+    } else if has_icloud_placeholder(path) {
+        FileAvailability::ICloudPlaceholder
+    } else {
+        FileAvailability::Missing
+    }
+}
+
 /// Check whether a file is locally available (not an iCloud placeholder).
 ///
 /// iCloud evicts files by replacing `foo.epub` with `.foo.epub.icloud`.
 /// Returns `true` if the real file exists on disk.
 pub fn is_file_downloaded(path: &Path) -> bool {
-    if path.exists() {
-        return true;
-    }
-    // If the real file doesn't exist, it might be an iCloud placeholder — either way, not available.
-    false
+    file_availability(path) == FileAvailability::Available
 }
 
 /// Returns the iCloud placeholder path for a given file.
@@ -81,6 +107,24 @@ mod tests {
         fs::write(&placeholder, "placeholder").unwrap();
         let file = dir.path().join("book.epub");
         assert!(!is_file_downloaded(&file));
+    }
+
+    #[test]
+    fn file_availability_distinguishes_missing_from_placeholder() {
+        let dir = TempDir::new().unwrap();
+        let available = dir.path().join("available.epub");
+        fs::write(&available, "epub data").unwrap();
+        assert_eq!(file_availability(&available), FileAvailability::Available);
+
+        let missing = dir.path().join("missing.epub");
+        assert_eq!(file_availability(&missing), FileAvailability::Missing);
+
+        fs::write(dir.path().join(".evicted.epub.icloud"), "placeholder").unwrap();
+        let evicted = dir.path().join("evicted.epub");
+        assert_eq!(
+            file_availability(&evicted),
+            FileAvailability::ICloudPlaceholder
+        );
     }
 
     // --- icloud_placeholder_path ---

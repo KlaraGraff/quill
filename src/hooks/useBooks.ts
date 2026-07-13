@@ -25,6 +25,13 @@ export interface Book {
   cover_data: string | null;
 }
 
+export type BookAvailabilityStatus = "available" | "icloud_placeholder" | "missing";
+
+export interface BookAvailability {
+  status: BookAvailabilityStatus;
+  available: boolean;
+}
+
 interface BookPage {
   books: Book[];
   next_cursor: string | null;
@@ -137,6 +144,6 @@ export async function updateBookMetadata(
   return invoke("update_book_metadata", { id, title, author });
 }
 
-export async function checkBookAvailable(id: string): Promise<boolean> {
-  return invoke<boolean>("check_book_available", { id });
+export async function checkBookAvailable(id: string): Promise<BookAvailability> {
+  return invoke<BookAvailability>("check_book_available", { id });
 }
