@@ -426,14 +426,14 @@ Reader windows are independent Tauri windows. Closing the main window hides it o
 | Workflow | Trigger | Steps |
 |---|---|---|
 | `ci.yaml` | Pull request | TypeScript check, ESLint, `cargo clippy`, `cargo test --lib` |
-| `release.yml` | `v*` tag push | Build macOS (aarch64 + x86_64) + Windows, code sign, notarize (macOS), create draft GitHub release |
+| `release.yml` | `v*` tag push | Build macOS (aarch64 + x86_64) + Windows, verify macOS ad-hoc signatures, create draft GitHub release; Developer ID signing and notarization activate when Apple credentials are configured |
 
 ### 10.2 Release process
 
 1. Bump version in `package.json`, `tauri.conf.json`, `Cargo.toml`.
 2. `cargo check` to sync `Cargo.lock`.
 3. Commit, tag `v{version}`, push.
-4. CI builds artifacts, signs, notarizes, uploads to draft release.
+4. CI builds artifacts, verifies macOS app signatures, and uploads to a draft release. When Apple Developer ID credentials are configured, it additionally signs and notarizes macOS builds.
 5. Edit release notes, publish.
 
 The auto-updater polls `https://github.com/yicheng47/quill/releases/latest/download/latest.json` on each launch. Updates are minisign-verified before install.

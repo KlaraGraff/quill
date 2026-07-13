@@ -83,6 +83,7 @@ jobs:
           echo "Certificate: $CERT_ID"
 
       - name: Build signed Tauri app
+        id: build-signed
         if: steps.signing.outputs.enabled == 'true'
         uses: tauri-apps/tauri-action@v0
         env:
@@ -93,7 +94,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ steps.certificate.outputs.identity }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -105,9 +105,12 @@ jobs:
           releaseBody: "See the [commits](https://github.com/${{ github.repository }}/commits/${{ github.ref_name }}) for details."
           releaseDraft: true
           prerelease: false
-          args: --target ${{ matrix.target }}
+          args: >-
+            --target ${{ matrix.target }}
+            --config '{"bundle":{"macOS":{"signingIdentity":"${{ steps.certificate.outputs.identity }}"}}}'
 
-      - name: Build unsigned Tauri app
+      - name: Build ad-hoc signed Tauri app
+        id: build-adhoc
         if: steps.signing.outputs.enabled != 'true'
         uses: tauri-apps/tauri-action@v0
         env:
@@ -125,6 +128,16 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: --target ${{ matrix.target }}
+
+      - name: Verify macOS app signature
+        if: >-
+          success() &&
+          (steps.build-signed.outcome == 'success' || steps.build-adhoc.outcome == 'success')
+        run: |
+          APP_PATH="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Quill Personal.app"
+          test -d "$APP_PATH"
+          codesign --verify --deep --strict --verbose=4 "$APP_PATH"
+          codesign -dv --verbose=4 "$APP_PATH" 2>&1
 
   build-windows:
     runs-on: windows-latest

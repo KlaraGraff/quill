@@ -34,7 +34,7 @@ This edition currently targets the macOS desktop app. It does not claim compatib
 
 ## Download
 
-Current builds and release notes are published at [KlaraGraff/quill Releases](https://github.com/KlaraGraff/quill/releases). Automatic updates are disabled until this fork has its own signed release channel.
+Current builds and release notes are published at [KlaraGraff/quill Releases](https://github.com/KlaraGraff/quill/releases). macOS builds currently use a valid ad-hoc signature, so Gatekeeper will still require a first-run confirmation. The signing and notarization roadmap is documented in [macOS distribution](docs/guide/macos-distribution.md). Automatic updates are disabled until this fork has its own signed release channel.
 
 ## Development
 
