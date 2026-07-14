@@ -285,14 +285,6 @@ impl Secrets {
         )))
     }
 
-    #[cfg(test)]
-    fn master_confirmation_request(&self, reason: &str) -> AppResult<String> {
-        Ok(self
-            .master_key_or_confirmation(reason)
-            .unwrap_err()
-            .to_string())
-    }
-
     /// Records an in-app cancellation without touching the operating-system
     /// credential store. The session remains denied until an explicit retry.
     pub fn deny(&self, reason: &str, request_id: Option<&str>) -> AppResult<()> {
@@ -1307,6 +1299,19 @@ impl Secrets {
         session.pending_master_request = None;
         Ok(())
     }
+
+    // Test-only state transitions keep production helpers private to the
+    // production impl while allowing denial behavior to be verified directly.
+    fn deny_master_for_test(&self) -> AppResult<()> {
+        self.set_master_state(MasterKeyState::Denied)
+    }
+
+    fn master_confirmation_request(&self, reason: &str) -> AppResult<String> {
+        Ok(self
+            .master_key_or_confirmation(reason)
+            .unwrap_err()
+            .to_string())
+    }
 }
 
 #[cfg(test)]
@@ -1352,7 +1357,7 @@ mod tests {
     fn denied_master_key_stops_the_session_from_prompting_again() {
         let secrets = Secrets::init_in_memory().unwrap();
         secrets.set("ai_api_key/test", "secret-value").unwrap();
-        secrets.set_master_state(MasterKeyState::Denied).unwrap();
+        secrets.deny_master_for_test().unwrap();
 
         let error = secrets.get("ai_api_key/test").unwrap_err().to_string();
         assert_eq!(error, "VAULT_ACCESS_DENIED");
