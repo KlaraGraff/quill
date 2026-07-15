@@ -138,6 +138,10 @@ export async function updateBookMetadata(
   return invoke("update_book_metadata", { id, title, author });
 }
 
+export async function updateBookCover(id: string, imagePath: string): Promise<void> {
+  return invoke("update_book_cover", { id, imagePath });
+}
+
 export async function checkBookAvailable(id: string): Promise<BookAvailability> {
   return invoke<BookAvailability>("check_book_available", { id });
 }

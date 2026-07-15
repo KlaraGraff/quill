@@ -163,6 +163,7 @@ export default function BookGrid({ books, hasMore, loadMore, loadingMore, active
           bookId={editBook.id}
           currentTitle={editBook.title}
           currentAuthor={editBook.author}
+          currentCover={editBook.cover_data}
           onClose={() => setEditBook(null)}
           onSaved={() => {
             setEditBook(null);

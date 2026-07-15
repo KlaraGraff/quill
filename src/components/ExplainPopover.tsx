@@ -14,6 +14,7 @@ interface ExplainPopoverProps {
   text: string;
   sentence: string;
   bookTitle?: string;
+  bookAuthor?: string;
   chapter?: string;
   bookId: string;
   cfi?: string;
@@ -30,6 +31,7 @@ function useExplainStream(
   passage: string,
   surrounding: string | undefined,
   bookTitle: string | undefined,
+  bookAuthor: string | undefined,
   chapter: string | undefined
 ) {
   const contentRef = useRef("");
@@ -78,6 +80,7 @@ function useExplainStream(
           passage,
           surrounding: surrounding || null,
           bookTitle: bookTitle || null,
+          bookAuthor: bookAuthor || null,
           chapter: chapter || null,
           requestId,
         });
@@ -109,7 +112,7 @@ function useExplainStream(
       unlistenRef.current?.();
       unlistenRef.current = null;
     };
-  }, [passage, surrounding, bookTitle, chapter]);
+  }, [passage, surrounding, bookAuthor, bookTitle, chapter]);
 
   return { content, contentRef, streaming, aiError, streamError };
 }
@@ -120,6 +123,7 @@ export default function ExplainPopover({
   text,
   sentence,
   bookTitle,
+  bookAuthor,
   chapter,
   onClose,
 }: ExplainPopoverProps) {
@@ -131,6 +135,7 @@ export default function ExplainPopover({
     text,
     sentence,
     bookTitle,
+    bookAuthor,
     chapter
   );
 

@@ -47,12 +47,13 @@ pub(crate) use import::{
 };
 #[doc(hidden)]
 pub use mutate::{
-    __cmd__delete_book, __cmd__mark_finished, __cmd__update_book_metadata,
-    __cmd__update_book_pages, __cmd__update_book_status, __cmd__update_reading_progress,
+    __cmd__delete_book, __cmd__mark_finished, __cmd__update_book_cover,
+    __cmd__update_book_metadata, __cmd__update_book_pages, __cmd__update_book_status,
+    __cmd__update_reading_progress,
 };
 pub use mutate::{
-    delete_book, mark_finished, update_book_metadata, update_book_pages, update_book_status,
-    update_reading_progress,
+    delete_book, mark_finished, update_book_cover, update_book_metadata, update_book_pages,
+    update_book_status, update_reading_progress,
 };
 #[allow(unused_imports)]
 pub(crate) use mutate::{do_delete_book, do_delete_book_with_note_policy, do_update_book};

@@ -2,6 +2,7 @@ import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { useParams, useNavigate, useLocation } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import {
   ArrowLeft,
@@ -216,6 +217,27 @@ export default function Reader() {
   }, []);
 
   const readingAssistanceSettingsRef = useRef<Record<string, string>>({});
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    listen<{ id: string; title: string; author: string }>("book-metadata-changed", (event) => {
+      if (event.payload.id !== bookId) return;
+      setBook((current) => current ? {
+        ...current,
+        title: event.payload.title,
+        author: event.payload.author,
+      } : current);
+      if (isStandaloneWindow) appWindow.setTitle(event.payload.title).catch(() => {});
+    }).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [bookId]);
 
   useEffect(() => {
     let disposed = false;
@@ -1509,6 +1531,7 @@ export default function Reader() {
           interaction={learningInteraction}
           bookId={bookId}
           bookTitle={book?.title}
+          bookAuthor={book?.author}
           chapter={currentChapterIndex >= 0 && currentChapterIndex < chapters.length
             ? chapters[currentChapterIndex].title
             : undefined}
@@ -1533,6 +1556,11 @@ export default function Reader() {
           text={translation.text}
           context={translation.context}
           bookId={bookId!}
+          bookTitle={book?.title}
+          bookAuthor={book?.author}
+          chapter={currentChapterIndex >= 0 && currentChapterIndex < chapters.length
+            ? chapters[currentChapterIndex].title
+            : undefined}
           cfi={translation.cfi}
           onClose={() => setTranslation(null)}
         />

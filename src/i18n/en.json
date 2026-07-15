@@ -278,6 +278,10 @@
   "editInfo.title": "Edit Info",
   "editInfo.bookTitle": "Title",
   "editInfo.bookAuthor": "Author",
+  "editInfo.cover": "Cover",
+  "editInfo.changeCover": "Change cover",
+  "editInfo.coverHint": "JPEG, PNG, or WebP up to 10 MB",
+  "editInfo.saveFailed": "Could not save. Check the image format and try again.",
   "editInfo.cancel": "Cancel",
   "editInfo.save": "Save",
 

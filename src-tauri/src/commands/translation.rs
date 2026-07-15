@@ -1,6 +1,6 @@
 use tauri::{AppHandle, State};
 
-use crate::commands::ai::{emit_stream_failure, ChatMessage};
+use crate::commands::ai::{book_reference_block, emit_stream_failure, ChatMessage};
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
 use crate::secrets::Secrets;
@@ -43,6 +43,9 @@ pub async fn ai_translate_passage(
     text: String,
     context: Option<String>,
     #[allow(unused_variables)] book_id: String,
+    book_title: Option<String>,
+    book_author: Option<String>,
+    chapter: Option<String>,
     target_language: Option<String>,
     request_id: String,
     app: AppHandle,
@@ -73,7 +76,7 @@ pub async fn ai_translate_passage(
     let has_context = context
         .as_ref()
         .is_some_and(|c| c != &text && c.len() > text.len());
-    let system_prompt = if has_context {
+    let mut system_prompt = if has_context {
         format!(
             "You are a translator embedded in an ebook reader. The user selected a portion of text they want translated into {}.\n\n\
             Full paragraph for context:\n\"{}\"\n\n\
@@ -89,6 +92,14 @@ pub async fn ai_translate_passage(
             target_name
         )
     };
+    if let Some(reference) = book_reference_block(
+        book_title.as_deref(),
+        book_author.as_deref(),
+        chapter.as_deref(),
+    ) {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&reference);
+    }
 
     let messages = vec![
         ChatMessage {
@@ -163,5 +174,14 @@ mod tests {
             configured_translation_language(None, Some(" en ".to_string()), Some("zh".to_string()))
                 .unwrap();
         assert_eq!(saved, "en");
+    }
+
+    #[test]
+    fn translation_uses_shared_untrusted_book_reference() {
+        let block =
+            book_reference_block(Some("Book"), Some("Unknown Author"), Some("One")).unwrap();
+        assert!(block.contains("untrusted reference data"));
+        assert!(block.contains("\"title\":\"Book\""));
+        assert!(!block.contains("Unknown Author"));
     }
 }

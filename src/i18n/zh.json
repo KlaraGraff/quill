@@ -278,6 +278,10 @@
   "editInfo.title": "编辑信息",
   "editInfo.bookTitle": "标题",
   "editInfo.bookAuthor": "作者",
+  "editInfo.cover": "封面",
+  "editInfo.changeCover": "更换封面",
+  "editInfo.coverHint": "支持 JPEG、PNG 和 WebP，最大 10 MB",
+  "editInfo.saveFailed": "保存失败，请检查图片格式后重试",
   "editInfo.cancel": "取消",
   "editInfo.save": "保存",
 

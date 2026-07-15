@@ -31,6 +31,7 @@ interface LookupPopoverProps {
   word: string;
   sentence: string;
   bookTitle?: string;
+  bookAuthor?: string;
   chapter?: string;
   bookId: string;
   cfi?: string;
@@ -42,6 +43,7 @@ function useStreamingLookup(
   word: string,
   sentence: string,
   bookTitle: string | undefined,
+  bookAuthor: string | undefined,
   chapter: string | undefined,
   kind: "definition" | "context"
 ) {
@@ -93,6 +95,7 @@ function useStreamingLookup(
           word,
           sentence,
           bookTitle: bookTitle || null,
+          bookAuthor: bookAuthor || null,
           chapter: chapter || null,
           requestId,
           kind,
@@ -127,7 +130,7 @@ function useStreamingLookup(
       unlistenRef.current?.();
       unlistenRef.current = null;
     };
-  }, [word, sentence, bookTitle, chapter, kind]);
+  }, [word, sentence, bookAuthor, bookTitle, chapter, kind]);
 
   return { content, contentRef, streaming, aiError, translationLanguageNotConfigured, streamError };
 }
@@ -169,6 +172,7 @@ export default function LookupPopover({
   word,
   sentence,
   bookTitle,
+  bookAuthor,
   chapter,
   bookId,
   cfi,
@@ -182,8 +186,8 @@ export default function LookupPopover({
   const popoverRef = useRef<HTMLDivElement>(null);
 
   // Two concurrent AI streams
-  const definition = useStreamingLookup(word, sentence, bookTitle, chapter, "definition");
-  const context = useStreamingLookup(word, sentence, bookTitle, chapter, "context");
+  const definition = useStreamingLookup(word, sentence, bookTitle, bookAuthor, chapter, "definition");
+  const context = useStreamingLookup(word, sentence, bookTitle, bookAuthor, chapter, "context");
 
   // Split the backend-marked translation from the definition stream.
   const { translationLine, definitionText } = splitDefinitionContent(definition.content, definition.streaming);

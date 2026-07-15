@@ -4,6 +4,25 @@ use super::text_prepare::{
 };
 use super::*;
 
+const MAX_CUSTOM_COVER_BYTES: u64 = 10 * 1024 * 1024;
+
+fn validated_cover_bytes(path: &Path) -> AppResult<Vec<u8>> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_CUSTOM_COVER_BYTES {
+        return Err(AppError::Other("BOOK_COVER_SIZE_INVALID".to_string()));
+    }
+    let bytes = fs::read(path)?;
+    let supported = bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(b"\xFF\xD8\xFF")
+        || (bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP");
+    if !supported {
+        return Err(AppError::Other("BOOK_COVER_FORMAT_INVALID".to_string()));
+    }
+    image::load_from_memory(&bytes)
+        .map_err(|_| AppError::Other("BOOK_COVER_FORMAT_INVALID".to_string()))?;
+    Ok(bytes)
+}
+
 pub(crate) fn do_delete_book(id: &str, db: &Db, sync: &SyncWriter) -> AppResult<()> {
     do_delete_book_with_note_policy(id, false, db, sync)
 }
@@ -266,9 +285,79 @@ pub fn update_book_metadata(
     id: String,
     title: String,
     author: String,
+    app: AppHandle,
     db: State<'_, Db>,
     sync: State<'_, SyncWriter>,
 ) -> AppResult<()> {
     do_update_book(&id, Some(&title), Some(&author), None, None, &db, &sync)?;
+    if let Err(error) = app.emit(
+        "book-metadata-changed",
+        serde_json::json!({ "id": id, "title": title, "author": author }),
+    ) {
+        log::warn!("failed to notify readers about metadata update: {error}");
+    }
     Ok(())
+}
+
+#[tauri::command]
+pub fn update_book_cover(
+    id: String,
+    image_path: String,
+    db: State<'_, Db>,
+    sync: State<'_, SyncWriter>,
+) -> AppResult<()> {
+    crate::sync::validation::validate_entity_id(&id)?;
+    let bytes = validated_cover_bytes(Path::new(&image_path))?;
+    let relative_path = format!("covers/{id}.img");
+    let destination = db.resolve_path(&relative_path)?;
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = destination.with_extension("img.tmp");
+    let previous = fs::read(&destination).ok();
+    fs::write(&temporary, &bytes)?;
+    fs::rename(&temporary, &destination)?;
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let device = sync.self_device().to_string();
+    let result = sync.with_tx(&db, now, |tx, events| {
+        let changed = tx.execute(
+            "UPDATE books
+             SET cover_path = ?1, cover_data = ?2, updated_at = ?3, updated_by_device = ?4
+             WHERE id = ?5",
+            params![relative_path, bytes, now, device, id],
+        )?;
+        if changed == 0 {
+            return Err(AppError::Other("BOOK_NOT_FOUND".to_string()));
+        }
+        events.push(EventBody::BookMetadataSet {
+            book: id.clone(),
+            field: "cover_path".to_string(),
+            value: serde_json::Value::String(relative_path.clone()),
+        });
+        Ok(())
+    });
+    if let Err(error) = result {
+        if let Some(previous) = previous {
+            let _ = fs::write(&destination, previous);
+        } else {
+            let _ = fs::remove_file(&destination);
+        }
+        return Err(error);
+    }
+    sync.queue_cover_write(&db, &id, &bytes);
+    Ok(())
+}
+
+#[cfg(test)]
+mod cover_tests {
+    use super::*;
+
+    #[test]
+    fn custom_cover_rejects_non_image_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cover.png");
+        fs::write(&path, b"not an image").unwrap();
+        assert!(validated_cover_bytes(&path).is_err());
+    }
 }

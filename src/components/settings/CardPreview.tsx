@@ -207,6 +207,7 @@ export default function CardPreview({
         context: localResult.modules.source_excerpt?.quote ?? localResult.sourceText,
         kind,
         bookTitle: null,
+        bookAuthor: null,
         chapter: null,
         cardConfig: JSON.stringify(config),
         requestId,

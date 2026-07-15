@@ -33,6 +33,7 @@ interface LearningCardControllerProps {
   interaction: ReaderInteraction;
   bookId: string;
   bookTitle?: string;
+  bookAuthor?: string;
   chapter?: string;
   config: CardDesignConfigV1;
   readerRect?: SerializableRect | DOMRect | null;
@@ -135,6 +136,7 @@ export default function LearningCardController({
   interaction,
   bookId,
   bookTitle,
+  bookAuthor,
   chapter,
   config,
   readerRect,
@@ -215,6 +217,7 @@ export default function LearningCardController({
           context: interaction.context,
           kind: interaction.kind,
           bookTitle: bookTitle || null,
+          bookAuthor: bookAuthor || null,
           chapter: chapter || null,
           cardConfig: JSON.stringify(config),
           requestId,
@@ -255,7 +258,7 @@ export default function LearningCardController({
       unlisten = undefined;
       invoke("ai_cancel", { requestId }).catch(() => {});
     };
-  }, [bookId, bookTitle, chapter, config, interaction, onLookupSuccess, retry]);
+  }, [bookAuthor, bookId, bookTitle, chapter, config, interaction, onLookupSuccess, retry]);
 
   useEffect(() => {
     refreshNotes().catch(() => {});

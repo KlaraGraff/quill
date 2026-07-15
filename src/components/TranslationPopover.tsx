@@ -21,6 +21,9 @@ interface TranslationPopoverProps {
   text: string;
   context?: string;
   bookId: string;
+  bookTitle?: string;
+  bookAuthor?: string;
+  chapter?: string;
   cfi?: string;
   onClose: () => void;
 }
@@ -49,6 +52,9 @@ function useStreamingTranslation(
   text: string,
   context: string | undefined,
   bookId: string,
+  bookTitle: string | undefined,
+  bookAuthor: string | undefined,
+  chapter: string | undefined,
   cfi: string | undefined
 ) {
   const contentRef = useRef("");
@@ -108,6 +114,9 @@ function useStreamingTranslation(
           text,
           context: context || null,
           bookId,
+          bookTitle: bookTitle || null,
+          bookAuthor: bookAuthor || null,
+          chapter: chapter || null,
           targetLanguage: null,
           requestId,
         });
@@ -141,7 +150,7 @@ function useStreamingTranslation(
       unlistenRef.current?.();
       unlistenRef.current = null;
     };
-  }, [text, context, bookId, cfi]);
+  }, [text, context, bookAuthor, bookId, bookTitle, cfi, chapter]);
 
   return { content, contentRef, streaming, aiError, languageNotConfigured, targetLang, streamError };
 }
@@ -152,6 +161,9 @@ export default function TranslationPopover({
   text,
   context,
   bookId,
+  bookTitle,
+  bookAuthor,
+  chapter,
   cfi,
   onClose,
 }: TranslationPopoverProps) {
@@ -161,7 +173,7 @@ export default function TranslationPopover({
   const popoverRef = useRef<HTMLDivElement>(null);
 
   const { content, contentRef, streaming, aiError, languageNotConfigured, targetLang, streamError } =
-    useStreamingTranslation(text, context, bookId, cfi);
+    useStreamingTranslation(text, context, bookId, bookTitle, bookAuthor, chapter, cfi);
 
   const allDone = !streaming;
   const hasContent = !!content;

@@ -668,6 +668,7 @@ pub fn run() {
             commands::books::update_book_status,
             commands::books::update_book_pages,
             commands::books::check_book_available,
+            commands::books::update_book_cover,
             commands::books::update_book_metadata,
             commands::books::get_text_book_document,
             commands::books::retry_text_book_preparation,
