@@ -1,0 +1,12 @@
+name: Event Probe
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "event=${{ github.event_name }} ref=${{ github.ref }} sha=${{ github.sha }}"'
