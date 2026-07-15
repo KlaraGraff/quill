@@ -543,6 +543,74 @@ pub fn load_book_overview(db: &Db, book_id: &str) -> AppResult<Option<BookOvervi
     Ok(Some(BookOverview { content, sections }))
 }
 
+pub fn load_section_overview(
+    db: &Db,
+    book_id: &str,
+    cutoff: super::retrieve::SpoilerCutoff,
+) -> AppResult<Option<BookOverview>> {
+    let state = get_book_ai_state(db, book_id)?;
+    if !state.has_summaries || state.summaries_stale {
+        return Ok(None);
+    }
+    let conn = db.reader();
+    let source_sha256: Option<String> = conn
+        .query_row(
+            "SELECT source_sha256 FROM book_index_state WHERE book_id = ?1",
+            params![book_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(source_sha256) = source_sha256 else {
+        return Ok(None);
+    };
+    let mut statement = conn.prepare(
+        "SELECT s.section_index, s.section_title, s.content, MAX(c.char_end)
+         FROM book_summaries s
+         LEFT JOIN book_chunks c
+           ON c.book_id = s.book_id AND c.section_index = s.section_index
+         WHERE s.book_id = ?1 AND s.scope = 'section' AND s.source_sha256 = ?2
+         GROUP BY s.id, s.section_index, s.section_title, s.content
+         ORDER BY s.section_index",
+    )?;
+    let sections = filter_section_overviews(
+        statement
+            .query_map(params![book_id, source_sha256], |row| {
+                Ok((
+                    SectionOverview {
+                        section_index: row.get(0)?,
+                        section_title: row.get(1)?,
+                        content: row.get(2)?,
+                    },
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?,
+        cutoff,
+    );
+    if sections.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(BookOverview {
+        content: String::new(),
+        sections,
+    }))
+}
+
+fn filter_section_overviews(
+    sections: Vec<(SectionOverview, Option<i64>)>,
+    cutoff: super::retrieve::SpoilerCutoff,
+) -> Vec<SectionOverview> {
+    sections
+        .into_iter()
+        .filter_map(|(section, char_end)| {
+            cutoff
+                .allows_section_summary(section.section_index, char_end)
+                .then_some(section)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,6 +641,46 @@ mod tests {
         assert_eq!(
             short_section_summary(&[chunk(0, 30, "First sentence. Second sentence.")]),
             "First sentence. Second sentence."
+        );
+    }
+
+    #[test]
+    fn read_section_summaries_respect_section_and_character_cutoffs() {
+        let rows = || {
+            vec![
+                (
+                    SectionOverview {
+                        section_index: 0,
+                        section_title: Some("One".into()),
+                        content: "First".into(),
+                    },
+                    Some(99),
+                ),
+                (
+                    SectionOverview {
+                        section_index: 1,
+                        section_title: Some("Two".into()),
+                        content: "Second".into(),
+                    },
+                    Some(199),
+                ),
+            ]
+        };
+        assert_eq!(
+            filter_section_overviews(
+                rows(),
+                crate::ai::grounding::retrieve::SpoilerCutoff::Section(0),
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            filter_section_overviews(
+                rows(),
+                crate::ai::grounding::retrieve::SpoilerCutoff::Character(99),
+            )
+            .len(),
+            1
         );
     }
 

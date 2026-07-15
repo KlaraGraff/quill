@@ -806,6 +806,7 @@ pub fn run() {
             commands::chats::rename_chat,
             commands::chats::list_chat_messages,
             commands::chats::save_chat_message,
+            commands::chats::replace_chat_message,
             // Translation
             commands::translation::ai_translate_passage,
             // MCP client integrations

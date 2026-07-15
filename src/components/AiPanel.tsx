@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { Database, Sparkles, Send, Loader2, Plus, ChevronDown, ChevronUp, Trash2, X, Square } from "lucide-react";
+import { BookOpen, Database, Sparkles, Send, Loader2, Plus, ChevronDown, ChevronUp, Trash2, X, Square } from "lucide-react";
 import { useAiChat } from "../hooks/useAiChat";
 import { timeAgo } from "../utils/timeAgo";
 import MessageBubble from "./MessageBubble";
@@ -28,9 +28,9 @@ export default function AiPanel({ bookId, bookTitle, bookAuthor, currentChapter,
     t("ai.prompt.characters"),
   ];
   const {
-    messages, streaming, send, cancel, initialize,
+    messages, streaming, send, retryWithWholeBook, cancel, initialize,
     chatId, chats, titling, initializing, groundingStatus, summaryProgress, bookAiState,
-    summariesAuto, prepareBookOverview, loadChat, deleteChat, renameChat, reset,
+    summariesAuto, spoilerGuardEnabled, setSpoilerGuardEnabled, prepareBookOverview, loadChat, deleteChat, renameChat, reset,
   } = useAiChat(bookId, { title: bookTitle, author: bookAuthor, chapter: currentChapter });
 
   const [input, setInput] = useState("");
@@ -190,6 +190,17 @@ export default function AiPanel({ bookId, bookTitle, bookAuthor, currentChapter,
         </div>
         <button
           type="button"
+          aria-pressed={spoilerGuardEnabled}
+          onClick={() => void setSpoilerGuardEnabled(!spoilerGuardEnabled)}
+          disabled={!bookId}
+          title={t(spoilerGuardEnabled ? "ai.spoilerGuard.bookOn" : "ai.spoilerGuard.bookOff")}
+          aria-label={t(spoilerGuardEnabled ? "ai.spoilerGuard.bookOn" : "ai.spoilerGuard.bookOff")}
+          className={`flex size-7 shrink-0 items-center justify-center rounded-lg hover:bg-bg-input disabled:opacity-40 ${spoilerGuardEnabled ? "text-accent-text" : "text-text-muted"}`}
+        >
+          <BookOpen size={15} />
+        </button>
+        <button
+          type="button"
           onClick={() => setIndexOpen(true)}
           disabled={!bookId}
           title={t("indexManager.title")}
@@ -305,7 +316,7 @@ export default function AiPanel({ bookId, bookTitle, bookAuthor, currentChapter,
         ) : (
           <div className="flex flex-col gap-3">
             {messages.map((msg) => (
-              <MessageBubble key={msg.id} msg={msg} messages={messages} streaming={streaming} onNavigateToCfi={onNavigateToCfi} onNavigateToSource={onNavigateToSource} />
+              <MessageBubble key={msg.id} msg={msg} messages={messages} streaming={streaming} onNavigateToCfi={onNavigateToCfi} onNavigateToSource={onNavigateToSource} onRetryWithWholeBook={retryWithWholeBook} />
             ))}
             <div />
           </div>

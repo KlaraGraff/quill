@@ -244,6 +244,8 @@ pub struct ChatMessageRow {
     pub metadata: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub updated_by_device: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

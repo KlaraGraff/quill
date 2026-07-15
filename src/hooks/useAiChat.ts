@@ -13,7 +13,19 @@ export interface ChatMessage {
   contextAnalysis?: string;
   reasoning?: string;
   sources?: CitedSource[];
+  spoilerGuard?: SpoilerGuardMetadata;
   dbId?: string;
+}
+
+export interface SpoilerGuardMetadata {
+  active: boolean;
+  wholeBookIntent: boolean;
+  progress: number;
+}
+
+interface AiChatResult {
+  sources: CitedSource[];
+  spoilerGuard: SpoilerGuardMetadata;
 }
 
 export interface CitedSource {
@@ -77,6 +89,42 @@ interface ChatMessageMetadata {
   analysis?: string;
   reasoning?: string;
   sources?: CitedSource[];
+  spoilerGuard?: SpoilerGuardMetadata;
+}
+
+function parseSpoilerGuard(value: unknown): SpoilerGuardMetadata | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const guard = value as Record<string, unknown>;
+  if (typeof guard.active !== "boolean" || typeof guard.wholeBookIntent !== "boolean") {
+    return undefined;
+  }
+  return {
+    active: guard.active,
+    wholeBookIntent: guard.wholeBookIntent,
+    progress: typeof guard.progress === "number" ? guard.progress : 0,
+  };
+}
+
+function parseAiChatResult(value: unknown): AiChatResult {
+  // Compatibility with v1.5 development builds that returned sources directly.
+  if (Array.isArray(value)) {
+    return {
+      sources: parseCitedSources(value) ?? [],
+      spoilerGuard: { active: false, wholeBookIntent: false, progress: 0 },
+    };
+  }
+  if (!value || typeof value !== "object") {
+    return {
+      sources: [],
+      spoilerGuard: { active: false, wholeBookIntent: false, progress: 0 },
+    };
+  }
+  const result = value as Record<string, unknown>;
+  return {
+    sources: parseCitedSources(result.sources) ?? [],
+    spoilerGuard: parseSpoilerGuard(result.spoilerGuard)
+      ?? { active: false, wholeBookIntent: false, progress: 0 },
+  };
 }
 
 function parseCitedSources(value: unknown): CitedSource[] | undefined {
@@ -103,6 +151,7 @@ function parseMessageMetadata(metadata: string | null): ChatMessageMetadata {
       analysis: typeof value.analysis === "string" ? value.analysis : undefined,
       reasoning: typeof value.reasoning === "string" ? value.reasoning : undefined,
       sources: parseCitedSources(value.sources),
+      spoilerGuard: parseSpoilerGuard(value.spoilerGuard),
     };
   } catch {
     return {};
@@ -115,6 +164,7 @@ function serializeMessageMetadata(metadata: ChatMessageMetadata): string | null 
   if (metadata.analysis) compact.analysis = metadata.analysis;
   if (metadata.reasoning) compact.reasoning = metadata.reasoning;
   if (metadata.sources?.length) compact.sources = metadata.sources;
+  if (metadata.spoilerGuard) compact.spoilerGuard = metadata.spoilerGuard;
   return Object.keys(compact).length > 0 ? JSON.stringify(compact) : null;
 }
 
@@ -217,7 +267,12 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
   const [groundingStatus, setGroundingStatus] = useState<GroundingStatusEvent["status"] | null>(null);
   const [summaryProgress, setSummaryProgress] = useState<SummaryProgressEvent | null>(null);
   const [bookAiState, setBookAiState] = useState<BookAiState | null>(null);
-  const { settings } = useSettings();
+  const { settings, save: saveSetting } = useSettings();
+  const spoilerSettingKey = bookId ? `book_spoiler_guard_${bookId}` : null;
+  const spoilerGuardEnabled = spoilerSettingKey
+    ? settings[spoilerSettingKey] === "on"
+      || (settings[spoilerSettingKey] !== "off" && settings.ai_spoiler_guard !== "false")
+    : settings.ai_spoiler_guard !== "false";
 
   const unlistenRef = useRef<UnlistenFn | null>(null);
   const groundingUnlistenRef = useRef<UnlistenFn | null>(null);
@@ -228,6 +283,7 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
   const streamingRef = useRef(false);
   const activeRequestIdRef = useRef<string | null>(null);
   const activeAssistantIdRef = useRef<string | null>(null);
+  const activeReplacementRef = useRef<ChatMessage | null>(null);
   const initializingRef = useRef(true);
   const streamGenerationRef = useRef(0);
   const streamFrameCleanupRef = useRef<(() => void) | null>(null);
@@ -387,6 +443,7 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
           contextAnalysis: metadata.analysis,
           reasoning: metadata.reasoning,
           sources: metadata.sources,
+          spoilerGuard: metadata.spoilerGuard,
           dbId: m.id,
         };
       });
@@ -446,7 +503,13 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
   }, [bookId, refreshChats, loadChat]);
 
   const send = useCallback(
-    async (content: string, context?: string, contextCfi?: string, contextAnalysis?: string) => {
+    async (
+      content: string,
+      context?: string,
+      contextCfi?: string,
+      contextAnalysis?: string,
+      options?: { spoilerOverride?: boolean; replaceAssistantId?: string },
+    ) => {
       // Refuse while the session chat is still loading — otherwise the lazy
       // chat-creation path below would spawn a *new* chat and miss the
       // existing one. Belt-and-suspenders alongside the UI gate.
@@ -486,6 +549,21 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
         return;
       }
 
+      const replacingAssistant = options?.replaceAssistantId
+        ? messagesRef.current.find((message) => message.id === options.replaceAssistantId && message.role === "assistant")
+        : undefined;
+      const replacementIndex = replacingAssistant
+        ? messagesRef.current.findIndex((message) => message.id === replacingAssistant.id)
+        : -1;
+      const previousUser = replacementIndex > 0 && messagesRef.current[replacementIndex - 1]?.role === "user"
+        ? messagesRef.current[replacementIndex - 1]
+        : undefined;
+      if (options?.replaceAssistantId && (!replacingAssistant || !previousUser)) {
+        stopActiveStream(false);
+        return;
+      }
+      activeReplacementRef.current = replacingAssistant ?? null;
+
       // New chat: generate the title from the user's message, concurrently with
       // the response stream (not after it), showing a loading state until it
       // lands. Falls back to a truncated title if the AI call fails.
@@ -514,7 +592,7 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
         });
       }
 
-      const userMessage: ChatMessage = {
+      const userMessage: ChatMessage = previousUser ?? {
         id: nextMsgId(),
         role: "user",
         content,
@@ -523,30 +601,37 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
         contextAnalysis,
       };
 
-      const assistantId = nextMsgId();
+      const assistantId = replacingAssistant?.id ?? nextMsgId();
       const assistantMessage: ChatMessage = {
         id: assistantId,
         role: "assistant",
         content: "",
+        dbId: replacingAssistant?.dbId,
       };
       activeAssistantIdRef.current = assistantId;
 
-      const apiHistory = [...messagesRef.current, userMessage];
-      updateMessages((prev) => [...prev, userMessage, assistantMessage]);
+      const apiHistory = replacingAssistant
+        ? messagesRef.current.slice(0, replacementIndex)
+        : [...messagesRef.current, userMessage];
+      updateMessages((prev) => replacingAssistant
+        ? prev.map((message) => message.id === assistantId ? assistantMessage : message)
+        : [...prev, userMessage, assistantMessage]);
 
       // Persist user message
-      try {
-        const meta = serializeMessageMetadata({ cfi: contextCfi, analysis: contextAnalysis });
-        const saved = await invoke<ChatMsgRecord>("save_chat_message", {
-          chatId: currentChatId,
-          role: "user",
-          content,
-          context: context || null,
-          metadata: meta,
-        });
-        userMessage.dbId = saved.id;
-      } catch (err) {
-        console.error("Failed to save user message:", err);
+      if (!replacingAssistant) {
+        try {
+          const meta = serializeMessageMetadata({ cfi: contextCfi, analysis: contextAnalysis });
+          const saved = await invoke<ChatMsgRecord>("save_chat_message", {
+            chatId: currentChatId,
+            role: "user",
+            content,
+            context: context || null,
+            metadata: meta,
+          });
+          userMessage.dbId = saved.id;
+        } catch (err) {
+          console.error("Failed to save user message:", err);
+        }
       }
       if (!isRequestActive()) return;
 
@@ -554,6 +639,8 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
       let fullContent = "";
       let fullReasoning = "";
       let citedSources: CitedSource[] = [];
+      let spoilerGuard: SpoilerGuardMetadata | undefined;
+      let chatResultPromise: Promise<AiChatResult> | null = null;
       let pendingContent = "";
       let pendingReasoning = "";
       let updateFrame: number | null = null;
@@ -652,26 +739,69 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
                 updateMessages((prev) =>
                   prev.map((m) =>
                     m.id === assistantId
-                      ? { ...m, content: fullContent || errorCode }
+                      ? replacingAssistant ?? { ...m, content: fullContent || errorCode }
                       : m
                   )
                 );
+                activeReplacementRef.current = null;
+                finishRequest();
+                return;
+              }
+
+              try {
+                const result = await chatResultPromise;
+                if (!result) throw new Error("AI_CHAT_RESULT_MISSING");
+                if (!isRequestActive()) return;
+                citedSources = result.sources;
+                spoilerGuard = result.spoilerGuard;
+                updateMessages((previous) => previous.map((message) => (
+                  message.id === assistantId
+                    ? { ...message, sources: citedSources, spoilerGuard }
+                    : message
+                )));
+              } catch (err) {
+                if (!isRequestActive()) return;
+                const errorContent = getAiErrorCode(err) ?? "AI_STREAM_FAILED";
+                updateMessages((previous) => previous.map((message) => (
+                  message.id === assistantId
+                    ? replacingAssistant ?? { ...message, content: errorContent }
+                    : message
+                )));
+                activeReplacementRef.current = null;
                 finishRequest();
                 return;
               }
 
               finishRequest();
+              activeReplacementRef.current = null;
 
               // Only a provider-confirmed completed stream may become history.
               if (fullContent) {
                 try {
-                  await invoke("save_chat_message", {
-                    chatId: currentChatId,
-                    role: "assistant",
-                    content: fullContent,
-                    context: null,
-                    metadata: serializeMessageMetadata({ reasoning: fullReasoning, sources: citedSources }),
+                  const metadata = serializeMessageMetadata({
+                    reasoning: fullReasoning,
+                    sources: citedSources,
+                    spoilerGuard,
                   });
+                  if (replacingAssistant?.dbId) {
+                    await invoke("replace_chat_message", {
+                      messageId: replacingAssistant.dbId,
+                      content: fullContent,
+                      metadata,
+                    });
+                  } else {
+                    const saved = await invoke<ChatMsgRecord>("save_chat_message", {
+                      chatId: currentChatId,
+                      role: "assistant",
+                      content: fullContent,
+                      context: null,
+                      metadata,
+                    });
+                    assistantMessage.dbId = saved.id;
+                    updateMessages((previous) => previous.map((message) => (
+                      message.id === assistantId ? { ...message, dbId: saved.id } : message
+                    )));
+                  }
                 } catch (err) {
                   console.error("Failed to save assistant message:", err);
                 }
@@ -700,8 +830,11 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
         if (!isRequestActive()) return;
         const errorContent = getAiErrorCode(err) ?? "AI_STREAM_FAILED";
         updateMessages((prev) => prev.map((message) => (
-          message.id === assistantId ? { ...message, content: errorContent } : message
+          message.id === assistantId
+            ? replacingAssistant ?? { ...message, content: errorContent }
+            : message
         )));
+        activeReplacementRef.current = null;
         finishRequest();
         return;
       }
@@ -718,17 +851,23 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
 
       try {
         if (!isRequestActive()) return;
-        citedSources = await invoke<CitedSource[]>("ai_chat", {
+        chatResultPromise = invoke<unknown>("ai_chat", {
           messages: apiMessages,
           bookId: bookId ?? null,
           bookTitle: bookContext?.title ?? null,
           bookAuthor: bookContext?.author ?? null,
           currentChapter: bookContext?.chapter ?? null,
           requestId,
-        });
-        if (isRequestActive() && citedSources.length > 0) {
+          spoilerOverride: options?.spoilerOverride ?? null,
+        }).then(parseAiChatResult);
+        const result = await chatResultPromise;
+        citedSources = result.sources;
+        spoilerGuard = result.spoilerGuard;
+        if (isRequestActive()) {
           updateMessages((previous) => previous.map((message) => (
-            message.id === assistantId ? { ...message, sources: citedSources } : message
+            message.id === assistantId
+              ? { ...message, sources: citedSources, spoilerGuard }
+              : message
           )));
         }
       } catch (err) {
@@ -738,27 +877,50 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
         updateMessages((prev) =>
           prev.map((m) =>
             m.id === assistantId
-              ? { ...m, content: errorContent }
+              ? replacingAssistant ?? { ...m, content: errorContent }
               : m
           )
         );
+        activeReplacementRef.current = null;
         finishRequest();
       }
     },
     [bookId, bookContext?.title, bookContext?.author, bookContext?.chapter, createChat, prepareBookOverview, refreshChats, settings.ai_summaries_auto, stopActiveStream]
   );
 
+  const retryWithWholeBook = useCallback((assistantId: string) => {
+    const assistantIndex = messagesRef.current.findIndex((message) => message.id === assistantId);
+    const userMessage = assistantIndex > 0 ? messagesRef.current[assistantIndex - 1] : undefined;
+    if (!userMessage || userMessage.role !== "user") return;
+    void send(
+      userMessage.content,
+      userMessage.context,
+      userMessage.contextCfi,
+      userMessage.contextAnalysis,
+      { spoilerOverride: true, replaceAssistantId: assistantId },
+    );
+  }, [send]);
+
+  const setSpoilerGuardEnabled = useCallback(async (enabled: boolean) => {
+    if (!spoilerSettingKey) return;
+    await saveSetting(spoilerSettingKey, enabled ? "on" : "off");
+  }, [saveSetting, spoilerSettingKey]);
+
   const cancel = useCallback(() => {
     if (!activeRequestIdRef.current && !streamingRef.current) return;
     const assistantId = activeAssistantIdRef.current;
+    const replacement = activeReplacementRef.current;
+    activeReplacementRef.current = null;
     stopActiveStream();
     if (!assistantId || !mountedRef.current) return;
     setMessages((current) => {
-      const next = current.filter((message) => (
-        message.id !== assistantId
-        || Boolean(message.content.trim())
-        || Boolean(message.reasoning?.trim())
-      ));
+      const next = replacement
+        ? current.map((message) => message.id === assistantId ? replacement : message)
+        : current.filter((message) => (
+            message.id !== assistantId
+            || Boolean(message.content.trim())
+            || Boolean(message.reasoning?.trim())
+          ));
       messagesRef.current = next;
       return next;
     });
@@ -812,11 +974,14 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
     summaryProgress,
     bookAiState,
     summariesAuto: settings.ai_summaries_auto !== "false",
+    spoilerGuardEnabled,
+    setSpoilerGuardEnabled,
     prepareBookOverview,
     cancel,
     titling,
     initializing,
     send,
+    retryWithWholeBook,
     reset,
     initialize,
     chatId,

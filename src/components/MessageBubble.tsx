@@ -18,6 +18,7 @@ interface MessageBubbleProps {
   streaming: boolean;
   onNavigateToCfi?: (cfi: string) => void;
   onNavigateToSource?: (source: CitedSource) => void;
+  onRetryWithWholeBook?: (assistantId: string) => void;
 }
 
 function CitationChip({ source, onClick }: { source: CitedSource; onClick?: () => void }) {
@@ -36,7 +37,7 @@ function CitationChip({ source, onClick }: { source: CitedSource; onClick?: () =
   );
 }
 
-export default function MessageBubble({ msg, messages, streaming, onNavigateToCfi, onNavigateToSource }: MessageBubbleProps) {
+export default function MessageBubble({ msg, messages, streaming, onNavigateToCfi, onNavigateToSource, onRetryWithWholeBook }: MessageBubbleProps) {
   const { t } = useTranslation();
   const isLast = msg === messages[messages.length - 1];
   const [reasoningExpanded, setReasoningExpanded] = useState<boolean | null>(null);
@@ -127,6 +128,29 @@ export default function MessageBubble({ msg, messages, streaming, onNavigateToCf
               <CitationChip key={source.marker} source={source} onClick={() => onNavigateToSource?.(source)} />
             ))}
           </div>
+        )}
+        {msg.spoilerGuard?.active && !(streaming && isLast) && (
+          msg.spoilerGuard.wholeBookIntent ? (
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-border pt-2 text-[11px] text-text-muted">
+              <span>{t("ai.spoilerGuard.notice", { progress: msg.spoilerGuard.progress })}</span>
+              {onRetryWithWholeBook && msg.dbId && isLast && (
+                <button
+                  type="button"
+                  onClick={() => onRetryWithWholeBook(msg.id)}
+                  className="font-medium text-accent-text hover:opacity-75"
+                >
+                  {t("ai.spoilerGuard.retryWholeBook")}
+                </button>
+              )}
+            </div>
+          ) : (
+            <span
+              title={t("ai.spoilerGuard.badgeHint")}
+              className="mt-2 inline-flex rounded border border-border px-1.5 py-0.5 text-[10px] text-text-muted"
+            >
+              {t("ai.spoilerGuard.badge")}
+            </span>
+          )
         )}
       </div>
     );

@@ -18,4 +18,4 @@ pub const SNIPPET_MAX_CHARS: usize = 120;
 
 pub use extract::{BlockText, SectionText};
 pub use index::{index_status, IndexStatus};
-pub use retrieve::{retrieve, CitedSource, RetrievedChunk};
+pub use retrieve::{retrieve, CitedSource, RetrievedChunk, SpoilerCutoff};

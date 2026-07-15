@@ -132,6 +132,7 @@ pub fn apply_event(tx: &Transaction, event: &Event) -> AppResult<()> {
         EventBody::ChatRename { id, title } => apply_chat_rename(tx, event, id, title),
         EventBody::ChatDelete { id } => apply_chat_delete(tx, event, id),
         EventBody::ChatMessageAdd(p) => apply_chat_message_add(tx, event, p),
+        EventBody::ChatMessageReplace(p) => apply_chat_message_replace(tx, event, p),
     }
 }
 
@@ -352,6 +353,10 @@ fn cascade_delete_book(tx: &Transaction, id: &str, ts: i64) -> AppResult<()> {
         params![id],
     )?;
     tx.execute("DELETE FROM book_settings WHERE book_id = ?1", params![id])?;
+    tx.execute(
+        "DELETE FROM settings WHERE key = ?1",
+        params![format!("book_spoiler_guard_{id}")],
+    )?;
     let chat_ids: Vec<String> = {
         let mut stmt = tx.prepare("SELECT id FROM chats WHERE book_id = ?1")?;
         let collected: Vec<String> = stmt
@@ -1335,14 +1340,60 @@ fn apply_chat_message_add(
     }
     tx.execute(
         "INSERT OR IGNORE INTO chat_messages
-         (id, chat_id, role, content, context, metadata, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-        params![p.id, p.chat_id, p.role, p.content, p.context, p.metadata, event.ts,],
+         (id, chat_id, role, content, context, metadata, created_at, updated_at, updated_by_device)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
+        params![
+            p.id,
+            p.chat_id,
+            p.role,
+            p.content,
+            p.context,
+            p.metadata,
+            event.ts,
+            event.device
+        ],
     )?;
     // Mirror the live `add_chat_message` command's side effect — the parent
     // chat's recency drives chat-list ordering, so peers must see the bump
     // too. LWW guard prevents an older message event from dragging
     // `updated_at` backwards if the chat has been renamed since.
+    tx.execute(
+        "UPDATE chats
+         SET updated_at = ?1, updated_by_device = ?2
+         WHERE id = ?3
+           AND (updated_at < ?1 OR (updated_at = ?1 AND updated_by_device < ?2))",
+        params![event.ts, event.device, p.chat_id],
+    )?;
+    Ok(())
+}
+
+fn apply_chat_message_replace(
+    tx: &Transaction,
+    event: &Event,
+    p: &ChatMessagePayload,
+) -> AppResult<()> {
+    if is_tombstoned(tx, entity::CHAT_MESSAGE, &p.id)?
+        || parent_tombstoned(tx, &[(entity::CHAT, &p.chat_id)])?
+    {
+        return Ok(());
+    }
+    let changed = tx.execute(
+        "UPDATE chat_messages
+         SET content = ?1, metadata = ?2, updated_at = ?3, updated_by_device = ?4
+         WHERE id = ?5 AND chat_id = ?6 AND role = 'assistant'
+           AND (updated_at, updated_by_device) < (?3, ?4)",
+        params![
+            p.content,
+            p.metadata,
+            event.ts,
+            event.device,
+            p.id,
+            p.chat_id
+        ],
+    )?;
+    if changed == 0 {
+        return Ok(());
+    }
     tx.execute(
         "UPDATE chats
          SET updated_at = ?1, updated_by_device = ?2
@@ -2504,6 +2555,127 @@ mod tests {
             })
             .unwrap();
         assert_eq!(chat_ts, 10_000, "older message must not drag chat backward");
+    }
+
+    #[test]
+    fn chat_message_replace_is_lww_and_cannot_create_or_replace_user_messages() {
+        let mut db = open_db();
+        apply_all(
+            &mut db,
+            &[
+                ev(1000, "dev-A", import_book("b1")),
+                ev(
+                    1100,
+                    "dev-A",
+                    EventBody::ChatCreate {
+                        id: "ch1".into(),
+                        book: "b1".into(),
+                        title: "Chat".into(),
+                        model: None,
+                    },
+                ),
+                ev(
+                    1200,
+                    "dev-A",
+                    EventBody::ChatMessageAdd(ChatMessagePayload {
+                        id: "assistant".into(),
+                        chat_id: "ch1".into(),
+                        role: "assistant".into(),
+                        content: "old".into(),
+                        context: None,
+                        metadata: None,
+                    }),
+                ),
+                ev(
+                    1300,
+                    "dev-A",
+                    EventBody::ChatMessageAdd(ChatMessagePayload {
+                        id: "user".into(),
+                        chat_id: "ch1".into(),
+                        role: "user".into(),
+                        content: "question".into(),
+                        context: None,
+                        metadata: None,
+                    }),
+                ),
+                ev(
+                    1500,
+                    "dev-B",
+                    EventBody::ChatMessageReplace(ChatMessagePayload {
+                        id: "assistant".into(),
+                        chat_id: "ch1".into(),
+                        role: "assistant".into(),
+                        content: "new".into(),
+                        context: None,
+                        metadata: Some("{}".into()),
+                    }),
+                ),
+                ev(
+                    1400,
+                    "dev-C",
+                    EventBody::ChatMessageReplace(ChatMessagePayload {
+                        id: "assistant".into(),
+                        chat_id: "ch1".into(),
+                        role: "assistant".into(),
+                        content: "stale".into(),
+                        context: None,
+                        metadata: None,
+                    }),
+                ),
+                ev(
+                    1600,
+                    "dev-B",
+                    EventBody::ChatMessageReplace(ChatMessagePayload {
+                        id: "missing".into(),
+                        chat_id: "ch1".into(),
+                        role: "assistant".into(),
+                        content: "must not insert".into(),
+                        context: None,
+                        metadata: None,
+                    }),
+                ),
+                ev(
+                    1700,
+                    "dev-B",
+                    EventBody::ChatMessageReplace(ChatMessagePayload {
+                        id: "user".into(),
+                        chat_id: "ch1".into(),
+                        role: "assistant".into(),
+                        content: "must not replace".into(),
+                        context: None,
+                        metadata: None,
+                    }),
+                ),
+            ],
+        );
+        let assistant: (String, Option<String>, i64, String) = db
+            .query_row(
+                "SELECT content, metadata, updated_at, updated_by_device
+                 FROM chat_messages WHERE id = 'assistant'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            assistant,
+            ("new".into(), Some("{}".into()), 1500, "dev-B".into())
+        );
+        let user: String = db
+            .query_row(
+                "SELECT content FROM chat_messages WHERE id = 'user'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(user, "question");
+        let missing: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM chat_messages WHERE id = 'missing'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(missing, 0);
     }
 
     #[test]

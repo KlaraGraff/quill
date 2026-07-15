@@ -312,7 +312,7 @@ mod tests {
     fn missing_index_has_no_retrieval_result() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE VIRTUAL TABLE book_chunks_fts USING fts5(seg_text, chunk_id UNINDEXED, book_id UNINDEXED); CREATE TABLE book_chunks (id TEXT, book_id TEXT, chunk_index INTEGER, section_index INTEGER, section_href TEXT, section_title TEXT, char_start INTEGER, char_end INTEGER, text TEXT, snippet TEXT, token_estimate INTEGER);").unwrap();
-        assert!(retrieve(&conn, "missing", "question", 100)
+        assert!(retrieve(&conn, "missing", "question", 100, None)
             .unwrap()
             .is_empty());
     }

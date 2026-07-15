@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
-use super::retrieve::{lexical_ranks, retrieve_ranked, RetrievedChunk};
+use super::retrieve::{lexical_ranks, retrieve_ranked, RetrievedChunk, SpoilerCutoff};
 use super::RETRIEVAL_TOP_K;
 use crate::ai::router;
 use crate::db::Db;
@@ -505,7 +505,12 @@ pub fn rrf_merge(lexical: &[String], semantic: &[String]) -> Vec<(String, f64)> 
         .collect()
 }
 
-fn vector_ranks(conn: &Connection, book_id: &str, embedding: &[f32]) -> AppResult<Vec<String>> {
+fn vector_ranks(
+    conn: &Connection,
+    book_id: &str,
+    embedding: &[f32],
+    cutoff: Option<SpoilerCutoff>,
+) -> AppResult<Vec<String>> {
     let query = embedding_json(embedding)?;
     let rows = conn
         .prepare(
@@ -513,11 +518,33 @@ fn vector_ranks(conn: &Connection, book_id: &str, embedding: &[f32]) -> AppResul
              WHERE embedding MATCH ?1 AND k = ?2 AND book_id = ?3
              ORDER BY distance",
         )?
-        .query_map(params![query, RETRIEVAL_TOP_K as i64, book_id], |row| {
-            row.get(0)
-        })?
+        .query_map(
+            params![query, (RETRIEVAL_TOP_K * 4) as i64, book_id],
+            |row| row.get(0),
+        )?
         .collect::<Result<Vec<String>, _>>()?;
-    Ok(rows)
+    if cutoff.is_none() {
+        return Ok(rows.into_iter().take(RETRIEVAL_TOP_K).collect());
+    }
+    let cutoff = cutoff.expect("cutoff checked");
+    let mut allowed = Vec::with_capacity(RETRIEVAL_TOP_K);
+    let mut statement = conn.prepare(
+        "SELECT section_index, char_start FROM book_chunks WHERE id = ?1 AND book_id = ?2",
+    )?;
+    for chunk_id in rows {
+        let position = statement
+            .query_row(params![chunk_id, book_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+            })
+            .optional()?;
+        if position.is_some_and(|(section, start)| cutoff.allows(section, start)) {
+            allowed.push(chunk_id);
+            if allowed.len() == RETRIEVAL_TOP_K {
+                break;
+            }
+        }
+    }
+    Ok(allowed)
 }
 
 pub fn hybrid_retrieve(
@@ -526,18 +553,19 @@ pub fn hybrid_retrieve(
     query_text: &str,
     query_vector: &[f32],
     budget_tokens: usize,
+    cutoff: Option<SpoilerCutoff>,
 ) -> AppResult<Vec<RetrievedChunk>> {
-    let lexical = lexical_ranks(conn, book_id, query_text)?;
-    let semantic = vector_ranks(conn, book_id, query_vector)?;
+    let lexical = lexical_ranks(conn, book_id, query_text, cutoff)?;
+    let semantic = vector_ranks(conn, book_id, query_vector, cutoff)?;
     if semantic.is_empty() {
-        return retrieve_ranked(conn, book_id, &lexical, budget_tokens);
+        return retrieve_ranked(conn, book_id, &lexical, budget_tokens, cutoff);
     }
     let lexical_ids = lexical
         .iter()
         .map(|(chunk_id, _)| chunk_id.clone())
         .collect::<Vec<_>>();
     let ranked = rrf_merge(&lexical_ids, &semantic);
-    retrieve_ranked(conn, book_id, &ranked, budget_tokens)
+    retrieve_ranked(conn, book_id, &ranked, budget_tokens, cutoff)
 }
 
 #[cfg(test)]
@@ -587,7 +615,33 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(vector_ranks(&conn, "book", &near).unwrap()[0], "near");
+        assert_eq!(vector_ranks(&conn, "book", &near, None).unwrap()[0], "near");
+    }
+
+    #[test]
+    fn vector_ranks_filter_chunks_after_the_spoiler_cutoff() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let db = Db::init(directory.path()).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let query = vec![1.0; DEFAULT_EMBEDDING_DIMENSIONS];
+        for (id, section) in [("allowed", 0_i64), ("blocked", 2_i64)] {
+            conn.execute(
+                "INSERT INTO book_chunks
+                 (id, book_id, chunk_index, section_index, text, snippet, token_estimate, created_at)
+                 VALUES (?1, 'book', ?2, ?2, ?1, ?1, 1, 1)",
+                params![id, section],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO book_chunk_vectors (chunk_id, book_id, embedding) VALUES (?1, 'book', ?2)",
+                params![id, embedding_json(&query).unwrap()],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            vector_ranks(&conn, "book", &query, Some(SpoilerCutoff::Section(0))).unwrap(),
+            vec!["allowed"]
+        );
     }
 
     #[test]
@@ -611,7 +665,7 @@ mod tests {
         .unwrap();
         ensure_vector_table(&conn, 3).unwrap();
         assert_eq!(
-            vector_ranks(&conn, "book", &vector).unwrap(),
+            vector_ranks(&conn, "book", &vector, None).unwrap(),
             vec!["cached"]
         );
     }

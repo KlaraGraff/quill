@@ -246,7 +246,7 @@ pub fn save_chat_message(
     sync: State<'_, SyncWriter>,
 ) -> AppResult<ChatMsg> {
     let id = Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = sync.next_logical_timestamp();
     let device = sync.self_device().to_string();
 
     let msg = ChatMsg {
@@ -262,9 +262,10 @@ pub fn save_chat_message(
 
     sync.with_tx(&db, now, |tx, events| {
         tx.execute(
-            "INSERT INTO chat_messages (id, chat_id, role, content, context, metadata, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-            params![id, chat_id, role, content, context, metadata, now],
+            "INSERT INTO chat_messages
+             (id, chat_id, role, content, context, metadata, created_at, updated_at, updated_by_device)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
+            params![id, chat_id, role, content, context, metadata, now, device],
         )?;
         // Bump the parent chat's updated_at — same pattern the merge engine
         // uses on `chat.message.add` (LWW guard avoids dragging chats
@@ -287,6 +288,55 @@ pub fn save_chat_message(
     })?;
 
     Ok(msg)
+}
+
+#[tauri::command]
+pub fn replace_chat_message(
+    message_id: String,
+    content: String,
+    metadata: Option<String>,
+    db: State<'_, Db>,
+    sync: State<'_, SyncWriter>,
+) -> AppResult<ChatMsg> {
+    crate::sync::validation::validate_entity_id(&message_id)?;
+    let now = sync.next_logical_timestamp();
+    let device = sync.self_device().to_string();
+    let message = sync.with_tx(&db, now, |tx, events| {
+        let mut message = tx.query_row(
+            "SELECT id, chat_id, role, content, context, metadata, created_at, updated_at
+             FROM chat_messages WHERE id = ?1",
+            params![message_id],
+            row_to_msg,
+        )?;
+        if message.role != "assistant" {
+            return Err(crate::error::AppError::Other(
+                "CHAT_MESSAGE_REPLACE_FORBIDDEN".to_string(),
+            ));
+        }
+        tx.execute(
+            "UPDATE chat_messages
+             SET content = ?1, metadata = ?2, updated_at = ?3, updated_by_device = ?4
+             WHERE id = ?5",
+            params![content, metadata, now, device, message_id],
+        )?;
+        tx.execute(
+            "UPDATE chats SET updated_at = ?1, updated_by_device = ?2 WHERE id = ?3",
+            params![now, device, message.chat_id],
+        )?;
+        message.content = content.clone();
+        message.metadata = metadata.clone();
+        message.updated_at = now;
+        events.push(EventBody::ChatMessageReplace(ChatMessagePayload {
+            id: message.id.clone(),
+            chat_id: message.chat_id.clone(),
+            role: message.role.clone(),
+            content: message.content.clone(),
+            context: message.context.clone(),
+            metadata: message.metadata.clone(),
+        }));
+        Ok(message)
+    })?;
+    Ok(message)
 }
 
 #[cfg(test)]

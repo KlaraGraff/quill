@@ -4,8 +4,8 @@ use crate::error::{AppError, AppResult};
 
 use super::events::{
     is_supported_event_schema_version, lookup_occurrence_mark_id, normalize_learning_term,
-    word_mark_exception_id, word_mark_rule_id, BookSummaryPayload, Event, EventBody,
-    LookupOccurrenceMarkPayload, NotePayload, WordMarkExceptionPayload, WordMarkPayload,
+    word_mark_exception_id, word_mark_rule_id, BookSummaryPayload, ChatMessagePayload, Event,
+    EventBody, LookupOccurrenceMarkPayload, NotePayload, WordMarkExceptionPayload, WordMarkPayload,
 };
 
 const BOOK_EXTENSIONS: &[&str] = &[
@@ -20,6 +20,8 @@ const MAX_NOTE_LOCATION_BYTES: usize = 16 * 1024;
 const MAX_LEARNING_TERM_BYTES: usize = 256;
 const MAX_WORD_MARK_DISPLAY_BYTES: usize = 1_024;
 const MAX_WORD_MARK_COLOR_BYTES: usize = 64;
+const MAX_CHAT_MESSAGE_BYTES: usize = 128 * 1024;
+const MAX_CHAT_METADATA_BYTES: usize = 256 * 1024;
 
 pub fn validate_entity_id(id: &str) -> AppResult<()> {
     if id.is_empty()
@@ -362,7 +364,34 @@ pub fn validate_event(event: &Event, expected_device: &str) -> AppResult<()> {
             }
             validate_book_summary_payload(payload)?;
         }
+        EventBody::ChatMessageReplace(payload) => {
+            if event.v < 6 {
+                return Err(AppError::Other(
+                    "SYNC_CHAT_MESSAGE_REPLACE_INVALID".to_string(),
+                ));
+            }
+            validate_chat_message_replace_payload(payload)?;
+        }
         _ => {}
+    }
+    Ok(())
+}
+
+fn validate_chat_message_replace_payload(payload: &ChatMessagePayload) -> AppResult<()> {
+    validate_entity_id(&payload.id)?;
+    validate_entity_id(&payload.chat_id)?;
+    if payload.role != "assistant"
+        || payload.content.trim().is_empty()
+        || payload.content.len() > MAX_CHAT_MESSAGE_BYTES
+        || payload.context.is_some()
+        || payload
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.len() > MAX_CHAT_METADATA_BYTES)
+    {
+        return Err(AppError::Other(
+            "SYNC_CHAT_MESSAGE_REPLACE_INVALID".to_string(),
+        ));
     }
     Ok(())
 }
@@ -639,5 +668,45 @@ mod tests {
             ..legacy
         };
         assert!(validate_event(&invalid_v1_learning, "dev-A").is_err());
+    }
+
+    #[test]
+    fn chat_message_replace_requires_v6_and_an_assistant_payload() {
+        let event = Event {
+            id: "01HYZX0000000000000000EVT2".into(),
+            ts: 1_714_770_000_000,
+            device: "dev-A".into(),
+            v: 6,
+            body: EventBody::ChatMessageReplace(ChatMessagePayload {
+                id: "message-1".into(),
+                chat_id: "chat-1".into(),
+                role: "assistant".into(),
+                content: "replacement".into(),
+                context: None,
+                metadata: Some("{}".into()),
+            }),
+            extra: Map::new(),
+        };
+        assert!(validate_event(&event, "dev-A").is_ok());
+        assert!(validate_event(
+            &Event {
+                v: 5,
+                ..event.clone()
+            },
+            "dev-A"
+        )
+        .is_err());
+        let EventBody::ChatMessageReplace(mut invalid_payload) = event.body else {
+            unreachable!()
+        };
+        invalid_payload.role = "user".into();
+        assert!(validate_event(
+            &Event {
+                body: EventBody::ChatMessageReplace(invalid_payload),
+                ..event
+            },
+            "dev-A"
+        )
+        .is_err());
     }
 }

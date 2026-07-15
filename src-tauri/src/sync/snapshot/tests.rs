@@ -1145,6 +1145,40 @@ fn snapshot_equivalence_events_vs_snapshot_yields_same_state() {
             }),
         ),
         ev(
+            1470,
+            "dev-A",
+            EventBody::ChatCreate {
+                id: "chat-1".into(),
+                book: "b1".into(),
+                title: "Chat".into(),
+                model: None,
+            },
+        ),
+        ev(
+            1480,
+            "dev-A",
+            EventBody::ChatMessageAdd(ChatMessagePayload {
+                id: "message-1".into(),
+                chat_id: "chat-1".into(),
+                role: "assistant".into(),
+                content: "old".into(),
+                context: None,
+                metadata: None,
+            }),
+        ),
+        ev(
+            1490,
+            "dev-B",
+            EventBody::ChatMessageReplace(ChatMessagePayload {
+                id: "message-1".into(),
+                chat_id: "chat-1".into(),
+                role: "assistant".into(),
+                content: "new".into(),
+                context: None,
+                metadata: Some("{}".into()),
+            }),
+        ),
+        ev(
             1500,
             "dev-B",
             EventBody::HighlightDelete { id: "h1".into() },

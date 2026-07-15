@@ -8,6 +8,39 @@ use super::segment::{segment_for_fts, SegmentMode};
 use super::RETRIEVAL_TOP_K;
 use crate::error::AppResult;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpoilerCutoff {
+    Character(i64),
+    Section(i64),
+}
+
+impl SpoilerCutoff {
+    pub fn allows(self, section_index: i64, char_start: Option<i64>) -> bool {
+        match self {
+            Self::Character(offset) => char_start.is_some_and(|start| start <= offset),
+            Self::Section(section) => section_index <= section,
+        }
+    }
+
+    pub fn allows_section_summary(self, section_index: i64, char_end: Option<i64>) -> bool {
+        match self {
+            Self::Character(offset) => char_end.is_some_and(|end| end <= offset),
+            Self::Section(section) => section_index <= section,
+        }
+    }
+
+    fn sql_parts(self) -> (i64, i64) {
+        match self {
+            Self::Character(offset) => (1, offset),
+            Self::Section(section) => (2, section),
+        }
+    }
+}
+
+fn cutoff_sql_parts(cutoff: Option<SpoilerCutoff>) -> (i64, i64) {
+    cutoff.map(SpoilerCutoff::sql_parts).unwrap_or((0, 0))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetrievedChunk {
     pub chunk_id: String,
@@ -97,20 +130,35 @@ pub(crate) fn lexical_ranks(
     conn: &Connection,
     book_id: &str,
     query_text: &str,
+    cutoff: Option<SpoilerCutoff>,
 ) -> AppResult<Vec<(String, f64)>> {
     let query = fts_query(query_text);
     if query.is_empty() {
         return Ok(Vec::new());
     }
+    let (cutoff_kind, cutoff_value) = cutoff_sql_parts(cutoff);
     let hits = conn
         .prepare(
-            "SELECT chunk_id, bm25(book_chunks_fts) AS score
-         FROM book_chunks_fts WHERE book_chunks_fts MATCH ?1 AND book_id = ?2
-         ORDER BY score LIMIT ?3",
+            "SELECT book_chunks_fts.chunk_id, bm25(book_chunks_fts) AS score
+             FROM book_chunks_fts
+             JOIN book_chunks ON book_chunks.id = book_chunks_fts.chunk_id
+               AND book_chunks.book_id = book_chunks_fts.book_id
+             WHERE book_chunks_fts MATCH ?1 AND book_chunks_fts.book_id = ?2
+               AND (?3 = 0
+                 OR (?3 = 1 AND book_chunks.char_start <= ?4)
+                 OR (?3 = 2 AND book_chunks.section_index <= ?4))
+             ORDER BY score LIMIT ?5",
         )?
-        .query_map(params![query, book_id, RETRIEVAL_TOP_K as i64], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-        })?
+        .query_map(
+            params![
+                query,
+                book_id,
+                cutoff_kind,
+                cutoff_value,
+                RETRIEVAL_TOP_K as i64
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
+        )?
         .collect::<Result<Vec<_>, _>>()?;
     if hits.is_empty() {
         return Ok(Vec::new());
@@ -123,6 +171,7 @@ pub(crate) fn retrieve_ranked(
     book_id: &str,
     hits: &[(String, f64)],
     budget_tokens: usize,
+    cutoff: Option<SpoilerCutoff>,
 ) -> AppResult<Vec<RetrievedChunk>> {
     if hits.is_empty() {
         return Ok(Vec::new());
@@ -135,8 +184,15 @@ pub(crate) fn retrieve_ranked(
              FROM book_chunks WHERE id = ?1 AND book_id = ?2",
         )?;
         for (id, score) in hits {
-            let chunk =
-                statement.query_row(params![id, book_id], |row| row_to_chunk(row, *score))?;
+            let chunk = statement
+                .query_row(params![id, book_id], |row| row_to_chunk(row, *score))
+                .optional()?;
+            let Some(chunk) = chunk else {
+                continue;
+            };
+            if cutoff.is_some_and(|value| !value.allows(chunk.section_index, chunk.char_start)) {
+                continue;
+            }
             chunks_by_id.insert(id.clone(), chunk);
         }
     }
@@ -170,6 +226,9 @@ pub(crate) fn retrieve_ranked(
         let Some(mut chunk) = maybe_chunk else {
             continue;
         };
+        if cutoff.is_some_and(|value| !value.allows(chunk.section_index, chunk.char_start)) {
+            continue;
+        }
         if let Some(score) = hit_scores.get(&chunk.chunk_id) {
             chunk.score = *score;
         }
@@ -247,9 +306,10 @@ pub fn retrieve(
     book_id: &str,
     query_text: &str,
     budget_tokens: usize,
+    cutoff: Option<SpoilerCutoff>,
 ) -> AppResult<Vec<RetrievedChunk>> {
-    let hits = lexical_ranks(conn, book_id, query_text)?;
-    retrieve_ranked(conn, book_id, &hits, budget_tokens)
+    let hits = lexical_ranks(conn, book_id, query_text, cutoff)?;
+    retrieve_ranked(conn, book_id, &hits, budget_tokens, cutoff)
 }
 
 pub fn total_book_tokens(conn: &Connection, book_id: &str) -> AppResult<usize> {
@@ -261,7 +321,11 @@ pub fn total_book_tokens(conn: &Connection, book_id: &str) -> AppResult<usize> {
     Ok(total.max(0) as usize)
 }
 
-pub fn retrieve_all(conn: &Connection, book_id: &str) -> AppResult<Vec<RetrievedChunk>> {
+pub fn retrieve_all(
+    conn: &Connection,
+    book_id: &str,
+    cutoff: Option<SpoilerCutoff>,
+) -> AppResult<Vec<RetrievedChunk>> {
     let mut statement = conn.prepare(
         "SELECT id, chunk_index, section_index, section_href, section_title, char_start, char_end,
                 text, snippet, token_estimate
@@ -270,8 +334,13 @@ pub fn retrieve_all(conn: &Connection, book_id: &str) -> AppResult<Vec<Retrieved
     let chunks = statement
         .query_map(params![book_id], |row| row_to_chunk(row, 0.0))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(Into::into);
-    chunks
+        .map_err(crate::error::AppError::from)?;
+    Ok(chunks
+        .into_iter()
+        .filter(|chunk| {
+            cutoff.is_none_or(|value| value.allows(chunk.section_index, chunk.char_start))
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -305,7 +374,7 @@ mod tests {
 
     #[test]
     fn retrieves_hit_with_neighbors_and_merges_by_reading_order() {
-        let result = retrieve(&setup(), "book", "rare signal", 500).unwrap();
+        let result = retrieve(&setup(), "book", "rare signal", 500, None).unwrap();
         assert_eq!(result.len(), 1);
         assert!(result[0].text.contains("Alpha setup."));
         assert!(result[0].text.contains("Neighbor context."));
@@ -313,24 +382,88 @@ mod tests {
 
     #[test]
     fn supports_two_character_chinese_queries() {
-        let result = retrieve(&setup(), "book", "宝玉", 500).unwrap();
+        let result = retrieve(&setup(), "book", "宝玉", 500, None).unwrap();
         assert!(result.iter().any(|chunk| chunk.text.contains("宝玉")));
     }
 
     #[test]
     fn empty_and_non_matching_queries_are_empty() {
         let conn = setup();
-        assert!(retrieve(&conn, "book", "", 100).unwrap().is_empty());
-        assert!(retrieve(&conn, "book", "not-present", 100)
+        assert!(retrieve(&conn, "book", "", 100, None).unwrap().is_empty());
+        assert!(retrieve(&conn, "book", "not-present", 100, None)
             .unwrap()
             .is_empty());
     }
 
     #[test]
     fn returns_all_chunks_in_reading_order() {
-        let result = retrieve_all(&setup(), "book").unwrap();
+        let result = retrieve_all(&setup(), "book", None).unwrap();
         assert_eq!(result.len(), 5);
         assert_eq!(result[0].chunk_id, "c0");
         assert_eq!(total_book_tokens(&setup(), "book").unwrap(), 100);
+    }
+
+    #[test]
+    fn lexical_hits_and_neighbors_respect_character_cutoff() {
+        let conn = setup();
+        let result = retrieve(
+            &conn,
+            "book",
+            "rare signal",
+            500,
+            Some(SpoilerCutoff::Character(1)),
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].text.contains("rare signal"));
+        assert!(!result[0].text.contains("Neighbor context"));
+
+        let blocked = retrieve(
+            &conn,
+            "book",
+            "Neighbor context",
+            500,
+            Some(SpoilerCutoff::Character(1)),
+        )
+        .unwrap();
+        assert!(blocked.is_empty());
+    }
+
+    #[test]
+    fn full_text_retrieval_respects_character_cutoff() {
+        let result = retrieve_all(&setup(), "book", Some(SpoilerCutoff::Character(2))).unwrap();
+        assert_eq!(
+            result
+                .iter()
+                .map(|chunk| chunk.chunk_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c0", "c1", "c2"]
+        );
+    }
+
+    #[test]
+    fn section_cutoff_filters_hits_neighbors_and_full_text() {
+        let conn = setup();
+        conn.execute("UPDATE book_chunks SET section_index = chunk_index", [])
+            .unwrap();
+        let result = retrieve(
+            &conn,
+            "book",
+            "rare signal",
+            500,
+            Some(SpoilerCutoff::Section(1)),
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].text.contains("rare signal"));
+        assert!(!result[0].text.contains("Neighbor context"));
+
+        let all = retrieve_all(&conn, "book", Some(SpoilerCutoff::Section(1))).unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|chunk| chunk.chunk_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c0", "c1"]
+        );
     }
 }

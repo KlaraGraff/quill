@@ -822,6 +822,17 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
           label={t("settings.ai.grounding")}
         />
       </div>
+      <div className="mb-4 flex min-h-[73px] items-center justify-between gap-4 border-b border-border py-3">
+        <div className="min-w-0">
+          <h4 className="text-[13px] font-medium text-text-primary">{t("settings.ai.spoilerGuard")}</h4>
+          <p className="mt-0.5 text-[11px] leading-[1.55] text-text-muted">{t("settings.ai.spoilerGuardHint")}</p>
+        </div>
+        <Toggle
+          checked={settings.ai_spoiler_guard !== "false"}
+          onChange={(enabled) => void saveSetting("ai_spoiler_guard", enabled ? "true" : "false")}
+          label={t("settings.ai.spoilerGuard")}
+        />
+      </div>
       <div className="mb-4 border-b border-border py-3">
         <h4 className="text-[13px] font-medium text-text-primary">{t("settings.ai.summaryProfile")}</h4>
         <p className="mt-0.5 text-[11px] leading-[1.55] text-text-muted">{t("settings.ai.summaryProfileHint")}</p>

@@ -18,10 +18,11 @@ use sha2::{Digest, Sha256};
 
 /// Schema version written by this client. Version 2 introduces learning notes
 /// and whole-book word-marker rules; version 3 adds per-location exceptions;
-/// version 4 adds synced book summaries.
+/// version 4 adds synced book summaries; version 5 preserves summary edits;
+/// version 6 adds LWW replacement of an existing assistant message.
 /// Readers retain old-version support while older clients reject newer
 /// envelopes instead of advancing their watermark past data they cannot apply.
-pub const EVENT_SCHEMA_VERSION: u32 = 5;
+pub const EVENT_SCHEMA_VERSION: u32 = 6;
 pub const MIN_SUPPORTED_EVENT_SCHEMA_VERSION: u32 = 1;
 
 pub fn is_supported_event_schema_version(version: u32) -> bool {
@@ -206,6 +207,8 @@ pub enum EventBody {
     ChatDelete { id: String },
     #[serde(rename = "chat.message.add")]
     ChatMessageAdd(ChatMessagePayload),
+    #[serde(rename = "chat.message.replace")]
+    ChatMessageReplace(ChatMessagePayload),
 }
 
 fn default_fsrs_version() -> i64 {
@@ -675,6 +678,14 @@ mod tests {
             content: "hi".into(),
             context: None,
             metadata: None,
+        })));
+        roundtrip(&mk(EventBody::ChatMessageReplace(ChatMessagePayload {
+            id: "m1".into(),
+            chat_id: "ch1".into(),
+            role: "assistant".into(),
+            content: "replaced".into(),
+            context: None,
+            metadata: Some("{}".into()),
         })));
     }
 

@@ -868,9 +868,17 @@ fn upsert_chat(tx: &Transaction, id: &str, r: &ChatRow) -> AppResult<()> {
 
 fn insert_chat_message(tx: &Transaction, id: &str, r: &ChatMessageRow) -> AppResult<()> {
     tx.execute(
-        "INSERT OR IGNORE INTO chat_messages
-         (id, chat_id, role, content, context, metadata, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO chat_messages
+         (id, chat_id, role, content, context, metadata, created_at, updated_at, updated_by_device)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(id) DO UPDATE SET
+           content=excluded.content,
+           context=excluded.context,
+           metadata=excluded.metadata,
+           updated_at=excluded.updated_at,
+           updated_by_device=excluded.updated_by_device
+         WHERE (chat_messages.updated_at, chat_messages.updated_by_device)
+             < (excluded.updated_at, excluded.updated_by_device)",
         params![
             id,
             r.chat_id,
@@ -879,7 +887,8 @@ fn insert_chat_message(tx: &Transaction, id: &str, r: &ChatMessageRow) -> AppRes
             r.context,
             r.metadata,
             r.created_at,
-            r.updated_at
+            r.updated_at,
+            r.updated_by_device,
         ],
     )?;
     Ok(())
@@ -1256,7 +1265,7 @@ pub(super) fn dump_state(conn: &Connection) -> AppResult<SnapshotState> {
 
     // chat_messages
     let mut stmt = conn.prepare(
-        "SELECT id, chat_id, role, content, context, metadata, created_at, updated_at
+        "SELECT id, chat_id, role, content, context, metadata, created_at, updated_at, updated_by_device
          FROM chat_messages",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -1270,6 +1279,7 @@ pub(super) fn dump_state(conn: &Connection) -> AppResult<SnapshotState> {
                 metadata: r.get(5)?,
                 created_at: r.get(6)?,
                 updated_at: r.get(7)?,
+                updated_by_device: r.get(8)?,
             },
         ))
     })?;
