@@ -1,10 +1,12 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Bookmark, Copy, Highlighter, Languages, Loader2, MessageSquareMore, RotateCcw, WandSparkles } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
   getLearningCardFixture,
   LearningCardView,
+  LearningCardStreamParser,
   MENU_ACTION_DEFINITIONS,
   type CardDesignConfigV1,
   type LearningCardResult,
@@ -21,6 +23,10 @@ interface CardPreviewProps {
   learnerLevel?: string;
   explanationMode?: string;
   showMenu?: boolean;
+  lastTouchedId?: string | null;
+  testText?: string;
+  testNonce?: number;
+  customActionTest?: { name: string; prompt: string; text: string; nonce: number };
 }
 
 type PreviewMarkState = "unmarked" | "current" | "book";
@@ -76,6 +82,10 @@ export default function CardPreview({
   learnerLevel = "B1",
   explanationMode = "adaptive_bilingual",
   showMenu = false,
+  lastTouchedId = null,
+  testText,
+  testNonce,
+  customActionTest,
 }: CardPreviewProps) {
   const { t } = useTranslation();
   const frameRef = useRef<HTMLDivElement>(null);
@@ -88,6 +98,9 @@ export default function CardPreview({
   const [realLoading, setRealLoading] = useState(false);
   const [realError, setRealError] = useState<string | null>(null);
   const [previewMarkState, setPreviewMarkState] = useState<PreviewMarkState>("unmarked");
+  const [highlightedId, setHighlightedId] = useState<string | null>(null);
+  const [customActionResult, setCustomActionResult] = useState("");
+  const [customActionLoading, setCustomActionLoading] = useState(false);
   const localResult = useMemo(() => {
     const level = learnerLevel.trim().toUpperCase();
     const beginnerAdaptive = explanationMode === "adaptive_bilingual" && ["A1", "A2"].includes(level);
@@ -184,6 +197,22 @@ export default function CardPreview({
     return () => observer.disconnect();
   }, [showMenu]);
 
+  useEffect(() => {
+    if (!lastTouchedId) return;
+    const timer = window.setTimeout(() => {
+      const escaped = CSS.escape(lastTouchedId);
+      const target = frameRef.current?.querySelector<HTMLElement>(
+        `[data-module-id="${escaped}"],[data-menu-id="${escaped}"]`,
+      );
+      target?.scrollIntoView({ block: "center", behavior: "smooth" });
+      setHighlightedId(lastTouchedId);
+      window.setTimeout(() => {
+        setHighlightedId((current) => current === lastTouchedId ? null : current);
+      }, 800);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [lastTouchedId]);
+
   const menuKind: SelectionMenuKind = kind;
   const previewMarkStates: PreviewMarkState[] = kind === "word"
     ? ["unmarked", "current", "book"]
@@ -193,7 +222,7 @@ export default function CardPreview({
   const menuItems = config.selectionMenus[menuKind].filter((item) => item.enabled);
   const result = realResult ?? localResult;
 
-  const generateRealPreview = async () => {
+  const generateRealPreview = async (sourceText = localResult.sourceText) => {
     const requestId = crypto.randomUUID();
     if (previewRequestRef.current) {
       await invoke("ai_cancel", { requestId: previewRequestRef.current }).catch(() => {});
@@ -201,10 +230,20 @@ export default function CardPreview({
     previewRequestRef.current = requestId;
     setRealLoading(true);
     setRealError(null);
+    setRealResult({ version: 1, kind, sourceText, modules: {} });
+    const allowedIds = new Set(config.cards[kind].modules.filter((module) => module.enabled).map((module) => module.id));
+    const parser = new LearningCardStreamParser(allowedIds);
+    let unlisten: UnlistenFn | undefined;
     try {
+      unlisten = await listen<{ delta: string; done: boolean }>(`ai-learning-card-chunk-${requestId}`, (event) => {
+        if (previewRequestRef.current !== requestId || event.payload.done || !event.payload.delta) return;
+        const modules = parser.push(event.payload.delta);
+        if (Object.keys(modules).length === 0) return;
+        setRealResult((current) => current ? { ...current, modules: { ...current.modules, ...modules } } : current);
+      });
       const response = await invoke<LearningCardResult>("ai_learning_card", {
-        text: localResult.sourceText,
-        context: localResult.modules.source_excerpt?.quote ?? localResult.sourceText,
+        text: sourceText,
+        context: sourceText,
         kind,
         bookTitle: null,
         bookAuthor: null,
@@ -218,12 +257,62 @@ export default function CardPreview({
         setRealError(error instanceof Error ? error.message : String(error));
       }
     } finally {
+      unlisten?.();
       if (previewRequestRef.current === requestId) {
         previewRequestRef.current = null;
         setRealLoading(false);
       }
     }
   };
+
+  useEffect(() => {
+    if (!testText || !testNonce) return;
+    void generateRealPreview(testText);
+    // A nonce deliberately retriggers the same test input.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [testNonce]);
+
+  useEffect(() => {
+    if (!customActionTest) return;
+    let active = true;
+    let unlisten: UnlistenFn | undefined;
+    const requestId = crypto.randomUUID();
+    setCustomActionResult("");
+    setCustomActionLoading(true);
+    const run = async () => {
+      unlisten = await listen<{ delta: string; done: boolean }>(`ai-custom-action-chunk-${requestId}`, (event) => {
+        if (!active) return;
+        if (event.payload.done) {
+          setCustomActionLoading(false);
+          return;
+        }
+        setCustomActionResult((current) => current + event.payload.delta);
+      });
+      await invoke("ai_custom_action", {
+        name: customActionTest.name,
+        prompt: customActionTest.prompt,
+        text: customActionTest.text,
+        context: customActionTest.text,
+        bookTitle: null,
+        chapter: null,
+        requestId,
+      }).catch((error) => {
+        if (active) setCustomActionResult(error instanceof Error ? error.message : String(error));
+      });
+      if (active) setCustomActionLoading(false);
+    };
+    void run().catch((error) => {
+      if (active) {
+        setCustomActionResult(error instanceof Error ? error.message : String(error));
+        setCustomActionLoading(false);
+      }
+    });
+    return () => {
+      active = false;
+      unlisten?.();
+      void invoke("ai_cancel", { requestId });
+    };
+  }, [customActionTest]);
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col lg:sticky lg:top-0">
@@ -252,7 +341,7 @@ export default function CardPreview({
           )}
           <button
             type="button"
-            onClick={generateRealPreview}
+            onClick={() => void generateRealPreview()}
             disabled={realLoading}
             title={t("settings.tools.generateRealPreviewHint")}
             className="flex h-8 items-center gap-1.5 rounded-md border border-border bg-bg-surface px-2.5 text-[11px] font-medium text-text-secondary hover:border-accent disabled:opacity-50"
@@ -292,21 +381,24 @@ export default function CardPreview({
             <div role="toolbar" aria-label={t("settings.tools.menu.previewLabel")} className="flex max-w-full flex-wrap items-center justify-center gap-1 rounded-md border border-border bg-bg-surface p-1 shadow-popover">
               {menuItems.map((item) => {
                 const definition = definitions.get(item.id);
-                const Icon = actionIcons[item.id];
-                if (!definition) return null;
+                const custom = item.id.startsWith("custom_") && item.name;
+                const Icon = custom ? WandSparkles : actionIcons[item.id];
+                if (!definition && !custom) return null;
                 const label = item.id === "highlight"
                   ? !previewMarked
                     ? t("contextMenu.mark")
                     : kind === "word"
                       ? t("contextMenu.removeCurrentMark")
                       : t("contextMenu.removeHighlight")
-                  : t(definition.labelKey);
+                  : custom ? item.name! : t(definition!.labelKey);
                 return (
                   <Fragment key={item.id}>
                     <button
                       type="button"
                       tabIndex={-1}
+                      data-menu-id={item.id}
                       className="flex h-8 items-center gap-1.5 rounded-sm px-2 text-[11px] font-medium text-text-secondary"
+                      style={highlightedId === item.id ? { outline: "2px solid var(--color-accent)", outlineOffset: "1px" } : undefined}
                     >
                       <Icon size={13} className="text-text-muted" />
                       {label}
@@ -327,12 +419,24 @@ export default function CardPreview({
             </div>
           </div>
         )}
+        {showMenu && customActionTest && (
+          <div className="w-full max-w-[520px] rounded-md border border-border bg-bg-surface shadow-context">
+            <div className="flex h-10 items-center gap-2 border-b border-border-light bg-accent-bg px-3 text-[12px] font-medium text-accent-text">
+              <WandSparkles size={13} />{customActionTest.name}
+              {customActionLoading && <Loader2 size={12} className="ml-auto animate-spin" />}
+            </div>
+            <p className="max-h-[180px] overflow-y-auto whitespace-pre-wrap px-3 py-3 text-[12px] leading-5 text-text-primary">
+              {customActionResult || t("explain.thinking")}
+            </p>
+          </div>
+        )}
         <LearningCardView
           result={result}
           config={config}
           availableWidth={availableWidth}
           maxHeight={Math.max(360, availableHeight - 24 - (showMenu ? menuHeight + 12 : 0))}
           presentationMode
+          highlightedModuleId={highlightedId}
         />
       </div>
     </div>

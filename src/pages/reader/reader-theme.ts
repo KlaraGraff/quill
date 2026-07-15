@@ -1,6 +1,7 @@
 import type { CSSProperties } from "react";
 import type { ReaderSettingsState } from "../../components/ReaderSettings";
 import {
+  type ReaderCustomTheme,
   getEffectivePageColumns,
   getFontFamily,
   getThemeStyles,
@@ -26,7 +27,7 @@ function readerSelectionColor(theme: string): string {
   }
 }
 
-export function getPdfOverlays(theme: string): PdfOverlay {
+export function getPdfOverlays(theme: string, customTheme?: ReaderCustomTheme): PdfOverlay {
   switch (theme) {
     case "paper": return { layers: [{
       backgroundColor: getThemeStyles("paper").body,
@@ -40,11 +41,15 @@ export function getPdfOverlays(theme: string): PdfOverlay {
       { backgroundColor: "#ffffff", mixBlendMode: "difference" },
       { backgroundColor: getThemeStyles("dark").body, mixBlendMode: "screen" },
     ] };
+    case "custom": return { layers: [{
+      backgroundColor: getThemeStyles("custom", customTheme).body,
+      mixBlendMode: "multiply",
+    }] };
     default: return null;
   }
 }
 
-export function getReaderThemeVars(theme: string): Record<string, string> | undefined {
+export function getReaderThemeVars(theme: string, customTheme?: ReaderCustomTheme): Record<string, string> | undefined {
   switch (theme) {
     case "original": return {
       "--color-bg-page": "#f4f4f5",
@@ -110,12 +115,31 @@ export function getReaderThemeVars(theme: string): Record<string, string> | unde
       "--color-accent-text": "#A78BFA",
       "--color-accent-bg": "#302647",
     };
+    case "custom": {
+      const colors = getThemeStyles("custom", customTheme);
+      return {
+        "--color-bg-page": colors.body,
+        "--color-bg-surface": colors.body,
+        "--color-bg-muted": colors.body,
+        "--color-bg-input": `${colors.text}12`,
+        "--color-text-primary": colors.text,
+        "--color-text-body": colors.text,
+        "--color-text-secondary": `${colors.text}CC`,
+        "--color-text-muted": `${colors.text}A6`,
+        "--color-text-placeholder": `${colors.text}80`,
+        "--color-border": `${colors.text}30`,
+        "--color-border-light": `${colors.text}1A`,
+        "--color-accent": "#7C3AED",
+        "--color-accent-text": "#6D28D9",
+        "--color-accent-bg": `${colors.text}12`,
+      };
+    }
     default: return undefined;
   }
 }
 
 export function getReaderCSS(settings: ReaderSettingsState): string {
-  const themeColors = getThemeStyles(settings.theme);
+  const themeColors = getThemeStyles(settings.theme, settings.customTheme);
   const fontFamily = getFontFamily(settings.font);
   const letterSpacing = settings.charSpacing === 0 ? "normal" : `${settings.charSpacing * 0.01}em`;
   const wordSpacing = settings.wordSpacing === 0 ? "normal" : `${settings.wordSpacing * 0.01}em`;

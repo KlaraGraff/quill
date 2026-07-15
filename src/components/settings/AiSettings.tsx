@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Activity, AlertCircle, Loader2, Plus } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -6,6 +6,7 @@ import Button from "../ui/Button";
 import Input from "../ui/Input";
 import Select from "../ui/Select";
 import Toggle from "../ui/Toggle";
+import SortableList from "../ui/SortableList";
 import AiServiceCard, {
   type AiConnectionTestResult,
   type AiCredential,
@@ -108,8 +109,6 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
   const [busyId, setBusyId] = useState<string | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [modelsLoadingId, setModelsLoadingId] = useState<string | null>(null);
-  const [draggingId, setDraggingId] = useState<string | null>(null);
-  const [dropTargetId, setDropTargetId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [oauthStatus, setOauthStatus] = useState<OAuthStatus>({ connected: false, account_id: null });
   const [oauthLoading, setOauthLoading] = useState(false);
@@ -510,20 +509,6 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
     await applyProfileOrder(next);
   };
 
-  const dropProfile = async (targetId: string) => {
-    const sourceId = draggingId;
-    setDraggingId(null);
-    setDropTargetId(null);
-    if (!sourceId || sourceId === targetId) return;
-    const sourceIndex = profiles.findIndex((profile) => profile.id === sourceId);
-    const targetIndex = profiles.findIndex((profile) => profile.id === targetId);
-    if (sourceIndex < 0 || targetIndex < 0) return;
-    const next = [...profiles];
-    const [moved] = next.splice(sourceIndex, 1);
-    next.splice(targetIndex, 0, moved);
-    await applyProfileOrder(next);
-  };
-
   const testProfile = async (profile: AiProfile) => {
     setTestingId(profile.id);
     setError(null);
@@ -916,10 +901,14 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
           <p className="mt-1 text-[11px] text-text-muted">{t("settings.ai.noServicesHint")}</p>
         </div>
       ) : (
-        <div className="space-y-2">
-          {profiles.map((profile) => (
+        <SortableList
+          items={profiles}
+          getId={(profile) => profile.id}
+          onReorder={applyProfileOrder}
+          disabled={(profile) => expandedId === profile.id || saving || busyId != null}
+          className="space-y-2"
+          renderItem={(profile) => (
             <AiServiceCard
-              key={profile.id}
               profile={profile}
               credentials={credentials[profile.id] ?? []}
               expanded={expandedId === profile.id}
@@ -932,8 +921,6 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
               healthStale={staleHealthIds.has(profile.id)}
               oauthStatus={oauthStatus}
               oauthLoading={oauthLoading}
-              dragging={draggingId === profile.id}
-              dropTarget={dropTargetId === profile.id && draggingId !== profile.id}
               onToggleExpanded={() => setExpandedId((current) => current === profile.id ? null : profile.id)}
               onChange={(patch) => updateProfile(profile.id, patch)}
               onToggleEnabled={(enabled) => toggleProfile(profile.id, enabled)}
@@ -942,25 +929,6 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
               onDuplicate={() => duplicateProfile(profile)}
               onDelete={() => deleteProfile(profile.id)}
               onMove={(direction) => moveProfile(profile.id, direction)}
-              onDragStart={(event: DragEvent<HTMLElement>) => {
-                event.dataTransfer.effectAllowed = "move";
-                event.dataTransfer.setData("text/plain", profile.id);
-                setDraggingId(profile.id);
-              }}
-              onDragOver={(event: DragEvent<HTMLElement>) => {
-                if (!draggingId || draggingId === profile.id) return;
-                event.preventDefault();
-                event.dataTransfer.dropEffect = "move";
-                setDropTargetId(profile.id);
-              }}
-              onDrop={(event: DragEvent<HTMLElement>) => {
-                event.preventDefault();
-                void dropProfile(profile.id);
-              }}
-              onDragEnd={() => {
-                setDraggingId(null);
-                setDropTargetId(null);
-              }}
               onAddCredential={(label, value) => addCredential(profile.id, label, value)}
               onReplaceCredential={(id, value) => replaceCredential(profile.id, id, value)}
               onToggleCredential={(id, enabled) => toggleCredential(profile.id, id, enabled)}
@@ -969,8 +937,8 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
               onOAuthLogin={() => loginWithOpenAi(profile)}
               onOAuthLogout={logoutFromOpenAi}
             />
-          ))}
-        </div>
+          )}
+        />
       )}
     </div>
   );

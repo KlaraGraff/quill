@@ -60,6 +60,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     (25, include_str!("../migrations/025_index_management.sql")),
     (26, include_str!("../migrations/026_ai_spoiler_guard.sql")),
+    (27, include_str!("../migrations/027_word_forms.sql")),
 ];
 
 fn register_sqlite_vec() {

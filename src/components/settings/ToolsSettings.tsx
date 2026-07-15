@@ -9,12 +9,15 @@ import {
   type CardDesignConfigV1,
   type LearningCardKind,
   type SelectionMenuKind,
+  type CustomLearningId,
 } from "../learning-card";
+import type { CustomImportSource } from "./CustomActionEditor";
 import Toggle from "../ui/Toggle";
 import CardDesignSettings from "./CardDesignSettings";
 import DensityHelpDialog from "./DensityHelpDialog";
 import SelectionMenuSettings from "./SelectionMenuSettings";
 import MarkerStyleSettings from "./MarkerStyleSettings";
+import ReaderBindingsSettings from "./ReaderBindingsSettings";
 import type { SettingsProps } from "./types";
 import {
   MARKER_STYLE_SETTING_KEY,
@@ -24,6 +27,7 @@ import {
   type MarkerStyleConfigV1,
 } from "../marker-style";
 import { notifyReadingAssistanceSettingsChanged } from "../reading-assistance-events";
+import { parseReaderBindings, READER_BINDINGS_SETTING_KEY, type ReaderActionBinding } from "../reader-bindings";
 
 type ToolsView = "interaction" | "cards" | "menu" | "markers";
 
@@ -35,6 +39,10 @@ export interface ToolsPreviewState {
   learnerLevel: string;
   explanationMode: string;
   showMenu: boolean;
+  lastTouchedId: string | null;
+  testText?: string;
+  testNonce?: number;
+  customActionTest?: { name: string; prompt: string; text: string; nonce: number };
   onDismiss: () => void;
 }
 
@@ -73,6 +81,34 @@ function wordTranslationEnabled(config: CardDesignConfigV1) {
   return config.cards.word.modules.find((module) => module.id === "target_translation")?.enabled ?? true;
 }
 
+function resolveFollowingSources(config: CardDesignConfigV1): CardDesignConfigV1 {
+  const cards = { ...config.cards };
+  for (const kind of ["word", "phrase", "passage"] as LearningCardKind[]) {
+    const card = cards[kind];
+    const customModules = { ...card.customModules };
+    for (const [id, definition] of Object.entries(customModules)) {
+      if (!definition?.sourceRef || !definition.follow) continue;
+      const source = config.cards[definition.sourceRef.kind].customModules[definition.sourceRef.id];
+      customModules[id as CustomLearningId] = source && !source.sourceRef
+        ? { ...definition, name: source.name, prompt: source.prompt, dirtySinceImport: false, updatedAt: source.updatedAt }
+        : { ...definition, follow: false };
+    }
+    cards[kind] = { ...card, customModules };
+  }
+  const selectionMenus = { ...config.selectionMenus };
+  for (const kind of ["word", "phrase", "passage"] as LearningCardKind[]) {
+    selectionMenus[kind] = selectionMenus[kind].map((item) => {
+      if (!item.sourceRef || !item.follow) return item;
+      const source = config.selectionMenus[item.sourceRef.kind]
+        .find((candidate) => candidate.id === item.sourceRef?.id && !candidate.sourceRef);
+      return source?.name && source.prompt
+        ? { ...item, name: source.name, prompt: source.prompt, dirtySinceImport: false, updatedAt: source.updatedAt }
+        : { ...item, follow: false };
+    });
+  }
+  return { ...config, cards, selectionMenus };
+}
+
 export default function ToolsSettings({
   settings,
   loading,
@@ -91,6 +127,10 @@ export default function ToolsSettings({
   const [autoHighlightLookupWords, setAutoHighlightLookupWords] = useState(true);
   const [markerStyle, setMarkerStyle] = useState<MarkerStyleConfigV1>(createDefaultMarkerStyleConfig);
   const [doubleClickQuickLookup, setDoubleClickQuickLookup] = useState(true);
+  const [readerBindings, setReaderBindings] = useState<ReaderActionBinding[]>([]);
+  const [lastTouchedId, setLastTouchedId] = useState<string | null>(null);
+  const [testPreview, setTestPreview] = useState<{ config: CardDesignConfigV1; text: string; id: string; nonce: number } | null>(null);
+  const [customActionTest, setCustomActionTest] = useState<ToolsPreviewState["customActionTest"]>();
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
   const hydratedRef = useRef(false);
 
@@ -104,6 +144,7 @@ export default function ToolsSettings({
     setAutoHighlightLookupWords(settings.auto_highlight_lookup_words !== "false");
     setMarkerStyle(parseMarkerStyleConfig(settings[MARKER_STYLE_SETTING_KEY]));
     setDoubleClickQuickLookup(settings.double_click_quick_lookup !== "false");
+    setReaderBindings(parseReaderBindings(settings[READER_BINDINGS_SETTING_KEY]).bindings);
     hydratedRef.current = true;
   }, [settings, loading]);
 
@@ -126,17 +167,23 @@ export default function ToolsSettings({
     const kind = isMenuPreview ? menuKind : cardKind;
     onPreviewChange?.({
       kind,
-      config,
+      config: testPreview?.config ?? config,
       explanationLanguage: resolvedExplanationLanguage,
       targetLanguage,
       learnerLevel: settings.cefr_level || "B1",
       explanationMode: previewExplanationMode,
       showMenu: isMenuPreview,
+      lastTouchedId: testPreview?.id ?? lastTouchedId,
+      testText: testPreview?.text,
+      testNonce: testPreview?.nonce,
+      customActionTest,
       onDismiss: () => setPreviewOpen(false),
     });
   }, [
     cardKind,
     config,
+    customActionTest,
+    lastTouchedId,
     loading,
     menuKind,
     onPreviewChange,
@@ -147,6 +194,7 @@ export default function ToolsSettings({
     settings.explanation_mode,
     settings.translation_language,
     targetLanguage,
+    testPreview,
     view,
   ]);
 
@@ -154,19 +202,21 @@ export default function ToolsSettings({
 
   if (loading) return null;
 
-  const queueSave = (entries: Record<string, string>) => {
+  const queueSave = (entries: Record<string, string>, toastMessage?: string) => {
     const keys = Object.keys(entries);
     saveQueue.current = saveQueue.current
       .catch(() => {})
       .then(() => saveBulk(entries))
       .then(() => notifyReadingAssistanceSettingsChanged(keys))
-      .then(() => showSavedToast())
+      .then(() => showSavedToast(toastMessage))
       .catch((error) => console.error("Failed to save learning tool settings:", error));
   };
   const persistConfig = (next: CardDesignConfigV1) => {
-    const normalized = parseCardDesignConfig(next);
+    const normalized = parseCardDesignConfig(resolveFollowingSources(next));
     const translationEnabled = wordTranslationEnabled(normalized);
     setConfig(normalized);
+    setTestPreview(null);
+    setCustomActionTest(undefined);
     queueSave({
       [LEARNING_CARD_CONFIG_SETTING_KEY]: serializeCardDesignConfig(normalized),
       show_translation: String(translationEnabled),
@@ -191,6 +241,30 @@ export default function ToolsSettings({
   const updateCard = (kind: LearningCardKind, card: CardDesignConfigV1["cards"][LearningCardKind]) => {
     persistConfig({ ...config, cards: { ...config.cards, [kind]: card } });
   };
+  const importSources = (targetKind: LearningCardKind): CustomImportSource[] => (
+    (Object.keys(config.cards) as LearningCardKind[])
+      .filter((kind) => kind !== targetKind)
+      .flatMap((kind) => Object.entries(config.cards[kind].customModules)
+        .filter(([, definition]) => definition && !definition.sourceRef)
+        .map(([id, definition]) => ({
+          kind,
+          id: id as CustomLearningId,
+          name: definition!.name,
+          prompt: definition!.prompt,
+        })))
+  );
+  const menuImportSources = (targetKind: LearningCardKind): CustomImportSource[] => (
+    (Object.keys(config.selectionMenus) as LearningCardKind[])
+      .filter((kind) => kind !== targetKind)
+      .flatMap((kind) => config.selectionMenus[kind]
+        .filter((item) => item.id.startsWith("custom_") && item.name && item.prompt && !item.sourceRef)
+        .map((item) => ({
+          kind,
+          id: item.id as CustomLearningId,
+          name: item.name!,
+          prompt: item.prompt!,
+        })))
+  );
   const views: { id: ToolsView; icon: typeof Highlighter; label: string }[] = [
     { id: "interaction", icon: MousePointerClick, label: t("settings.tools.views.interaction") },
     { id: "cards", icon: LayoutPanelTop, label: t("settings.tools.views.cards") },
@@ -236,14 +310,29 @@ export default function ToolsSettings({
               label={t("settings.tools.interaction.doubleClick")}
               checked={doubleClickQuickLookup}
               onChange={(enabled) => {
+                if (enabled && readerBindings.some((binding) => binding.trigger === "mouse:double")) {
+                  showSavedToast(t("settings.tools.bindings.doubleClickConflictReverse"));
+                  return;
+                }
                 setDoubleClickQuickLookup(enabled);
                 persistLegacy("double_click_quick_lookup", String(enabled));
               }}
             />
           </SettingsRow>
-          <p className="border-t border-border-light px-1 py-3 text-[11px] leading-[18px] text-text-muted">
-            {t("settings.tools.interaction.forceClickHint")}
-          </p>
+          <ReaderBindingsSettings
+            value={readerBindings}
+            config={config}
+            doubleClickEnabled={doubleClickQuickLookup}
+            previousPageBinding={settings.previous_page_binding || "key:ArrowLeft"}
+            nextPageBinding={settings.next_page_binding || "key:ArrowRight"}
+            onChange={(bindings) => {
+              setReaderBindings(bindings);
+              queueSave(
+                { [READER_BINDINGS_SETTING_KEY]: JSON.stringify({ version: 1, bindings }) },
+                t("settings.tools.bindings.savedToast"),
+              );
+            }}
+          />
         </div>
       )}
 
@@ -282,6 +371,21 @@ export default function ToolsSettings({
               value={config.cards[cardKind]}
               onChange={(card) => updateCard(cardKind, card)}
               onOpenDensityHelp={() => setDensityHelpOpen(true)}
+              onTouched={setLastTouchedId}
+              importSources={importSources(cardKind)}
+              onTest={(text, customId, draft, card) => {
+                const testCard = {
+                  ...card,
+                  customModules: { ...card.customModules, [customId]: draft },
+                };
+                setTestPreview({
+                  text,
+                  id: customId,
+                  nonce: Date.now(),
+                  config: { ...config, cards: { ...config.cards, [cardKind]: testCard } },
+                });
+                setPreviewOpen(true);
+              }}
             />
           </div>
         </div>
@@ -324,6 +428,12 @@ export default function ToolsSettings({
                 ...config,
                 selectionMenus: { ...config.selectionMenus, [menuKind]: menu },
               })}
+              onTouched={setLastTouchedId}
+              importSources={menuImportSources(menuKind)}
+              onTest={(text, draft) => {
+                setCustomActionTest({ name: draft.name, prompt: draft.prompt, text, nonce: Date.now() });
+                setPreviewOpen(true);
+              }}
             />
           </div>
         </div>

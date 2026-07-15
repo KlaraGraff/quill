@@ -3,12 +3,16 @@ import { useTranslation } from "react-i18next";
 import { Check, Download, Trash2 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import Select from "../ui/Select";
+import ColorControl from "../ui/ColorControl";
 import {
   customFontFamily,
   fonts,
   FONT_SIZE_MIN,
   FONT_SIZE_MAX,
   getDefaultReaderTheme,
+  parseReaderCustomTheme,
+  getCustomThemeStyles,
+  type ReaderCustomTheme,
   type ReaderTheme,
 } from "../reader-settings";
 import { loadCustomFonts, type CustomFontRecord } from "../custom-fonts";
@@ -45,7 +49,15 @@ const READER_THEME_OPTIONS: {
     swatchClass: "bg-reader-dark-bg border border-reader-dark-border",
     checkClass: "text-white",
   },
+  {
+    value: "custom",
+    labelKey: "readerSettings.themeCustom",
+    swatchClass: "border border-reader-original-border",
+    checkClass: "text-accent",
+  },
 ];
+
+const CUSTOM_THEME_PRESETS = ["#F4E6C7", "#DDE8D8", "#DDE7F1", "#E7DDEC", "#D8D9DC"] as const;
 
 function NumberInput({ value, onChange, onBlur, suffix, min, max }: {
   value: number;
@@ -75,9 +87,10 @@ function NumberInput({ value, onChange, onBlur, suffix, min, max }: {
   );
 }
 
-export default function ReadingSettings({ settings, loading, refresh, save, showSavedToast }: SettingsProps) {
+export default function ReadingSettings({ settings, loading, refresh, save, saveBulk, showSavedToast }: SettingsProps) {
   const { t } = useTranslation();
   const [readerTheme, setReaderTheme] = useState<ReaderTheme>(getDefaultReaderTheme());
+  const [customTheme, setCustomTheme] = useState<ReaderCustomTheme>(() => parseReaderCustomTheme(null));
   const [fontFamily, setFontFamily] = useState("georgia");
   const [fontSize, setFontSize] = useState(26);
   const [lineSpacing, setLineSpacing] = useState(1.8);
@@ -96,6 +109,7 @@ export default function ReadingSettings({ settings, loading, refresh, save, show
   useEffect(() => {
     if (loading) return;
     setReaderTheme((settings.reader_theme as ReaderTheme) || getDefaultReaderTheme());
+    setCustomTheme(parseReaderCustomTheme(settings.reader_custom_theme));
     if (settings.font_family) setFontFamily(settings.font_family);
     if (settings.font_size) setFontSize(parseInt(settings.font_size));
     if (settings.line_spacing) setLineSpacing(parseFloat(settings.line_spacing));
@@ -127,7 +141,7 @@ export default function ReadingSettings({ settings, loading, refresh, save, show
           <p className="text-[14px] font-medium text-text-primary tracking-[-0.15px]">{t("settings.layout.theme")}</p>
           <p className="text-[12px] text-text-muted mt-0.5">{t("settings.layout.themeHint")}</p>
         </div>
-        <div className="grid grid-cols-4 gap-2 shrink-0">
+        <div className="grid grid-cols-5 gap-2 shrink-0">
           {READER_THEME_OPTIONS.map((theme) => (
             <button
               key={theme.value}
@@ -143,6 +157,7 @@ export default function ReadingSettings({ settings, loading, refresh, save, show
                 className={`size-8 rounded-full ${theme.swatchClass} flex items-center justify-center ${
                   readerTheme === theme.value ? "ring-2 ring-accent ring-offset-2 ring-offset-bg-surface" : ""
                 }`}
+                style={theme.value === "custom" ? { backgroundColor: getCustomThemeStyles(customTheme).body } : undefined}
               >
                 {readerTheme === theme.value && <Check size={14} className={theme.checkClass} />}
               </span>
@@ -151,6 +166,27 @@ export default function ReadingSettings({ settings, loading, refresh, save, show
           ))}
         </div>
       </div>
+      {readerTheme === "custom" && (
+        <div className="border-b border-border-light pb-4">
+          <ColorControl
+            color={customTheme.color}
+            opacity={customTheme.opacity}
+            minOpacity={0}
+            presets={CUSTOM_THEME_PRESETS}
+            colorLabel={t("settings.layout.customThemeColor")}
+            pickerLabel={t("settings.layout.customThemePicker")}
+            hexLabel={t("settings.layout.customThemeHex")}
+            opacityLabel={t("settings.layout.customThemeOpacity")}
+            onChange={(next) => {
+              setCustomTheme(next);
+              void saveBulk({
+                reader_theme: "custom",
+                reader_custom_theme: JSON.stringify(next),
+              }).then(() => showSavedToast());
+            }}
+          />
+        </div>
+      )}
       {/* Font Family */}
       <div className="flex items-center justify-between h-[73px]">
         <div>

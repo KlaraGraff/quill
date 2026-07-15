@@ -15,7 +15,7 @@ export interface MarkerVisualStyleV1 {
 
 export interface MarkerStyleConfigV1 {
   version: 1;
-  markMatchingWords: boolean;
+  wordMatchScope: "current" | "book" | "forms";
   manual: MarkerVisualStyleV1;
   automaticFollowsManual: boolean;
   automatic: MarkerVisualStyleV1;
@@ -50,7 +50,7 @@ const DEFAULT_AUTOMATIC: MarkerVisualStyleV1 = {
 export function createDefaultMarkerStyleConfig(): MarkerStyleConfigV1 {
   return {
     version: 1,
-    markMatchingWords: true,
+    wordMatchScope: "book",
     manual: { ...DEFAULT_MANUAL },
     automaticFollowsManual: true,
     automatic: { ...DEFAULT_AUTOMATIC },
@@ -88,11 +88,13 @@ export function parseMarkerStyleConfig(value: unknown): MarkerStyleConfigV1 {
       source = null;
     }
   }
-  const parsed = source && typeof source === "object" ? source as Partial<MarkerStyleConfigV1> : {};
+  const parsed = source && typeof source === "object" ? source as Partial<MarkerStyleConfigV1> & { markMatchingWords?: boolean } : {};
   const defaults = createDefaultMarkerStyleConfig();
   return {
     version: 1,
-    markMatchingWords: parsed.markMatchingWords ?? defaults.markMatchingWords,
+    wordMatchScope: parsed.wordMatchScope === "current" || parsed.wordMatchScope === "book" || parsed.wordMatchScope === "forms"
+      ? parsed.wordMatchScope
+      : parsed.markMatchingWords === false ? "current" : "book",
     manual: normalizeVisualStyle(parsed.manual, defaults.manual),
     automaticFollowsManual: parsed.automaticFollowsManual ?? defaults.automaticFollowsManual,
     automatic: normalizeVisualStyle(parsed.automatic, defaults.automatic),

@@ -16,6 +16,7 @@ import {
   wordRangeAtPoint,
   type ReaderInteraction,
 } from "../../components/reader-interaction";
+import { bindingFromKeyboardEvent } from "../../components/reader-bindings";
 
 interface InteractionView {
   getCFI(index: number, range: Range): string;
@@ -34,6 +35,17 @@ interface InstallDocumentInteractionsOptions {
   view: InteractionView;
   bookFormat: string;
   interactionGeneration: number;
+}
+
+interface SelectionSnapshot {
+  range: Range;
+  rects: DOMRect[];
+}
+
+function pointInsideSnapshot(snapshot: SelectionSnapshot | null, x: number, y: number) {
+  return Boolean(snapshot?.rects.some((rect) => (
+    x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
+  )));
 }
 
 interface ReaderInteractionsOptions {
@@ -55,6 +67,7 @@ interface ReaderInteractionsOptions {
   handlePageTurnMouseDown(event: MouseEvent): void;
   handlePageTurnContextMenu(event: MouseEvent): void;
   handlePageTurnWheel(event: WheelEvent): void;
+  handleReaderBinding(trigger: string, interaction: ReaderInteraction | null): boolean;
 }
 
 export function useReaderInteractions({
@@ -76,6 +89,7 @@ export function useReaderInteractions({
   handlePageTurnMouseDown,
   handlePageTurnContextMenu,
   handlePageTurnWheel,
+  handleReaderBinding,
 }: ReaderInteractionsOptions) {
   const installDocumentInteractions = useCallback(({
     doc,
@@ -135,6 +149,7 @@ export function useReaderInteractions({
     };
 
     let activePointerId: number | null = null;
+    let selectionSnapshot: SelectionSnapshot | null = null;
     let pointerCaptureTarget: Element | null = null;
     let selectionNormalizationUntil = 0;
     const scheduleSelectionMenu = (delay = 150, includeWord = false) => {
@@ -250,6 +265,13 @@ export function useReaderInteractions({
     doc.addEventListener("webkitmouseforcedown", preserveSystemForceClick);
 
     doc.addEventListener("keydown", (event: KeyboardEvent) => {
+      if ((event.target as Element | null)?.closest("input,textarea,select,[contenteditable='true']")) return;
+      const trigger = bindingFromKeyboardEvent(event);
+      if (trigger && handleReaderBinding(trigger, interactionForSelection("selection-menu"))) {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
       if ((event.metaKey || event.ctrlKey) && event.key === "[") {
         event.preventDefault();
         view.history.back();
@@ -264,7 +286,14 @@ export function useReaderInteractions({
         if (bookFormat === "pdf") handleZoom(-10);
       } else handlePageTurnKeyDown(event);
     });
-    doc.addEventListener("mousedown", handlePageTurnMouseDown, true);
+    doc.addEventListener("mousedown", (event: MouseEvent) => {
+      const range = selectedRange(doc);
+      selectionSnapshot = range ? {
+        range: range.cloneRange(),
+        rects: Array.from(range.getClientRects()),
+      } : null;
+      handlePageTurnMouseDown(event);
+    }, true);
     doc.addEventListener("contextmenu", handlePageTurnContextMenu, true);
     doc.addEventListener("wheel", handlePageTurnWheel, { passive: false });
 
@@ -284,12 +313,14 @@ export function useReaderInteractions({
       if (isInteractiveReaderTarget(event.target)) return;
       const selection = doc.getSelection?.();
       if (selection && !selection.isCollapsed) return;
-      const range = wordRangeAtPoint(
-        doc,
-        event.clientX,
-        event.clientY,
-        doc.documentElement.lang || undefined,
-      );
+      const range = pointInsideSnapshot(selectionSnapshot, event.clientX, event.clientY)
+        ? selectionSnapshot?.range.cloneRange() ?? null
+        : wordRangeAtPoint(
+            doc,
+            event.clientX,
+            event.clientY,
+            doc.documentElement.lang || undefined,
+          );
       if (!range) return;
       replaceDocumentSelection(doc, range);
       const text = range.toString().trim();
@@ -316,7 +347,6 @@ export function useReaderInteractions({
     doc.addEventListener("dblclick", (event: MouseEvent) => {
       cancelPendingWordClick();
       cancelPendingSelectionMenu();
-      if (!doubleClickQuickLookupRef.current) return;
       if (!supportsSelection || isInteractiveReaderTarget(event.target)) return;
       const range = wordRangeAtPoint(
         doc,
@@ -329,10 +359,9 @@ export function useReaderInteractions({
       const location = view.getCFI(index, range);
       const normalizedText = normalizeInteractionText(text);
       if (!text || !normalizedText || !location) return;
-      event.preventDefault();
-      openLearningInteraction({
+      const interaction: ReaderInteraction = {
         trigger: "word-quick-lookup",
-        kind: "word",
+        kind: classifySelection(text, doc.documentElement.lang || undefined),
         text,
         normalizedText,
         context: contextForRange(range, text),
@@ -341,7 +370,15 @@ export function useReaderInteractions({
         source: "foliate",
         format: bookFormat === "pdf" ? "pdf" : "epub",
         locale: doc.documentElement.lang || undefined,
-      });
+      };
+      if (!doubleClickQuickLookupRef.current) {
+        if (handleReaderBinding("mouse:double", interaction)) event.preventDefault();
+        return;
+      }
+      event.preventDefault();
+      replaceDocumentSelection(doc, range);
+      openLearningInteraction(interaction);
+      selectionSnapshot = null;
     });
 
     doc.addEventListener("mousedown", () => {
@@ -359,6 +396,7 @@ export function useReaderInteractions({
     doubleClickQuickLookupRef,
     forceClickSuppressedUntilRef,
     handlePageTurnContextMenu,
+    handleReaderBinding,
     handlePageTurnKeyDown,
     handlePageTurnMouseDown,
     handlePageTurnWheel,

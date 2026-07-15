@@ -7,6 +7,8 @@ import type {
   LearningCardKind,
   LearningModuleDefinition,
   LearningModuleId,
+  CustomLearningDefinition,
+  CustomLearningId,
   ModuleDensity,
   SelectionMenuActionDefinition,
   SelectionMenuActionId,
@@ -15,6 +17,10 @@ import type {
 } from "./types";
 
 export const LEARNING_CARD_CONFIG_SETTING_KEY = "learning_card_config";
+export const MAX_CUSTOM_CARD_MODULES = 8;
+export const MAX_CUSTOM_MENU_ACTIONS = 6;
+export const MAX_CUSTOM_NAME_LENGTH = 30;
+export const MAX_CUSTOM_PROMPT_LENGTH = 2000;
 
 export const CARD_KIND_ORDER: LearningCardKind[] = ["word", "phrase", "passage"];
 export const SELECTION_MENU_KIND_ORDER: SelectionMenuKind[] = ["word", "phrase", "passage"];
@@ -120,11 +126,12 @@ const defaultCard = (
   modules: MODULE_DEFINITIONS[kind].map(({ id }) =>
     moduleConfig(id, enabled.includes(id), !collapsed.includes(id)),
   ),
+  customModules: {},
 });
 
 export function createDefaultCardDesignConfig(): CardDesignConfigV1 {
   return {
-    version: 1,
+    version: 2,
     cards: {
       word: defaultCard(
         "word",
@@ -173,6 +180,7 @@ function parseModules(
   kind: LearningCardKind,
   value: unknown,
   defaults: CardModuleConfig[],
+  customModules: CardKindConfig["customModules"],
 ): CardModuleConfig[] {
   if (!Array.isArray(value)) return defaults.map((item) => ({ ...item }));
   const allowed = new Map(MODULE_DEFINITIONS[kind].map((item) => [item.id, item]));
@@ -182,17 +190,20 @@ function parseModules(
 
   for (const item of value) {
     if (!isObject(item) || typeof item.id !== "string") continue;
-    const moduleDefinition = allowed.get(item.id as LearningModuleId);
-    const fallback = defaultById.get(item.id as LearningModuleId);
-    if (!moduleDefinition || !fallback || seen.has(moduleDefinition.id)) continue;
-    seen.add(moduleDefinition.id);
+    const id = item.id as LearningModuleId;
+    const moduleDefinition = allowed.get(id);
+    const fallback = defaultById.get(id);
+    const custom = id.startsWith("custom_") && customModules[id as CustomLearningId];
+    if ((!moduleDefinition || !fallback) && !custom) continue;
+    if (seen.has(id)) continue;
+    seen.add(id);
     parsed.push({
-      id: moduleDefinition.id,
-      enabled: typeof item.enabled === "boolean" ? item.enabled : fallback.enabled,
+      id,
+      enabled: typeof item.enabled === "boolean" ? item.enabled : fallback?.enabled ?? true,
       defaultExpanded: typeof item.defaultExpanded === "boolean"
         ? item.defaultExpanded
-        : fallback.defaultExpanded,
-      density: isModuleDensity(item.density) ? item.density : fallback.density,
+        : fallback?.defaultExpanded ?? true,
+      density: isModuleDensity(item.density) ? item.density : fallback?.density ?? "inherit",
     });
   }
 
@@ -202,18 +213,64 @@ function parseModules(
   return parsed;
 }
 
+function isCustomId(value: unknown): value is CustomLearningId {
+  return typeof value === "string" && /^custom_[a-zA-Z0-9_-]+$/.test(value);
+}
+
+function parseSourceRef(value: unknown) {
+  if (!isObject(value) || !CARD_KIND_ORDER.includes(value.kind as LearningCardKind) || !isCustomId(value.id)) {
+    return undefined;
+  }
+  return { kind: value.kind as LearningCardKind, id: value.id };
+}
+
+function parseCustomDefinition(value: unknown): CustomLearningDefinition | null {
+  if (!isObject(value)) return null;
+  const name = typeof value.name === "string"
+    ? Array.from(value.name.trim()).slice(0, MAX_CUSTOM_NAME_LENGTH).join("")
+    : "";
+  const prompt = typeof value.prompt === "string"
+    ? Array.from(value.prompt.trim()).slice(0, MAX_CUSTOM_PROMPT_LENGTH).join("")
+    : "";
+  if (!name || !prompt) return null;
+  const createdAt = typeof value.createdAt === "number" ? value.createdAt : Date.now();
+  return {
+    name,
+    prompt,
+    sourceRef: parseSourceRef(value.sourceRef),
+    follow: value.follow === true,
+    dirtySinceImport: value.dirtySinceImport === true,
+    createdAt,
+    updatedAt: typeof value.updatedAt === "number" ? value.updatedAt : createdAt,
+  };
+}
+
+function parseCustomModules(value: unknown): CardKindConfig["customModules"] {
+  if (!isObject(value)) return {};
+  const entries = Object.entries(value).slice(0, MAX_CUSTOM_CARD_MODULES);
+  const parsed: CardKindConfig["customModules"] = {};
+  for (const [id, definition] of entries) {
+    if (!isCustomId(id)) continue;
+    const custom = parseCustomDefinition(definition);
+    if (custom) parsed[id] = custom;
+  }
+  return parsed;
+}
+
 function parseCard(
   kind: LearningCardKind,
   value: unknown,
   fallback: CardKindConfig,
 ): CardKindConfig {
-  if (!isObject(value)) return { ...fallback, modules: fallback.modules.map((item) => ({ ...item })) };
+  if (!isObject(value)) return { ...fallback, modules: fallback.modules.map((item) => ({ ...item })), customModules: {} };
+  const customModules = parseCustomModules(value.customModules);
   return {
     defaultDensity: isDensity(value.defaultDensity) ? value.defaultDensity : fallback.defaultDensity,
     widthMode: isWidthMode(value.widthMode) ? value.widthMode : fallback.widthMode,
     exampleCount: clampInteger(value.exampleCount, fallback.exampleCount, 0, 3),
     keyTermCount: clampInteger(value.keyTermCount, fallback.keyTermCount, 1, 8),
-    modules: parseModules(kind, value.modules, fallback.modules),
+    modules: parseModules(kind, value.modules, fallback.modules, customModules),
+    customModules,
   };
 }
 
@@ -232,9 +289,15 @@ function parseMenu(
     if (!isObject(item) || typeof item.id !== "string") continue;
     const id = item.id as SelectionMenuActionId;
     const fallback = defaultById.get(id);
-    if (!allowed.has(id) || !fallback || seen.has(id)) continue;
+    const custom = isCustomId(id) ? parseCustomDefinition(item) : null;
+    if (custom && parsed.filter((entry) => isCustomId(entry.id)).length >= MAX_CUSTOM_MENU_ACTIONS) continue;
+    if ((!allowed.has(id) || !fallback) && !custom) continue;
     seen.add(id);
-    parsed.push({ id, enabled: typeof item.enabled === "boolean" ? item.enabled : fallback.enabled });
+    parsed.push({
+      id,
+      enabled: typeof item.enabled === "boolean" ? item.enabled : fallback?.enabled ?? true,
+      ...(custom ?? {}),
+    });
   }
   for (const fallback of defaults) {
     if (!seen.has(fallback.id)) parsed.push({ ...fallback });
@@ -252,11 +315,11 @@ export function parseCardDesignConfig(value: unknown): CardDesignConfigV1 {
       return defaults;
     }
   }
-  if (!isObject(candidate) || candidate.version !== 1) return defaults;
+  if (!isObject(candidate) || (candidate.version !== 1 && candidate.version !== 2)) return defaults;
   const cards = isObject(candidate.cards) ? candidate.cards : {};
   const selectionMenus = isObject(candidate.selectionMenus) ? candidate.selectionMenus : {};
   return {
-    version: 1,
+    version: 2,
     cards: {
       word: parseCard("word", cards.word, defaults.cards.word),
       phrase: parseCard("phrase", cards.phrase, defaults.cards.phrase),

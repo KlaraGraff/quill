@@ -15,6 +15,7 @@ import {
   getReaderThemes,
   type ReaderCapabilities,
   type ReaderFont,
+  type ReaderCustomTheme,
   type ReaderTheme,
 } from "./reader-settings";
 
@@ -27,6 +28,7 @@ export type PageTurnAnimation = "none" | "slide" | "fade" | "cover";
 
 export interface ReaderSettingsState {
   theme: ReaderTheme;
+  customTheme: ReaderCustomTheme;
   font: ReaderFont;
   fontSize: number; // px
   brightness: number; // 0-100
@@ -203,6 +205,7 @@ export default function ReaderSettings({
     paper: t("readerSettings.themeSepia"),
     quiet: t("readerSettings.themeGray"),
     dark: t("readerSettings.themeDark"),
+    custom: t("readerSettings.themeCustom"),
   };
 
   if (!open) return null;
@@ -259,6 +262,7 @@ export default function ReaderSettings({
               className={`size-8 rounded-full ${theme.color} flex items-center justify-center ${
                 settings.theme === theme.id ? "ring-2 ring-accent ring-offset-2 ring-offset-bg-surface" : ""
               }`}
+              style={theme.id === "custom" ? { backgroundColor: settings.customTheme.color } : undefined}
             >
               {settings.theme === theme.id && (
                 <Check

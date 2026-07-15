@@ -333,6 +333,10 @@ export default function SettingsModal({ open, onClose, initialSection = "general
                 learnerLevel={toolsPreview.learnerLevel}
                 explanationMode={toolsPreview.explanationMode}
                 showMenu={toolsPreview.showMenu}
+                lastTouchedId={toolsPreview.lastTouchedId}
+                testText={toolsPreview.testText}
+                testNonce={toolsPreview.testNonce}
+                customActionTest={toolsPreview.customActionTest}
               />
             </div>
           </aside>

@@ -17,6 +17,7 @@ import {
 import {
   getDefaultReaderTheme,
   isReaderFontAvailable,
+  parseReaderCustomTheme,
 } from "../../components/reader-settings";
 import {
   DEFAULT_NEXT_PAGE_BINDING,
@@ -28,6 +29,8 @@ import {
 } from "../../components/settings-events";
 
 const readerPreferenceSettingKeys = {
+  theme: "reader_theme",
+  customTheme: "reader_custom_theme",
   margins: "margins",
   readingMode: "reading_mode",
   pageColumns: "page_columns",
@@ -70,6 +73,7 @@ function marginSetting(value: string | number | undefined, fallback: number): nu
 function createDefaultReaderSettings(): ReaderSettingsState {
   return {
     theme: getDefaultReaderTheme(),
+    customTheme: parseReaderCustomTheme(null),
     font: "palatino",
     fontSize: 26,
     brightness: 100,
@@ -105,6 +109,7 @@ export function mergeStoredReaderSettings(
     theme: bookSettings.theme
       || (globalSettings.reader_theme as ReaderSettingsState["theme"])
       || previous.theme,
+    customTheme: parseReaderCustomTheme(globalSettings.reader_custom_theme ?? bookSettings.customTheme),
     brightness: bookSettings.brightness
       ?? (globalSettings.brightness ? parseInt(globalSettings.brightness) : previous.brightness),
     pageColumns: bookSettings.pageColumns
@@ -200,6 +205,11 @@ export function useReaderSettingsSync(bookId: string | undefined): ReaderSetting
     readerSettingsRef.current = next;
     setReaderSettings(next);
     const changed: Record<string, string> = {};
+    if (previous.theme !== next.theme) changed[readerPreferenceSettingKeys.theme] = next.theme;
+    if (previous.customTheme.color !== next.customTheme.color
+      || previous.customTheme.opacity !== next.customTheme.opacity) {
+      changed[readerPreferenceSettingKeys.customTheme] = JSON.stringify(next.customTheme);
+    }
     if (previous.margins !== next.margins) changed[readerPreferenceSettingKeys.margins] = String(next.margins);
     if (previous.readingMode !== next.readingMode) changed[readerPreferenceSettingKeys.readingMode] = next.readingMode;
     if (previous.pageColumns !== next.pageColumns) changed[readerPreferenceSettingKeys.pageColumns] = String(next.pageColumns);
@@ -220,6 +230,10 @@ export function useReaderSettingsSync(bookId: string | undefined): ReaderSetting
       setReaderSettings((current) => {
         const next = {
           ...current,
+          theme: (values[readerPreferenceSettingKeys.theme] as ReaderSettingsState["theme"]) || current.theme,
+          customTheme: values[readerPreferenceSettingKeys.customTheme]
+            ? parseReaderCustomTheme(values[readerPreferenceSettingKeys.customTheme])
+            : current.customTheme,
           margins: marginSetting(values[readerPreferenceSettingKeys.margins], current.margins),
           readingMode: readingModeSetting(
             values[readerPreferenceSettingKeys.readingMode],

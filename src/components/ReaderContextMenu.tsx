@@ -10,7 +10,7 @@ import {
 import { useTranslation } from "react-i18next";
 import type { InteractionKind, SerializableRect } from "./reader-interaction";
 
-export type ReaderMenuAction = "primary" | "ask-ai" | "save" | "highlight" | "translate" | "copy";
+export type ReaderMenuAction = "primary" | "ask-ai" | "save" | "highlight" | "translate" | "copy" | `custom_${string}`;
 
 interface ReaderContextMenuProps {
   anchorRect: SerializableRect;
@@ -30,6 +30,8 @@ interface ReaderContextMenuProps {
   onSave: () => void;
   onToggleMark?: () => void;
   onRemoveBookWordMark?: () => void;
+  customActions?: Array<{ id: `custom_${string}`; name: string }>;
+  onCustomAction?: (id: `custom_${string}`) => void;
 }
 
 export default function ReaderContextMenu({
@@ -50,6 +52,8 @@ export default function ReaderContextMenu({
   onSave,
   onToggleMark,
   onRemoveBookWordMark,
+  customActions = [],
+  onCustomAction,
 }: ReaderContextMenuProps) {
   const { t } = useTranslation();
   const menuRef = useRef<HTMLDivElement>(null);
@@ -123,7 +127,7 @@ export default function ReaderContextMenu({
   }, [anchorRect]);
 
   const primaryIsLookup = kind !== "passage";
-  const definitions: Record<ReaderMenuAction, { label: string; icon: typeof Sparkles; run: () => void }> = {
+  const definitions: Record<string, { label: string; icon: typeof Sparkles; run: () => void }> = {
     primary: {
       label: kind === "word"
         ? t("contextMenu.lookUp", { defaultValue: "查词" })
@@ -162,6 +166,11 @@ export default function ReaderContextMenu({
       icon: Copy,
       run: onCopy,
     },
+    ...Object.fromEntries(customActions.map((action) => [action.id, {
+      label: action.name,
+      icon: Sparkles,
+      run: () => onCustomAction?.(action.id),
+    }])),
   };
 
   return (
@@ -174,6 +183,7 @@ export default function ReaderContextMenu({
     >
       {actions.map((action) => {
         const definition = definitions[action];
+        if (!definition) return null;
         const Icon = definition.icon;
         const showRemoveBookWordMark = action === "highlight"
           && kind === "word"
