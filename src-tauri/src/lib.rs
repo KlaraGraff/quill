@@ -565,6 +565,8 @@ pub fn run() {
                 .expect("failed to migrate secrets");
             ai::router::migrate_legacy_config(&db, &secrets)
                 .expect("failed to migrate AI profile configuration");
+            ai::router::migrate_embedding_source(&db, &secrets)
+                .expect("failed to migrate embedding configuration");
             secrets
                 .register_legacy_candidates(&db)
                 .expect("failed to register legacy secret metadata");
@@ -673,10 +675,17 @@ pub fn run() {
             commands::books::get_text_book_document,
             commands::books::retry_text_book_preparation,
             commands::ai::ai_reindex_book,
+            commands::ai::ai_update_book_index,
+            commands::ai::ai_index_details,
+            commands::ai::get_book_overview,
+            commands::ai::update_book_overview,
+            commands::ai::update_book_section_summary,
+            commands::ai::ai_regenerate_book_summaries,
             // Settings
             commands::settings::get_all_settings,
             commands::settings::ai_api_key_configured,
             commands::settings::ai_vector_retrieval_status,
+            commands::settings::ai_embedding_probe,
             commands::settings::set_ai_vector_retrieval,
             commands::settings::vault_status,
             commands::settings::vault_authorize,

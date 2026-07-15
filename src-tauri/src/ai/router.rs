@@ -950,6 +950,146 @@ pub async fn complete_with_failover(
     })
 }
 
+async fn stream_with_profile_inner(
+    app: &AppHandle,
+    db: &Db,
+    secrets: &Secrets,
+    profile_id: &str,
+    messages: &[ChatMessage],
+    event_name: &str,
+    max_tokens: Option<u32>,
+    cancel: &mut watch::Receiver<bool>,
+) -> AppResult<AiProfileView> {
+    let profile = profile_by_id(db, profile_id)?;
+    if !profile.view.enabled {
+        return Err(AppError::Other("AI_PROFILE_DISABLED".to_string()));
+    }
+    if profile.view.auth_mode == "oauth" && profile.view.provider == "openai" {
+        let (token, account_id) = crate::ai::oauth::get_valid_token(secrets).await?;
+        stream_once(
+            app,
+            &profile,
+            &token,
+            account_id.as_deref(),
+            messages,
+            event_name,
+            max_tokens,
+            Arc::new(AtomicBool::new(false)),
+            cancel,
+        )
+        .await?;
+        return Ok(profile.view);
+    }
+    if profile.view.provider == "ollama" {
+        stream_once(
+            app,
+            &profile,
+            "",
+            None,
+            messages,
+            event_name,
+            max_tokens,
+            Arc::new(AtomicBool::new(false)),
+            cancel,
+        )
+        .await?;
+        return Ok(profile.view);
+    }
+    let mut last_error = None;
+    for credential in credentials_for(db, profile_id)? {
+        let Some(key) = secrets
+            .get(&credential.secret_ref)?
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        match stream_once(
+            app,
+            &profile,
+            &key,
+            None,
+            messages,
+            event_name,
+            max_tokens,
+            Arc::new(AtomicBool::new(false)),
+            cancel,
+        )
+        .await
+        {
+            Ok(()) => return Ok(profile.view),
+            Err(error) if is_cancelled(&error) => return Err(error),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| AppError::Other("AI_NO_USABLE_KEYS".to_string())))
+}
+
+pub async fn complete_with_profile(
+    app: &AppHandle,
+    db: &Db,
+    secrets: &Secrets,
+    profile_id: &str,
+    messages: &[ChatMessage],
+    max_tokens: Option<u32>,
+    request_id: Option<&str>,
+) -> AppResult<AiCompletion> {
+    let event_name = format!("ai-internal-profile-completion-{}", uuid::Uuid::new_v4());
+    let output = Arc::new(Mutex::new(String::new()));
+    let listener_output = Arc::clone(&output);
+    let listener_id = app.listen(event_name.clone(), move |event| {
+        let Ok(chunk) = serde_json::from_str::<crate::commands::ai::AiStreamChunk>(event.payload())
+        else {
+            return;
+        };
+        if !chunk.done && !chunk.delta.is_empty() {
+            if let Ok(mut text) = listener_output.lock() {
+                text.push_str(&chunk.delta);
+            }
+        }
+    });
+    let started = Instant::now();
+    let mut cancel = request_id
+        .and_then(|id| {
+            cancellation_registry()
+                .lock()
+                .ok()
+                .and_then(|registry| registry.get(id).map(watch::Sender::subscribe))
+        })
+        .unwrap_or_else(|| {
+            request_id
+                .map(register_request)
+                .unwrap_or_else(|| watch::channel(false).1)
+        });
+    let routed = stream_with_profile_inner(
+        app,
+        db,
+        secrets,
+        profile_id,
+        messages,
+        &event_name,
+        max_tokens,
+        &mut cancel,
+    )
+    .await;
+    app.unlisten(listener_id);
+    if let Some(id) = request_id {
+        finish_request(id);
+    }
+    let profile = routed?;
+    let text = output
+        .lock()
+        .map_err(|error| AppError::Other(error.to_string()))?
+        .clone();
+    Ok(AiCompletion {
+        text,
+        profile_id: profile.id,
+        provider: profile.provider,
+        model: profile.model,
+        first_token_ms: None,
+        total_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
 fn connection_test_token_limit(profile: &AiProfile) -> Option<u32> {
     // OpenAI-compatible reasoning endpoints frequently reject `max_tokens`
     // (some require `max_completion_tokens`, while others accept neither).
@@ -1230,6 +1370,33 @@ pub(crate) fn embedding_source(
     db: &Db,
     secrets: &Secrets,
 ) -> AppResult<Option<crate::ai::grounding::vector::EmbeddingSource>> {
+    let explicit = {
+        let conn = db.reader();
+        let get = |key: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .ok()
+        };
+        (get("ai_embedding_configured") == Some("true".to_string())).then(|| {
+            (
+                get("ai_embedding_endpoint"),
+                get("ai_embedding_model"),
+                get("ai_embedding_dimensions").and_then(|value| value.parse::<usize>().ok()),
+            )
+        })
+    };
+    if let Some((Some(endpoint), Some(model), Some(dimensions))) = explicit {
+        return Ok(Some(crate::ai::grounding::vector::EmbeddingSource {
+            profile_id: "explicit".to_string(),
+            endpoint,
+            model,
+            api_key: secrets.get(crate::ai::grounding::vector::EMBEDDING_SECRET_REF)?,
+            dimensions,
+        }));
+    }
     let profile = match active_profile(db) {
         Ok(profile) => profile,
         Err(AppError::Other(code)) if code == "AI_NOT_CONFIGURED" => return Ok(None),
@@ -1256,10 +1423,65 @@ pub(crate) fn embedding_source(
         format!("{base_url}/v1/embeddings")
     };
     Ok(Some(crate::ai::grounding::vector::EmbeddingSource {
-        profile_id: profile.view.id,
+        profile_id: profile.view.id.clone(),
         endpoint,
-        api_key,
+        model: crate::ai::grounding::vector::DEFAULT_EMBEDDING_MODEL.to_string(),
+        api_key: Some(api_key),
+        dimensions: crate::ai::grounding::vector::DEFAULT_EMBEDDING_DIMENSIONS,
     }))
+}
+
+pub fn migrate_embedding_source(db: &Db, secrets: &Secrets) -> AppResult<()> {
+    let should_migrate = {
+        let conn = db.reader();
+        let vector_enabled = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'ai_vector_retrieval'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .is_some_and(|value| value == "true");
+        let explicit = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'ai_embedding_configured'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .is_some_and(|value| value == "true");
+        vector_enabled && !explicit
+    };
+    if !should_migrate {
+        return Ok(());
+    }
+    let Some(source) = embedding_source(db, secrets)? else {
+        return Ok(());
+    };
+    if let Some(credential) = credentials_for(db, &source.profile_id)?.into_iter().next() {
+        let _ = secrets.copy_local(
+            &credential.secret_ref,
+            crate::ai::grounding::vector::EMBEDDING_SECRET_REF,
+        )?;
+    }
+    let conn = db
+        .conn
+        .lock()
+        .map_err(|error| AppError::Other(error.to_string()))?;
+    let dimensions = source.dimensions.to_string();
+    for (key, value) in [
+        ("ai_embedding_endpoint", source.endpoint.as_str()),
+        ("ai_embedding_model", source.model.as_str()),
+        ("ai_embedding_dimensions", dimensions.as_str()),
+        ("ai_embedding_configured", "true"),
+    ] {
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )?;
+    }
+    Ok(())
 }
 
 pub fn list_profiles(db: &Db) -> AppResult<Vec<AiProfileView>> {

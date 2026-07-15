@@ -6,7 +6,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
 use super::index::{index_status, IndexStatus};
-use crate::ai::router::{complete_with_failover, register_request};
+use crate::ai::router::{complete_with_failover, complete_with_profile, register_request};
 use crate::commands::ai::ChatMessage;
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
@@ -26,14 +26,16 @@ pub struct SummaryChunk {
     pub token_estimate: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SectionOverview {
     pub section_index: i64,
     pub section_title: Option<String>,
     pub content: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BookOverview {
     pub content: String,
     pub sections: Vec<SectionOverview>,
@@ -154,8 +156,30 @@ async fn complete_summary(
         return Err(AppError::Ai("AI_REQUEST_CANCELLED".to_string()));
     }
     register_request(request_id);
-    let completion =
-        complete_with_failover(app, db, secrets, messages, None, Some(request_id), None).await?;
+    let profile_id = {
+        let conn = db.reader();
+        conn.query_row(
+            "SELECT value FROM settings WHERE key = 'ai_summary_profile_id'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    };
+    let completion = if let Some(profile_id) = profile_id {
+        complete_with_profile(
+            app,
+            db,
+            secrets,
+            &profile_id,
+            messages,
+            None,
+            Some(request_id),
+        )
+        .await?
+    } else {
+        complete_with_failover(app, db, secrets, messages, None, Some(request_id), None).await?
+    };
     Ok((completion.text.trim().to_string(), completion.model))
 }
 
@@ -214,6 +238,7 @@ fn summary_payload(input: SummaryPayloadInput<'_>) -> BookSummaryPayload {
         source_sha256: input.source_sha256.to_string(),
         created_at: input.now,
         updated_at: input.now,
+        user_edited: false,
     }
 }
 
@@ -232,15 +257,16 @@ fn persist_summaries(db: &Db, sync: &SyncWriter, rows: &[BookSummaryPayload]) ->
         for row in rows {
             tx.execute(
                 "INSERT INTO book_summaries
-                 (id, book_id, scope, section_index, section_title, content, language, model, source_sha256, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 (id, book_id, scope, section_index, section_title, content, language, model, source_sha256, created_at, updated_at, user_edited)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT(book_id, scope, COALESCE(section_index, -1)) DO UPDATE SET
                    id=excluded.id, section_title=excluded.section_title, content=excluded.content,
                    language=excluded.language, model=excluded.model, source_sha256=excluded.source_sha256,
-                   updated_at=excluded.updated_at",
+                   updated_at=excluded.updated_at, user_edited=excluded.user_edited",
                 params![
                     row.id, row.book_id, row.scope, row.section_index, row.section_title,
                     row.content, row.language, row.model, row.source_sha256, row.created_at, row.updated_at,
+                    row.user_edited as i64,
                 ],
             )?;
             events.push(EventBody::BookSummaryUpsert(row.clone()));
@@ -255,6 +281,7 @@ pub async fn generate_book_summaries(
     secrets: &Secrets,
     book_id: &str,
     request_id: &str,
+    overwrite_edited: bool,
 ) -> AppResult<()> {
     if index_status(db, book_id)? != IndexStatus::Ready {
         return Err(AppError::Other("AI_INDEX_NOT_READY".to_string()));
@@ -269,6 +296,33 @@ pub async fn generate_book_summaries(
         .unwrap_or_else(|_| "en".to_string())
     };
     let (source_sha256, chunks) = load_summary_chunks(db, book_id)?;
+    let existing_edited = if overwrite_edited {
+        BTreeMap::new()
+    } else {
+        let conn = db.reader();
+        let mut statement = conn.prepare(
+            "SELECT scope, COALESCE(section_index, -1), section_title, content, language, model,
+                    source_sha256, created_at, updated_at
+             FROM book_summaries WHERE book_id = ?1 AND user_edited = 1",
+        )?;
+        let rows = statement
+            .query_map(params![book_id], |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, i64>(1)?),
+                    (
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ),
+                ))
+            })?
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        rows
+    };
     let mut grouped: BTreeMap<i64, (Option<String>, Vec<SummaryChunk>)> = BTreeMap::new();
     for chunk in chunks {
         grouped
@@ -294,6 +348,16 @@ pub async fn generate_book_summaries(
     let mut models = Vec::new();
 
     for (section_index, (title, chunks)) in grouped {
+        if let Some((edited_title, content, _, _, _, _, _)) =
+            existing_edited.get(&("section".to_string(), section_index))
+        {
+            sections.push(SectionOverview {
+                section_index,
+                section_title: edited_title.clone().or(title),
+                content: content.clone(),
+            });
+            continue;
+        }
         let tokens = chunks
             .iter()
             .map(|chunk| chunk.token_estimate)
@@ -350,15 +414,23 @@ pub async fn generate_book_summaries(
             content,
         });
     }
-    emit_progress(app, book_id, done, total, "book");
-    let (book_summary, book_model) = complete_summary(
-        app,
-        db,
-        secrets,
-        &book_prompt(&language, &sections),
-        request_id,
-    )
-    .await?;
+    let edited_book = existing_edited.get(&("book".to_string(), -1));
+    let (book_summary, book_model) = if let Some((_, content, _, model, _, _, _)) = edited_book {
+        (
+            content.clone(),
+            model.clone().unwrap_or_else(|| "user".to_string()),
+        )
+    } else {
+        emit_progress(app, book_id, done, total, "book");
+        complete_summary(
+            app,
+            db,
+            secrets,
+            &book_prompt(&language, &sections),
+            request_id,
+        )
+        .await?
+    };
     let now = chrono::Utc::now().timestamp_millis();
     let mut rows = sections
         .iter()
@@ -387,6 +459,21 @@ pub async fn generate_book_summaries(
         source_sha256: &source_sha256,
         now,
     }));
+    for row in &mut rows {
+        let key = (row.scope.clone(), row.section_index.unwrap_or(-1));
+        if let Some((title, content, language, model, _hash, created_at, updated_at)) =
+            existing_edited.get(&key)
+        {
+            row.section_title = title.clone();
+            row.content = content.clone();
+            row.language = language.clone();
+            row.model = model.clone();
+            row.source_sha256 = source_sha256.clone();
+            row.created_at = *created_at;
+            row.updated_at = now.max(*updated_at);
+            row.user_edited = true;
+        }
+    }
     let sync = app.state::<SyncWriter>();
     persist_summaries(db, &sync, &rows)?;
     emit_progress(app, book_id, total, total, "done");

@@ -7,6 +7,7 @@ import BookContextMenu from "./BookContextMenu";
 import EditMetadataModal from "./EditMetadataModal";
 import { useTranslation } from "react-i18next";
 import DeleteBookDialog, { type DeleteBookNotePolicy } from "./DeleteBookDialog";
+import IndexManagerModal from "./IndexManagerModal";
 
 function CoverImage({ src, alt, title }: { src: string; alt: string; title: string }) {
   const [failed, setFailed] = useState(false);
@@ -45,6 +46,7 @@ export default function BookList({ books, hasMore, loadMore, loadingMore, active
   } | null>(null);
   const [editBook, setEditBook] = useState<Book | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Book | null>(null);
+  const [indexBookId, setIndexBookId] = useState<string | null>(null);
 
   const handleContextMenu = (e: React.MouseEvent, book: Book) => {
     e.preventDefault();
@@ -176,6 +178,7 @@ export default function BookList({ books, hasMore, loadMore, loadingMore, active
             setEditBook(contextMenu.book);
             setContextMenu(null);
           }}
+          onManageIndex={() => { setIndexBookId(contextMenu.book.id); setContextMenu(null); }}
           onDelete={() => {
             setDeleteTarget(contextMenu.book);
             setContextMenu(null);
@@ -209,6 +212,7 @@ export default function BookList({ books, hasMore, loadMore, loadingMore, active
           }}
         />
       )}
+      {indexBookId && <IndexManagerModal bookId={indexBookId} onClose={() => setIndexBookId(null)} />}
 
       {hasMore && <LoadMoreSentinel loadMore={loadMore} loadingMore={loadingMore} />}
     </>

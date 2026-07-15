@@ -122,6 +122,17 @@ impl Snapshot {
                 "SYNC_SNAPSHOT_BOOK_SUMMARY_INVALID".to_string(),
             ));
         }
+        if self.v < 5
+            && self
+                .state
+                .book_summaries
+                .values()
+                .any(|row| row.user_edited)
+        {
+            return Err(AppError::Other(
+                "SYNC_SNAPSHOT_BOOK_SUMMARY_INVALID".to_string(),
+            ));
+        }
         let snapshot_id = self
             .id
             .parse::<Ulid>()
@@ -801,12 +812,12 @@ fn upsert_book_summary(tx: &Transaction, id: &str, r: &BookSummaryRow) -> AppRes
     tx.execute(
         "INSERT INTO book_summaries
          (id, book_id, scope, section_index, section_title, content, language, model,
-          source_sha256, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+          source_sha256, created_at, updated_at, user_edited)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(book_id, scope, COALESCE(section_index, -1)) DO UPDATE SET
            id=excluded.id, section_title=excluded.section_title, content=excluded.content,
            language=excluded.language, model=excluded.model, source_sha256=excluded.source_sha256,
-           updated_at=excluded.updated_at
+           updated_at=excluded.updated_at, user_edited=excluded.user_edited
          WHERE book_summaries.updated_at < excluded.updated_at",
         params![
             id,
@@ -820,6 +831,7 @@ fn upsert_book_summary(tx: &Transaction, id: &str, r: &BookSummaryRow) -> AppRes
             r.source_sha256,
             r.created_at,
             r.updated_at,
+            r.user_edited as i64,
         ],
     )?;
     Ok(())
@@ -1142,7 +1154,7 @@ pub(super) fn dump_state(conn: &Connection) -> AppResult<SnapshotState> {
     // enumerated here; see docs/impls/1-grounded-book-chat-overview.md D2.
     let mut stmt = conn.prepare(
         "SELECT id, book_id, scope, section_index, section_title, content, language, model,
-                source_sha256, created_at, updated_at FROM book_summaries",
+                source_sha256, created_at, updated_at, user_edited FROM book_summaries",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((
@@ -1158,6 +1170,7 @@ pub(super) fn dump_state(conn: &Connection) -> AppResult<SnapshotState> {
                 source_sha256: r.get(8)?,
                 created_at: r.get(9)?,
                 updated_at: r.get(10)?,
+                user_edited: r.get::<_, i64>(11)? != 0,
             },
         ))
     })?;

@@ -6,6 +6,7 @@ import {
   FolderPlus,
   FolderMinus,
   Pencil,
+  Database,
   Trash2,
   ChevronRight,
   Plus,
@@ -25,6 +26,7 @@ interface BookContextMenuProps {
   onMarkReading: () => void;
   onMarkUnread: () => void;
   onEditInfo: () => void;
+  onManageIndex: () => void;
   onDelete: () => void;
   onBooksChanged?: () => void;
 }
@@ -40,6 +42,7 @@ export default function BookContextMenu({
   onMarkReading,
   onMarkUnread,
   onEditInfo,
+  onManageIndex,
   onDelete,
   onBooksChanged,
 }: BookContextMenuProps) {
@@ -198,6 +201,13 @@ export default function BookContextMenu({
           <span className="flex-1 text-[13px] font-medium text-text-primary tracking-[-0.08px]">
             {t("bookMenu.editInfo")}
           </span>
+        </button>
+        <button
+          onClick={onManageIndex}
+          className="flex h-[31.5px] w-[calc(100%-8px)] items-center gap-3 rounded-sm px-3 mx-1 text-left hover:bg-accent-bg"
+        >
+          <Database size={16} className="text-text-muted" />
+          <span className="flex-1 text-[13px] font-medium text-text-primary">{t("bookMenu.aiIndex")}</span>
         </button>
 
         <div className="mx-3 my-1 h-px bg-border/80" />

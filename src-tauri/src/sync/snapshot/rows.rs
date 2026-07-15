@@ -197,6 +197,8 @@ pub struct BookSummaryRow {
     pub source_sha256: String,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub user_edited: bool,
 }
 
 fn default_fsrs_version() -> i64 {

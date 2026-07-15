@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 /// version 4 adds synced book summaries.
 /// Readers retain old-version support while older clients reject newer
 /// envelopes instead of advancing their watermark past data they cannot apply.
-pub const EVENT_SCHEMA_VERSION: u32 = 4;
+pub const EVENT_SCHEMA_VERSION: u32 = 5;
 pub const MIN_SUPPORTED_EVENT_SCHEMA_VERSION: u32 = 1;
 
 pub fn is_supported_event_schema_version(version: u32) -> bool {
@@ -363,6 +363,8 @@ pub struct BookSummaryPayload {
     pub source_sha256: String,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub user_edited: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -623,6 +625,7 @@ mod tests {
             source_sha256: "hash".into(),
             created_at: 1,
             updated_at: 2,
+            user_edited: true,
         })));
     }
 

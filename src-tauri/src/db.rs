@@ -58,6 +58,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         24,
         include_str!("../migrations/024_ai_vector_retrieval.sql"),
     ),
+    (25, include_str!("../migrations/025_index_management.sql")),
 ];
 
 fn register_sqlite_vec() {
@@ -245,7 +246,7 @@ impl Db {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=OFF;")?;
 
         Self::run_migrations(&conn)?;
-        crate::ai::grounding::vector::ensure_vector_table(&conn)?;
+        crate::ai::grounding::vector::ensure_configured_vector_table(&conn)?;
 
         // One-time migration: convert absolute paths to relative
         Self::migrate_to_relative_paths(&conn, data_dir)?;

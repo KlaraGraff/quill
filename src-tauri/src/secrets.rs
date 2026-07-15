@@ -366,6 +366,24 @@ impl Secrets {
         Ok(())
     }
 
+    pub fn copy_local(&self, source: &str, target: &str) -> AppResult<bool> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .map_err(|error| AppError::Other(error.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| AppError::Other(error.to_string()))?;
+        let changed = conn.execute(
+            "INSERT INTO secrets (key, value, created_at)
+             SELECT ?2, value, ?3 FROM secrets WHERE key = ?1
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, created_at = excluded.created_at",
+            params![source, target, chrono::Utc::now().timestamp_millis()],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn set_many(&self, values: &[(&str, Option<&str>)]) -> AppResult<()> {
         let _operation = self
             .operation_lock

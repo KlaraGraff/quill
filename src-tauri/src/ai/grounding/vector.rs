@@ -10,8 +10,9 @@ use crate::db::Db;
 use crate::error::{AppError, AppResult};
 use crate::secrets::Secrets;
 
-pub const EMBEDDING_MODEL: &str = "text-embedding-3-small";
-pub const EMBEDDING_DIMENSIONS: usize = 1_536;
+pub const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-3-small";
+pub const DEFAULT_EMBEDDING_DIMENSIONS: usize = 1_536;
+pub const EMBEDDING_SECRET_REF: &str = "ai_embedding_api_key";
 const RRF_K: f64 = 60.0;
 const EMBEDDING_BATCH_SIZE: usize = 32;
 
@@ -19,7 +20,9 @@ const EMBEDDING_BATCH_SIZE: usize = 32;
 pub(crate) struct EmbeddingSource {
     pub(crate) profile_id: String,
     pub(crate) endpoint: String,
-    pub(crate) api_key: String,
+    pub(crate) model: String,
+    pub(crate) api_key: Option<String>,
+    pub(crate) dimensions: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -27,16 +30,102 @@ pub(crate) struct EmbeddingSource {
 pub struct VectorAvailability {
     pub available: bool,
     pub reason: Option<String>,
+    pub dimensions: Option<usize>,
+    pub model: Option<String>,
 }
 
-pub fn ensure_vector_table(conn: &Connection) -> AppResult<()> {
-    conn.execute_batch(
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingProbeResult {
+    pub ok: bool,
+    pub dimensions: usize,
+    pub latency_ms: u64,
+    pub error: Option<String>,
+}
+
+fn configured_dimensions(conn: &Connection) -> usize {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = 'ai_embedding_dimensions'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|value| value.parse::<usize>().ok())
+    .filter(|value| (1..=65_536).contains(value))
+    .unwrap_or(DEFAULT_EMBEDDING_DIMENSIONS)
+}
+
+pub fn ensure_configured_vector_table(conn: &Connection) -> AppResult<()> {
+    ensure_vector_table(conn, configured_dimensions(conn))
+}
+
+pub fn ensure_vector_table(conn: &Connection, dimensions: usize) -> AppResult<()> {
+    if !(1..=65_536).contains(&dimensions) {
+        return Err(AppError::Other(
+            "AI_EMBEDDING_DIMENSIONS_UNSUPPORTED".to_string(),
+        ));
+    }
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'book_chunk_vectors'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let expected = format!("float[{dimensions}]");
+    let rebuild = existing.is_none()
+        || existing
+            .as_deref()
+            .is_some_and(|sql| !sql.contains(&expected));
+    if existing
+        .as_deref()
+        .is_some_and(|sql| !sql.contains(&expected))
+    {
+        conn.execute_batch("DROP TABLE book_chunk_vectors;")?;
+    }
+    conn.execute_batch(&format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS book_chunk_vectors USING vec0(
             chunk_id TEXT PRIMARY KEY,
             book_id TEXT,
-            embedding float[1536]
-        );",
-    )?;
+            embedding float[{dimensions}]
+        );"
+    ))?;
+    if rebuild {
+        let model = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'ai_embedding_model'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_else(|_| DEFAULT_EMBEDDING_MODEL.to_string());
+        let mut statement = conn.prepare(
+            "SELECT chunk_id, book_id, embedding FROM book_chunk_embeddings
+             WHERE dimensions = ?1 AND model = ?2",
+        )?;
+        let rows = statement
+            .query_map(params![dimensions as i64, model], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for (chunk_id, book_id, blob) in rows {
+            if blob.len() != dimensions * 4 {
+                continue;
+            }
+            let vector = blob
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four bytes")))
+                .collect::<Vec<_>>();
+            conn.execute(
+                "INSERT INTO book_chunk_vectors (chunk_id, book_id, embedding) VALUES (?1, ?2, ?3)",
+                params![chunk_id, book_id, embedding_json(&vector)?],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -51,8 +140,8 @@ fn embedding_blob(embedding: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-fn validate_embedding(embedding: &[f32]) -> AppResult<()> {
-    if embedding.len() != EMBEDDING_DIMENSIONS || embedding.iter().any(|value| !value.is_finite()) {
+fn validate_embedding(embedding: &[f32], dimensions: usize) -> AppResult<()> {
+    if embedding.len() != dimensions || embedding.iter().any(|value| !value.is_finite()) {
         return Err(AppError::Other(
             "AI_EMBEDDING_DIMENSIONS_UNSUPPORTED".to_string(),
         ));
@@ -61,17 +150,28 @@ fn validate_embedding(embedding: &[f32]) -> AppResult<()> {
 }
 
 async fn embeddings(source: &EmbeddingSource, input: Vec<String>) -> AppResult<Vec<Vec<f32>>> {
-    let response = tokio::time::timeout(
-        crate::ai::FIRST_BYTE_TIMEOUT,
-        crate::ai::http_client()
-            .post(&source.endpoint)
-            .bearer_auth(&source.api_key)
-            .json(&serde_json::json!({ "model": EMBEDDING_MODEL, "input": input }))
-            .send(),
-    )
-    .await
-    .map_err(|_| AppError::Ai("AI_EMBEDDING_FIRST_BYTE_TIMEOUT".to_string()))?
-    .map_err(|error| AppError::Ai(error.to_string()))?;
+    embeddings_internal(source, input, true).await
+}
+
+async fn embeddings_internal(
+    source: &EmbeddingSource,
+    input: Vec<String>,
+    enforce_dimensions: bool,
+) -> AppResult<Vec<Vec<f32>>> {
+    let mut request = crate::ai::http_client()
+        .post(&source.endpoint)
+        .json(&serde_json::json!({ "model": source.model, "input": input }));
+    if let Some(key) = source
+        .api_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+    {
+        request = request.bearer_auth(key);
+    }
+    let response = tokio::time::timeout(crate::ai::FIRST_BYTE_TIMEOUT, request.send())
+        .await
+        .map_err(|_| AppError::Ai("AI_EMBEDDING_FIRST_BYTE_TIMEOUT".to_string()))?
+        .map_err(|error| AppError::Ai(error.to_string()))?;
     if !response.status().is_success() {
         return Err(crate::ai::http_status_error("Embedding", response).await);
     }
@@ -102,8 +202,10 @@ async fn embeddings(source: &EmbeddingSource, input: Vec<String>) -> AppResult<V
         .into_iter()
         .map(|item| item.embedding)
         .collect::<Vec<_>>();
-    for embedding in &embeddings {
-        validate_embedding(embedding)?;
+    if enforce_dimensions {
+        for embedding in &embeddings {
+            validate_embedding(embedding, source.dimensions)?;
+        }
     }
     Ok(embeddings)
 }
@@ -120,7 +222,7 @@ fn record_capability(db: &Db, source: &EmbeddingSource, available: bool, reason:
         params![
             source.profile_id,
             source.endpoint,
-            EMBEDDING_MODEL,
+            source.model,
             available as i64,
             reason,
             chrono::Utc::now().timestamp_millis(),
@@ -133,6 +235,8 @@ pub fn availability(db: &Db, secrets: &Secrets) -> AppResult<VectorAvailability>
         return Ok(VectorAvailability {
             available: false,
             reason: Some("requires_compatible_provider".to_string()),
+            dimensions: None,
+            model: None,
         });
     };
     let cached = {
@@ -140,7 +244,7 @@ pub fn availability(db: &Db, secrets: &Secrets) -> AppResult<VectorAvailability>
         conn.query_row(
             "SELECT available, reason FROM ai_embedding_capabilities
              WHERE profile_id = ?1 AND endpoint = ?2 AND model = ?3",
-            params![source.profile_id, source.endpoint, EMBEDDING_MODEL],
+            params![source.profile_id, source.endpoint, source.model],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
         )
         .optional()?
@@ -149,11 +253,15 @@ pub fn availability(db: &Db, secrets: &Secrets) -> AppResult<VectorAvailability>
         return Ok(VectorAvailability {
             available: false,
             reason: reason.or_else(|| Some("embedding_endpoint_unavailable".to_string())),
+            dimensions: Some(source.dimensions),
+            model: Some(source.model),
         });
     }
     Ok(VectorAvailability {
         available: true,
         reason: None,
+        dimensions: Some(source.dimensions),
+        model: Some(source.model),
     })
 }
 
@@ -190,14 +298,18 @@ pub fn source(db: &Db, secrets: &Secrets) -> AppResult<Option<EmbeddingSource>> 
     router::embedding_source(db, secrets)
 }
 
-pub fn has_complete_embeddings(db: &Db, book_id: &str) -> AppResult<bool> {
+pub fn has_complete_embeddings(
+    db: &Db,
+    book_id: &str,
+    source: &EmbeddingSource,
+) -> AppResult<bool> {
     let conn = db.reader();
     let counts: (i64, i64) = conn.query_row(
         "SELECT COUNT(*), COUNT(e.chunk_id)
          FROM book_chunks c
-         LEFT JOIN book_chunk_embeddings e ON e.chunk_id = c.id AND e.model = ?2
+         LEFT JOIN book_chunk_embeddings e ON e.chunk_id = c.id AND e.model = ?2 AND e.dimensions = ?3
          WHERE c.book_id = ?1",
-        params![book_id, EMBEDDING_MODEL],
+        params![book_id, source.model, source.dimensions as i64],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     Ok(counts.0 > 0 && counts.0 == counts.1)
@@ -215,14 +327,20 @@ pub async fn ensure_embeddings(db: &Db, book_id: &str, source: &EmbeddingSource)
             "SELECT c.id, c.text
              FROM book_chunks c
              LEFT JOIN book_chunk_embeddings e
-               ON e.chunk_id = c.id AND e.model = ?2 AND e.source_sha256 = ?3
+               ON e.chunk_id = c.id AND e.model = ?2 AND e.source_sha256 = ?3 AND e.dimensions = ?4
              WHERE c.book_id = ?1 AND e.chunk_id IS NULL
              ORDER BY c.chunk_index",
         )?;
         let chunks = statement
-            .query_map(params![book_id, EMBEDDING_MODEL, source_sha256], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
+            .query_map(
+                params![
+                    book_id,
+                    source.model,
+                    source_sha256,
+                    source.dimensions as i64
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         (source_sha256, chunks)
     };
@@ -233,7 +351,7 @@ pub async fn ensure_embeddings(db: &Db, book_id: &str, source: &EmbeddingSource)
             .conn
             .lock()
             .map_err(|error| AppError::Other(error.to_string()))?;
-        ensure_vector_table(&conn)?;
+        ensure_vector_table(&conn, source.dimensions)?;
         let transaction = conn.transaction()?;
         for ((chunk_id, _), vector) in batch.iter().zip(vectors.iter()) {
             let encoded = embedding_json(vector)?;
@@ -248,8 +366,8 @@ pub async fn ensure_embeddings(db: &Db, book_id: &str, source: &EmbeddingSource)
                     chunk_id,
                     book_id,
                     embedding_blob(vector),
-                    EMBEDDING_DIMENSIONS as i64,
-                    EMBEDDING_MODEL,
+                    source.dimensions as i64,
+                    source.model,
                     source_sha256,
                     chrono::Utc::now().timestamp_millis(),
                 ],
@@ -274,6 +392,96 @@ pub async fn query_embedding(source: &EmbeddingSource, query: String) -> AppResu
         .into_iter()
         .next()
         .ok_or_else(|| AppError::Ai("AI_EMBEDDING_RESPONSE_INVALID".to_string()))
+}
+
+pub async fn probe_and_save(
+    db: &Db,
+    secrets: &Secrets,
+    endpoint: String,
+    model: String,
+    api_key: Option<String>,
+) -> AppResult<EmbeddingProbeResult> {
+    let endpoint = endpoint.trim().to_string();
+    let model = model.trim().to_string();
+    let parsed = reqwest::Url::parse(&endpoint)
+        .map_err(|_| AppError::Other("AI_EMBEDDING_CONFIG_INVALID".to_string()))?;
+    if model.is_empty() || !matches!(parsed.scheme(), "http" | "https") {
+        return Err(AppError::Other("AI_EMBEDDING_CONFIG_INVALID".to_string()));
+    }
+    let started = std::time::Instant::now();
+    let effective_key = match api_key.as_ref() {
+        Some(value) => (!value.trim().is_empty()).then(|| value.clone()),
+        None => secrets.get(EMBEDDING_SECRET_REF)?,
+    };
+    let source = EmbeddingSource {
+        profile_id: "explicit".to_string(),
+        endpoint: endpoint.clone(),
+        model: model.clone(),
+        api_key: effective_key,
+        dimensions: DEFAULT_EMBEDDING_DIMENSIONS,
+    };
+    let response =
+        embeddings_internal(&source, vec!["Quill embedding probe".to_string()], false).await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let vector = match response {
+        Ok(mut values) => values.pop().unwrap_or_default(),
+        Err(error) => {
+            return Ok(EmbeddingProbeResult {
+                ok: false,
+                dimensions: 0,
+                latency_ms,
+                error: Some(error.to_string()),
+            });
+        }
+    };
+    let dimensions = vector.len();
+    if dimensions == 0 || dimensions > 65_536 || vector.iter().any(|value| !value.is_finite()) {
+        return Ok(EmbeddingProbeResult {
+            ok: false,
+            dimensions: 0,
+            latency_ms,
+            error: Some("AI_EMBEDDING_RESPONSE_INVALID".to_string()),
+        });
+    }
+    if let Some(value) = api_key.as_deref() {
+        secrets.set_many(&[(
+            EMBEDDING_SECRET_REF,
+            (!value.trim().is_empty()).then_some(value),
+        )])?;
+    }
+    let dimensions_text = dimensions.to_string();
+    let conn = db
+        .conn
+        .lock()
+        .map_err(|error| AppError::Other(error.to_string()))?;
+    let tx = conn.unchecked_transaction()?;
+    for (key, value) in [
+        ("ai_embedding_endpoint", endpoint.as_str()),
+        ("ai_embedding_model", model.as_str()),
+        ("ai_embedding_dimensions", dimensions_text.as_str()),
+        ("ai_embedding_configured", "true"),
+    ] {
+        tx.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+    }
+    ensure_vector_table(&tx, dimensions)?;
+    tx.execute(
+        "INSERT INTO ai_embedding_capabilities (profile_id, endpoint, model, available, reason, checked_at)
+         VALUES ('explicit', ?1, ?2, 1, NULL, ?3)
+         ON CONFLICT(profile_id) DO UPDATE SET endpoint=excluded.endpoint, model=excluded.model,
+           available=1, reason=NULL, checked_at=excluded.checked_at",
+        params![endpoint, model, chrono::Utc::now().timestamp_millis()],
+    )?;
+    tx.commit()?;
+    Ok(EmbeddingProbeResult {
+        ok: true,
+        dimensions,
+        latency_ms,
+        error: None,
+    })
 }
 
 pub fn rrf_merge(lexical: &[String], semantic: &[String]) -> Vec<(String, f64)> {
@@ -364,9 +572,9 @@ mod tests {
         let directory = tempfile::TempDir::new().unwrap();
         let db = Db::init(directory.path()).unwrap();
         let conn = db.conn.lock().unwrap();
-        let mut near = vec![0.0; EMBEDDING_DIMENSIONS];
+        let mut near = vec![0.0; DEFAULT_EMBEDDING_DIMENSIONS];
         near[0] = 1.0;
-        let mut far = vec![0.0; EMBEDDING_DIMENSIONS];
+        let mut far = vec![0.0; DEFAULT_EMBEDDING_DIMENSIONS];
         far[1] = 1.0;
         conn.execute(
             "INSERT INTO book_chunk_vectors (chunk_id, book_id, embedding) VALUES (?1, 'book', ?2)",
@@ -380,5 +588,31 @@ mod tests {
         .unwrap();
 
         assert_eq!(vector_ranks(&conn, "book", &near).unwrap()[0], "near");
+    }
+
+    #[test]
+    fn dimension_change_rebuilds_vector_table_from_matching_cache() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let db = Db::init(directory.path()).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let vector = vec![0.25_f32, 0.5, 0.75];
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('ai_embedding_model', 'model')
+             ON CONFLICT(key) DO UPDATE SET value = 'model'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO book_chunk_embeddings
+             (chunk_id, book_id, embedding, dimensions, model, source_sha256, created_at)
+             VALUES ('cached', 'book', ?1, 3, 'model', 'hash', 1)",
+            params![embedding_blob(&vector)],
+        )
+        .unwrap();
+        ensure_vector_table(&conn, 3).unwrap();
+        assert_eq!(
+            vector_ranks(&conn, "book", &vector).unwrap(),
+            vec!["cached"]
+        );
     }
 }

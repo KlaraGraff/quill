@@ -1141,12 +1141,12 @@ fn apply_book_summary_upsert(
     tx.execute(
         "INSERT INTO book_summaries
          (id, book_id, scope, section_index, section_title, content, language, model,
-          source_sha256, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+          source_sha256, created_at, updated_at, user_edited)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(book_id, scope, COALESCE(section_index, -1)) DO UPDATE SET
            id=excluded.id, section_title=excluded.section_title, content=excluded.content,
            language=excluded.language, model=excluded.model, source_sha256=excluded.source_sha256,
-           updated_at=excluded.updated_at
+           updated_at=excluded.updated_at, user_edited=excluded.user_edited
          WHERE book_summaries.updated_at < excluded.updated_at",
         params![
             payload.id,
@@ -1160,6 +1160,7 @@ fn apply_book_summary_upsert(
             payload.source_sha256,
             payload.created_at,
             payload.updated_at,
+            payload.user_edited as i64,
         ],
     )?;
     Ok(())
@@ -1424,6 +1425,7 @@ mod tests {
             source_sha256: "hash".into(),
             created_at: updated_at,
             updated_at,
+            user_edited: false,
         })
     }
 

@@ -357,6 +357,9 @@ pub fn validate_event(event: &Event, expected_device: &str) -> AppResult<()> {
             if event.v < 4 {
                 return Err(AppError::Other("SYNC_BOOK_SUMMARY_INVALID".to_string()));
             }
+            if event.v < 5 && payload.user_edited {
+                return Err(AppError::Other("SYNC_BOOK_SUMMARY_INVALID".to_string()));
+            }
             validate_book_summary_payload(payload)?;
         }
         _ => {}

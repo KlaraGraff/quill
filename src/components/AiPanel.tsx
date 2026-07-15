@@ -1,10 +1,11 @@
 import { useState, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { Sparkles, Send, Loader2, Plus, ChevronDown, ChevronUp, Trash2, X, Square } from "lucide-react";
+import { Database, Sparkles, Send, Loader2, Plus, ChevronDown, ChevronUp, Trash2, X, Square } from "lucide-react";
 import { useAiChat } from "../hooks/useAiChat";
 import { timeAgo } from "../utils/timeAgo";
 import MessageBubble from "./MessageBubble";
 import type { CitedSource } from "../hooks/useAiChat";
+import IndexManagerModal from "./IndexManagerModal";
 
 interface AiPanelProps {
   bookId?: string;
@@ -38,6 +39,7 @@ export default function AiPanel({ bookId, bookTitle, bookAuthor, currentChapter,
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   const [newChatFlash, setNewChatFlash] = useState(false);
+  const [indexOpen, setIndexOpen] = useState(false);
   const messagesScrollRef = useRef<HTMLDivElement>(null);
   const followMessagesRef = useRef(true);
   const scrollFrameRef = useRef<number | null>(null);
@@ -187,6 +189,15 @@ export default function AiPanel({ bookId, bookTitle, bookAuthor, currentChapter,
           )}
         </div>
         <button
+          type="button"
+          onClick={() => setIndexOpen(true)}
+          disabled={!bookId}
+          title={t("indexManager.title")}
+          className="flex size-7 shrink-0 items-center justify-center rounded-lg hover:bg-bg-input disabled:opacity-40"
+        >
+          <Database size={15} className="text-text-muted" />
+        </button>
+        <button
           onClick={handleNewChat}
           className="shrink-0 size-7 rounded-lg flex items-center justify-center hover:bg-bg-input cursor-pointer"
         >
@@ -239,6 +250,7 @@ export default function AiPanel({ bookId, bookTitle, bookAuthor, currentChapter,
           </div>
         )}
       </div>
+      {indexOpen && bookId && <IndexManagerModal bookId={bookId} onClose={() => setIndexOpen(false)} />}
 
       {/* Messages */}
       <div

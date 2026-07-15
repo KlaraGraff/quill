@@ -75,6 +75,17 @@ pub async fn set_ai_vector_retrieval(
 }
 
 #[tauri::command]
+pub async fn ai_embedding_probe(
+    endpoint: String,
+    model: String,
+    api_key: Option<String>,
+    db: State<'_, Db>,
+    secrets: State<'_, Secrets>,
+) -> AppResult<crate::ai::grounding::vector::EmbeddingProbeResult> {
+    crate::ai::grounding::vector::probe_and_save(&db, &secrets, endpoint, model, api_key).await
+}
+
+#[tauri::command]
 pub fn vault_status(secrets: State<'_, Secrets>) -> AppResult<crate::secrets::VaultStatus> {
     secrets.status()
 }

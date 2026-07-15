@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { AlertCircle, Loader2, Plus } from "lucide-react";
+import { Activity, AlertCircle, Loader2, Plus } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import Button from "../ui/Button";
+import Input from "../ui/Input";
+import Select from "../ui/Select";
 import Toggle from "../ui/Toggle";
 import AiServiceCard, {
   type AiConnectionTestResult,
@@ -32,6 +34,15 @@ interface VaultStatus {
 interface VectorAvailability {
   available: boolean;
   reason: string | null;
+  dimensions?: number | null;
+  model?: string | null;
+}
+
+interface EmbeddingProbeResult {
+  ok: boolean;
+  dimensions: number;
+  latencyMs: number;
+  error?: string | null;
 }
 
 const PROFILE_CONFIG_KEYS = [
@@ -108,6 +119,11 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
     available: false,
     reason: "requires_compatible_provider",
   });
+  const [embeddingEndpoint, setEmbeddingEndpoint] = useState("");
+  const [embeddingModel, setEmbeddingModel] = useState("");
+  const [embeddingKey, setEmbeddingKey] = useState("");
+  const [embeddingTesting, setEmbeddingTesting] = useState(false);
+  const [embeddingProbe, setEmbeddingProbe] = useState<EmbeddingProbeResult | null>(null);
   const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const profilesRef = useRef<AiProfile[]>([]);
   const savedProfilesRef = useRef<AiProfile[]>([]);
@@ -180,6 +196,8 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
       );
       replaceProfiles(nextProfiles);
       replaceSavedProfiles(nextProfiles);
+      setEmbeddingEndpoint(settings.ai_embedding_endpoint || "http://localhost:11434/v1/embeddings");
+      setEmbeddingModel(settings.ai_embedding_model || "text-embedding-3-small");
       setCredentials(Object.fromEntries(credentialEntries));
       setExpandedId((current) => current && nextProfiles.some((profile) => profile.id === current) ? current : null);
       try {
@@ -202,7 +220,7 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
     } finally {
       setLoading(false);
     }
-  }, [refreshOAuthStatus, refreshVaultStatus, refreshVectorAvailability, replaceProfiles, replaceSavedProfiles]);
+  }, [refreshOAuthStatus, refreshVaultStatus, refreshVectorAvailability, replaceProfiles, replaceSavedProfiles, settings.ai_embedding_endpoint, settings.ai_embedding_model]);
 
   useEffect(() => {
     void load();
@@ -731,6 +749,28 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
     }
   };
 
+  const testEmbedding = async () => {
+    setEmbeddingTesting(true);
+    setError(null);
+    try {
+      const result = await invoke<EmbeddingProbeResult>("ai_embedding_probe", {
+        endpoint: embeddingEndpoint,
+        model: embeddingModel,
+        apiKey: embeddingKey || null,
+      });
+      setEmbeddingProbe(result);
+      if (result.ok) {
+        setEmbeddingKey("");
+        await refreshVectorAvailability();
+      }
+    } catch (nextError) {
+      setEmbeddingProbe(null);
+      setError(errorText(nextError));
+    } finally {
+      setEmbeddingTesting(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex items-center gap-2 py-8 text-[13px] text-text-muted">
@@ -742,6 +782,35 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
 
   return (
     <div className="pb-6 pt-2">
+      <div className="mb-3">
+        <h4 className="text-[13px] font-medium text-text-primary">{t("settings.ai.chatModels")}</h4>
+        <p className="mt-0.5 text-[11px] leading-[1.55] text-text-muted">{t("settings.ai.chatModelsHint")}</p>
+      </div>
+      <div className="mb-4 border-y border-border py-4">
+        <h4 className="text-[13px] font-medium text-text-primary">{t("settings.ai.embeddingTitle")}</h4>
+        <p className="mt-0.5 text-[11px] leading-[1.55] text-text-muted">{t("settings.ai.embeddingHint")}</p>
+        <div className="mt-3 grid gap-2 sm:grid-cols-2">
+          <Input value={embeddingEndpoint} onChange={(event) => setEmbeddingEndpoint(event.target.value)} placeholder="http://localhost:11434/v1/embeddings" />
+          <Input value={embeddingModel} onChange={(event) => setEmbeddingModel(event.target.value)} placeholder="text-embedding-3-small" />
+        </div>
+        <div className="mt-2 flex items-center gap-2">
+          <Input className="min-w-0 flex-1" type="password" value={embeddingKey} onChange={(event) => setEmbeddingKey(event.target.value)} placeholder={t("settings.ai.embeddingKeyPlaceholder")} />
+          <Button variant="secondary" size="sm" onClick={() => void testEmbedding()} disabled={embeddingTesting || !embeddingEndpoint.trim() || !embeddingModel.trim()}>
+            {embeddingTesting ? <Loader2 size={14} className="animate-spin" /> : <Activity size={14} />}
+            {t("settings.ai.embeddingTest")}
+          </Button>
+        </div>
+        {(embeddingProbe || vectorAvailability.available) && (
+          <p className={`mt-2 text-[11px] ${embeddingProbe?.ok === false ? "text-danger-text" : "text-success-text"}`}>
+            {embeddingProbe?.ok === false
+              ? t("settings.ai.embeddingFailed")
+              : t("settings.ai.embeddingAvailable", {
+                  dimensions: embeddingProbe?.dimensions ?? vectorAvailability.dimensions,
+                  latency: embeddingProbe?.latencyMs ?? "-",
+                })}
+          </p>
+        )}
+      </div>
       <div className="mb-4 flex min-h-[73px] items-center justify-between gap-4 border-b border-border py-3">
         <div className="min-w-0">
           <h4 className="text-[13px] font-medium text-text-primary">{t("settings.ai.grounding")}</h4>
@@ -751,6 +820,19 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
           checked={settings.ai_grounding_enabled !== "false"}
           onChange={(enabled) => void saveSetting("ai_grounding_enabled", enabled ? "true" : "false")}
           label={t("settings.ai.grounding")}
+        />
+      </div>
+      <div className="mb-4 border-b border-border py-3">
+        <h4 className="text-[13px] font-medium text-text-primary">{t("settings.ai.summaryProfile")}</h4>
+        <p className="mt-0.5 text-[11px] leading-[1.55] text-text-muted">{t("settings.ai.summaryProfileHint")}</p>
+        <Select
+          className="mt-2"
+          value={settings.ai_summary_profile_id || ""}
+          onChange={(value) => void saveSetting("ai_summary_profile_id", value)}
+          options={[
+            { value: "", label: t("settings.ai.summaryProfileFollow") },
+            ...profiles.filter((profile) => profile.enabled).map((profile) => ({ value: profile.id, label: profile.label })),
+          ]}
         />
       </div>
       <div className="mb-4 flex min-h-[73px] items-center justify-between gap-4 border-b border-border py-3">

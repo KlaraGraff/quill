@@ -163,6 +163,7 @@ fn write_then_read_roundtrip() {
             source_sha256: "hash".into(),
             created_at: 1_714_770_000_000,
             updated_at: 1_714_770_000_000,
+            user_edited: true,
         },
     );
     let marker_id = word_mark_rule_id("b1", "term", "exact");
