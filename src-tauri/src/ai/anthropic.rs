@@ -121,6 +121,70 @@ pub async fn stream_chat(
     Err(AppError::Ai("AI_STREAM_INCOMPLETE".to_string()))
 }
 
+fn process_data(
+    app: &AppHandle,
+    event_name: &str,
+    data: &str,
+    emitted: &AtomicBool,
+) -> AppResult<bool> {
+    let parsed: serde_json::Value = serde_json::from_str(data)
+        .map_err(|_| AppError::Ai("AI_STREAM_PROTOCOL_ERROR: invalid JSON event".to_string()))?;
+    match parsed["type"].as_str().unwrap_or("") {
+        "content_block_delta" => {
+            if let Some(thinking) = parsed["delta"]["thinking"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+            {
+                emitted.store(true, Ordering::Relaxed);
+                let _ = app.emit(
+                    event_name,
+                    AiStreamChunk {
+                        delta: String::new(),
+                        reasoning_delta: Some(thinking.to_string()),
+                        done: false,
+                        error: None,
+                    },
+                );
+            }
+            if let Some(text) = parsed["delta"]["text"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+            {
+                emitted.store(true, Ordering::Relaxed);
+                let _ = app.emit(
+                    event_name,
+                    AiStreamChunk {
+                        delta: text.to_string(),
+                        reasoning_delta: None,
+                        done: false,
+                        error: None,
+                    },
+                );
+            }
+        }
+        // Anthropic streams overloaded/rate-limit failures as an error event.
+        // Surface the real code so the router cools the right credential rather
+        // than reporting a generic AI_STREAM_INCOMPLETE.
+        "error" => {
+            return Err(crate::ai::stream_event_error("Anthropic", &parsed["error"]));
+        }
+        "message_stop" => {
+            let _ = app.emit(
+                event_name,
+                AiStreamChunk {
+                    delta: String::new(),
+                    reasoning_delta: None,
+                    done: true,
+                    error: None,
+                },
+            );
+            return Ok(true);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,59 +237,13 @@ mod tests {
         assert_eq!(body["system"].as_array().unwrap().len(), 1);
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
     }
-}
 
-fn process_data(
-    app: &AppHandle,
-    event_name: &str,
-    data: &str,
-    emitted: &AtomicBool,
-) -> AppResult<bool> {
-    let parsed: serde_json::Value = serde_json::from_str(data)
-        .map_err(|_| AppError::Ai("AI_STREAM_PROTOCOL_ERROR: invalid JSON event".to_string()))?;
-    match parsed["type"].as_str().unwrap_or("") {
-        "content_block_delta" => {
-            if let Some(thinking) = parsed["delta"]["thinking"]
-                .as_str()
-                .filter(|value| !value.is_empty())
-            {
-                emitted.store(true, Ordering::Relaxed);
-                let _ = app.emit(
-                    event_name,
-                    AiStreamChunk {
-                        delta: String::new(),
-                        reasoning_delta: Some(thinking.to_string()),
-                        done: false,
-                        error: None,
-                    },
-                );
-            }
-            if let Some(text) = parsed["delta"]["text"].as_str() {
-                emitted.store(true, Ordering::Relaxed);
-                let _ = app.emit(
-                    event_name,
-                    AiStreamChunk {
-                        delta: text.to_string(),
-                        reasoning_delta: None,
-                        done: false,
-                        error: None,
-                    },
-                );
-            }
-        }
-        "message_stop" => {
-            let _ = app.emit(
-                event_name,
-                AiStreamChunk {
-                    delta: String::new(),
-                    reasoning_delta: None,
-                    done: true,
-                    error: None,
-                },
-            );
-            return Ok(true);
-        }
-        _ => {}
+    #[test]
+    fn error_event_surfaces_provider_code() {
+        let error = crate::ai::stream_event_error(
+            "Anthropic",
+            &serde_json::json!({ "type": "overloaded_error" }),
+        );
+        assert!(error.to_string().contains("type=overloaded_error"));
     }
-    Ok(false)
 }

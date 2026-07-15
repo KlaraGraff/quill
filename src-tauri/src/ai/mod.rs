@@ -89,6 +89,27 @@ pub(crate) async fn http_status_error(
     ))
 }
 
+/// Build an `AppError` from an error object delivered *inside* an SSE stream
+/// (the top-level `error` field of an OpenAI-style error event, or the `error`
+/// of an Anthropic `{"type":"error",...}` event). Mirrors `http_status_error`'s
+/// `type=`/`code=` shape so `classify_error` routes it (rate_limit, quota,
+/// auth, content policy, …) instead of the stream ending as a generic
+/// `AI_STREAM_INCOMPLETE` with the real code lost.
+pub(crate) fn stream_event_error(
+    provider: &str,
+    error: &serde_json::Value,
+) -> crate::error::AppError {
+    let error_type = sanitized_error_field(error.get("type"))
+        .map(|value| format!(" type={value}"))
+        .unwrap_or_default();
+    let error_code = sanitized_error_field(error.get("code"))
+        .map(|value| format!(" code={value}"))
+        .unwrap_or_default();
+    crate::error::AppError::Ai(format!(
+        "AI_STREAM_PROVIDER_ERROR provider={provider}{error_type}{error_code}"
+    ))
+}
+
 fn sanitized_error_field(value: Option<&serde_json::Value>) -> Option<String> {
     let value = match value? {
         serde_json::Value::String(value) => value.as_str(),

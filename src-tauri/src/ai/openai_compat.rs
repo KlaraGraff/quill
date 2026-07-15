@@ -114,6 +114,74 @@ pub async fn stream_chat(
     Err(AppError::Ai("AI_STREAM_INCOMPLETE".to_string()))
 }
 
+fn process_data(
+    app: &AppHandle,
+    event_name: &str,
+    data: &str,
+    emitted: &AtomicBool,
+) -> AppResult<bool> {
+    if data == "[DONE]" {
+        let _ = app.emit(
+            event_name,
+            AiStreamChunk {
+                delta: String::new(),
+                reasoning_delta: None,
+                done: true,
+                error: None,
+            },
+        );
+        return Ok(true);
+    }
+
+    let parsed: serde_json::Value = serde_json::from_str(data)
+        .map_err(|_| AppError::Ai("AI_STREAM_PROTOCOL_ERROR: invalid JSON event".to_string()))?;
+    // A mid-stream error event carries the real reason (rate limit, quota,
+    // content policy). Surface it so the router can cool the right credential
+    // instead of treating the truncated stream as AI_STREAM_INCOMPLETE.
+    if !parsed["error"].is_null() {
+        return Err(crate::ai::stream_event_error(
+            "OpenAI-compatible",
+            &parsed["error"],
+        ));
+    }
+    let choice_delta = &parsed["choices"][0]["delta"];
+    let reasoning = choice_delta["reasoning_content"]
+        .as_str()
+        .or_else(|| choice_delta["reasoning"].as_str())
+        .or_else(|| choice_delta["thinking"].as_str());
+    if let Some(reasoning) = reasoning.filter(|value| !value.is_empty()) {
+        emitted.store(true, Ordering::Relaxed);
+        let _ = app.emit(
+            event_name,
+            AiStreamChunk {
+                delta: String::new(),
+                reasoning_delta: Some(reasoning.to_string()),
+                done: false,
+                error: None,
+            },
+        );
+    }
+    // Only a non-empty content delta counts as "emitted": a leading empty
+    // chunk (some gateways send one before erroring) must not block failover
+    // to another credential.
+    if let Some(delta) = choice_delta["content"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+    {
+        emitted.store(true, Ordering::Relaxed);
+        let _ = app.emit(
+            event_name,
+            AiStreamChunk {
+                delta: delta.to_string(),
+                reasoning_delta: None,
+                done: false,
+                error: None,
+            },
+        );
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,57 +217,17 @@ mod tests {
             serde_json::json!({ "role": "user", "content": "Question" })
         );
     }
-}
 
-fn process_data(
-    app: &AppHandle,
-    event_name: &str,
-    data: &str,
-    emitted: &AtomicBool,
-) -> AppResult<bool> {
-    if data == "[DONE]" {
-        let _ = app.emit(
-            event_name,
-            AiStreamChunk {
-                delta: String::new(),
-                reasoning_delta: None,
-                done: true,
-                error: None,
-            },
+    #[test]
+    fn mid_stream_error_event_surfaces_provider_code() {
+        // A gateway can send a rate-limit error mid-stream. It must become a
+        // classified error, not be swallowed into AI_STREAM_INCOMPLETE.
+        let error = crate::ai::stream_event_error(
+            "OpenAI-compatible",
+            &serde_json::json!({ "type": "rate_limit_error", "code": "rate_limited" }),
         );
-        return Ok(true);
+        let message = error.to_string();
+        assert!(message.contains("type=rate_limit_error"));
+        assert!(message.contains("code=rate_limited"));
     }
-
-    let parsed: serde_json::Value = serde_json::from_str(data)
-        .map_err(|_| AppError::Ai("AI_STREAM_PROTOCOL_ERROR: invalid JSON event".to_string()))?;
-    let choice_delta = &parsed["choices"][0]["delta"];
-    let reasoning = choice_delta["reasoning_content"]
-        .as_str()
-        .or_else(|| choice_delta["reasoning"].as_str())
-        .or_else(|| choice_delta["thinking"].as_str());
-    if let Some(reasoning) = reasoning.filter(|value| !value.is_empty()) {
-        emitted.store(true, Ordering::Relaxed);
-        let _ = app.emit(
-            event_name,
-            AiStreamChunk {
-                delta: String::new(),
-                reasoning_delta: Some(reasoning.to_string()),
-                done: false,
-                error: None,
-            },
-        );
-    }
-    if let Some(delta) = choice_delta["content"].as_str() {
-        emitted.store(true, Ordering::Relaxed);
-        let _ = app.emit(
-            event_name,
-            AiStreamChunk {
-                delta: delta.to_string(),
-                reasoning_delta: None,
-                done: false,
-                error: None,
-            },
-        );
-    }
-    Ok(false)
 }

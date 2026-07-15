@@ -3,11 +3,26 @@ use base64::Engine;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 
 use crate::error::{AppError, AppResult};
 use crate::secrets::Secrets;
+
+/// Serializes concurrent access-token refreshes. Two AI requests (e.g. a chat
+/// stream and a concurrent title generation) can both observe an expired token
+/// and race to refresh it with the same refresh_token. OpenAI rotates refresh
+/// tokens, so the loser gets a 401 — classified as `Auth` and cooling the whole
+/// profile for 5 minutes — and the out-of-order `save_tokens` writes can clobber
+/// the freshly rotated token, eventually forcing re-authentication. Holding this
+/// lock and re-reading tokens inside it makes the second caller reuse the first
+/// caller's result instead of refreshing again.
+fn refresh_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 // OpenAI OAuth constants (public PKCE client, matches Codex CLI / pi-mono)
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -337,7 +352,18 @@ pub async fn get_valid_token(secrets: &Secrets) -> AppResult<(String, Option<Str
         return Ok((tokens.access_token, tokens.account_id));
     }
 
-    // Token expired — refresh it
+    // Token expired — refresh it under the refresh lock so concurrent callers
+    // don't each spend the same (rotating) refresh token.
+    let _guard = refresh_lock().lock().await;
+
+    // Re-read inside the lock: a caller that was queued behind an in-flight
+    // refresh finds the freshly saved token here and skips a redundant refresh.
+    let tokens =
+        load_tokens(secrets)?.ok_or_else(|| AppError::Other("AI_NOT_CONFIGURED".to_string()))?;
+    if tokens.expires_at > now_epoch() + 60 {
+        return Ok((tokens.access_token, tokens.account_id));
+    }
+
     let Some(refresh_token) = tokens.refresh_token.as_deref() else {
         clear_tokens(secrets)?;
         return Err(AppError::Other(

@@ -1444,6 +1444,113 @@ mod tests {
         tx.commit().unwrap();
     }
 
+    /// Guard against a forgotten cascade when a new `book_id`-bearing table is
+    /// added. Seeds a book plus a row in every current child table, deletes the
+    /// book through `cascade_delete`, then enumerates *every* table with a
+    /// `book_id` column and asserts none still references the deleted book.
+    ///
+    /// Foreign keys are OFF app-wide (the replay engine writes rows out of
+    /// order), so SQLite never enforces this at runtime — a table wired into a
+    /// feature but not into `cascade_delete_book` would silently orphan its
+    /// rows. This turns that mistake into a failing test.
+    #[test]
+    fn cascade_delete_book_leaves_no_orphans_in_any_book_id_table() {
+        let mut conn = open_db();
+        conn.execute_batch(
+            "INSERT INTO books (id, title, author, file_path, status, progress, created_at, updated_at)
+                 VALUES ('b1','T','A','books/test.epub','reading',42,1700000000000,1700000000000);
+             INSERT INTO collections (id, name, sort_order, created_at, updated_at)
+                 VALUES ('c1','Fav',0,1700000000000,1700000000000);
+             INSERT INTO collection_books (collection_id, book_id, created_at, updated_at)
+                 VALUES ('c1','b1',1700000000000,1700000000000);
+             INSERT INTO bookmarks (id, book_id, cfi, label, created_at, updated_at)
+                 VALUES ('bm1','b1','epubcfi(/6/2!/4)','Ch1',1700000000000,1700000000000);
+             INSERT INTO highlights (id, book_id, cfi_range, color, note, text_content, created_at, updated_at)
+                 VALUES ('h1','b1','epubcfi(/6/4!/2,/4)','yellow','n','q',1700000000000,1700000000000);
+             INSERT INTO vocab_words (id, book_id, word, definition, context_sentence, cfi, mastery, review_count, next_review_at, created_at, updated_at)
+                 VALUES ('v1','b1','w','d','s','epubcfi(/6/4!/8)','learning',0,NULL,1700000000000,1700000000000);
+             INSERT INTO chats (id, book_id, title, model, pinned, metadata, created_at, updated_at)
+                 VALUES ('ch1','b1','First','m',0,NULL,1700000000000,1700000000000);
+             INSERT INTO chat_messages (id, chat_id, role, content, context, metadata, created_at, updated_at)
+                 VALUES ('m1','ch1','user','hello',NULL,NULL,1700000000000,1700000000000);
+             INSERT INTO notes (id, book_id, anchor_kind, normalized_word, scope, location, selected_text, content, content_format, created_at, updated_at)
+                 VALUES ('n1','b1','word','w','book',NULL,NULL,'note','plain_text',1700000000000,1700000000000);
+             INSERT INTO lookup_records (id, book_id, lookup_text, normalized_text, context_sentence, chapter, cfi, definition, context_explanation, result_json, provider_profile_id, model, created_at, last_looked_up_at, updated_at, lookup_count)
+                 VALUES ('l1','b1','L','l','s','One','epubcfi(/6/2)','d','e','{}','p','m',1700000000000,1700000000000,1700000000000,2);
+             INSERT INTO word_mark_rules (id, book_id, normalized_word, display_word, match_mode, color, enabled, created_at, updated_at)
+                 VALUES ('wm1','b1','w','W','exact','lookup',1,1700000000000,1700000000000);
+             INSERT INTO word_mark_exceptions (id, rule_id, book_id, normalized_word, location, excluded, created_at, updated_at)
+                 VALUES ('wme1','wm1','b1','w','epubcfi(/6/2)',1,1700000000000,1700000000000);
+             INSERT INTO lookup_occurrence_marks (id, book_id, normalized_word, display_word, location, enabled, created_at, updated_at)
+                 VALUES ('lom1','b1','w','W','epubcfi(/6/2)',1,1700000000000,1700000000000);
+             INSERT INTO book_index_state (book_id, source_sha256, index_version, chunk_count, status, error, indexed_at)
+                 VALUES ('b1','hash-1',1,1,'ready',NULL,1700000000000);
+             INSERT INTO book_chunks (id, book_id, chunk_index, section_index, section_href, section_title, char_start, char_end, text, snippet, token_estimate, created_at)
+                 VALUES ('bc1','b1',0,0,'s0.xhtml','S0',0,99,'text','snip',8,1700000000000);
+             INSERT INTO book_chunks_fts (seg_text, chunk_id, book_id) VALUES ('text','bc1','b1');
+             INSERT INTO book_chunk_embeddings (chunk_id, book_id, embedding, dimensions, model, source_sha256, created_at)
+                 VALUES ('bc1','b1',X'00','3','m','hash-1',1700000000000);
+             INSERT INTO book_summaries (id, book_id, scope, section_index, section_title, content, language, model, source_sha256, created_at, updated_at)
+                 VALUES ('bs1','b1','book',NULL,NULL,'sum','en','m','hash-1',1700000000000,1700000000000);
+             INSERT INTO book_settings (book_id, key, value)
+                 VALUES ('b1','font','serif');",
+        )
+        .unwrap();
+
+        {
+            let tx = conn.transaction().unwrap();
+            cascade_delete(&tx, entity::BOOK, "b1", 1700000001000).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let books: i64 = conn
+            .query_row("SELECT COUNT(*) FROM books WHERE id = 'b1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(books, 0, "the book row itself must be deleted");
+
+        let tables: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let mut checked = 0;
+        for table in tables {
+            if table == "books" {
+                continue;
+            }
+            let has_book_id: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = 'book_id'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if has_book_id == 0 {
+                continue;
+            }
+            let orphans: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM \"{table}\" WHERE book_id = 'b1'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                orphans, 0,
+                "table `{table}` still has rows for the deleted book — cascade_delete_book is missing a DELETE for it"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 12,
+            "expected to verify many child tables, only checked {checked} — did the seed drift from the schema?"
+        );
+    }
+
     fn import_book(id: &str) -> EventBody {
         EventBody::BookImport(BookImportPayload {
             id: id.into(),
