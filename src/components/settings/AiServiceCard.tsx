@@ -26,6 +26,7 @@ import Button from "../ui/Button";
 import Input from "../ui/Input";
 import Select from "../ui/Select";
 import Slider from "../ui/Slider";
+import Toggle from "../ui/Toggle";
 
 export interface AiProfile {
   id: string;
@@ -200,40 +201,6 @@ function connectionErrorLabel(
 ): string {
   const key = kind ? CONNECTION_ERROR_KEYS[kind] : undefined;
   return key ? t(`settings.ai.testError.${key}`) : (kind ?? t("settings.ai.unknownError"));
-}
-
-function Switch({
-  checked,
-  disabled,
-  label,
-  onChange,
-}: {
-  checked: boolean;
-  disabled?: boolean;
-  label: string;
-  onChange: (checked: boolean) => void;
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={label}
-      title={label}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      className={`relative h-6 w-11 shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
-        checked ? "bg-accent" : "bg-border"
-      }`}
-    >
-      <span
-        aria-hidden="true"
-        className={`absolute left-0.5 top-0.5 size-5 rounded-full bg-white shadow transition-transform ${
-          checked ? "translate-x-5" : "translate-x-0"
-        }`}
-      />
-    </button>
-  );
 }
 
 export default function AiServiceCard({
@@ -431,7 +398,7 @@ export default function AiServiceCard({
         </span>
 
         <div onClick={(event) => event.stopPropagation()} className="shrink-0">
-          <Switch
+          <Toggle
             checked={profile.enabled}
             disabled={profileBusy}
             label={t("settings.ai.toggleService", { name: profile.label })}
@@ -634,7 +601,7 @@ export default function AiServiceCard({
                   {credentials.map((credential, credentialIndex) => (
                     <div key={credential.id} className="py-2">
                       <div className="flex items-center gap-2">
-                        <Switch
+                        <Toggle
                           checked={credential.enabled}
                           disabled={credentialBusyId != null}
                           label={t("settings.ai.toggleKey", { name: credential.label })}

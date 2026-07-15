@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import Select from "../ui/Select";
-import type { SettingsProps } from "./types";
+import { ROW_CONTROL_WIDTH, type SettingsProps } from "./types";
 
 export default function AppearanceSettings({ settings, loading, save, showSavedToast }: SettingsProps) {
   const { t } = useTranslation();
@@ -31,7 +31,7 @@ export default function AppearanceSettings({ settings, loading, save, showSavedT
           <p className="text-[12px] text-text-muted mt-0.5">{t("settings.general.themeHint")}</p>
         </div>
         <Select
-          className="w-[130px] shrink-0"
+          className={ROW_CONTROL_WIDTH}
           value={theme}
           onChange={(value) => {
             setTheme(value);

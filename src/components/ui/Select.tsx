@@ -21,6 +21,31 @@ const MENU_GAP = 4;
 const OPTION_HEIGHT = 40;
 const GROUP_HEIGHT = 24;
 const VIEWPORT_MARGIN = 8;
+const PORTALED_THEME_VARS = [
+  "--color-bg-page",
+  "--color-bg-surface",
+  "--color-bg-muted",
+  "--color-bg-input",
+  "--color-text-primary",
+  "--color-text-body",
+  "--color-text-secondary",
+  "--color-text-muted",
+  "--color-text-placeholder",
+  "--color-border",
+  "--color-border-light",
+  "--color-accent",
+  "--color-accent-text",
+  "--color-accent-bg",
+] as const;
+
+function inheritedThemeVars(element: Element): CSSProperties {
+  const computed = getComputedStyle(element);
+  return PORTALED_THEME_VARS.reduce<CSSProperties>((style, name) => {
+    const value = computed.getPropertyValue(name).trim();
+    if (value) Object.assign(style, { [name]: value });
+    return style;
+  }, {});
+}
 
 export default function Select({ label, value, onChange, options, className = "", placeholder = "" }: SelectProps) {
   const [open, setOpen] = useState(false);
@@ -68,6 +93,7 @@ export default function Select({ label, value, onChange, options, className = ""
     const spaceAbove = rect.top - MENU_GAP - VIEWPORT_MARGIN;
     const openUp = menuHeight > spaceBelow && spaceAbove > spaceBelow;
     setMenuStyle({
+      ...inheritedThemeVars(buttonRef.current),
       left: rect.left,
       width: rect.width,
       maxHeight: Math.min(menuHeight, openUp ? spaceAbove : spaceBelow),

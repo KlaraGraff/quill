@@ -9,7 +9,7 @@ import AiServiceCard, {
   type AiProfile,
 } from "./AiServiceCard";
 import type { SettingsProps } from "./types";
-import { invokeWithVaultAccess, prepareVaultForWrite } from "../../utils/vaultAccess";
+import { invokeWithCredentialMigration } from "../../utils/vaultAccess";
 
 interface AiSettingsProps extends SettingsProps {
   onSaveRef?: (save: (() => void) | null) => void;
@@ -22,10 +22,9 @@ interface OAuthStatus {
 }
 
 interface VaultStatus {
-  state: "locked" | "ready" | "denied" | "unavailable";
   encryptedSecretCount: number;
-  pendingLocalMigrationCount: number;
-  pendingLocalMigrationOldestAt: number | null;
+  legacyKeychainCandidateCount: number;
+  pendingMigrationCount: number;
 }
 
 const PROFILE_CONFIG_KEYS = [
@@ -96,7 +95,7 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
   const [oauthStatus, setOauthStatus] = useState<OAuthStatus>({ connected: false, account_id: null });
   const [oauthLoading, setOauthLoading] = useState(false);
   const [vaultStatus, setVaultStatus] = useState<VaultStatus | null>(null);
-  const [securingPendingCredentials, setSecuringPendingCredentials] = useState(false);
+  const [migratingCredentials, setMigratingCredentials] = useState(false);
   const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const profilesRef = useRef<AiProfile[]>([]);
   const savedProfilesRef = useRef<AiProfile[]>([]);
@@ -142,7 +141,7 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
   }, []);
 
   const refreshOAuthStatus = useCallback(async () => {
-    const next = await invokeWithVaultAccess<OAuthStatus>("openai_oauth_status");
+    const next = await invoke<OAuthStatus>("openai_oauth_status");
     setOauthStatus(next);
   }, []);
 
@@ -495,7 +494,7 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
         await saveProfiles(false);
       }
       const testedProfile = profilesRef.current.find((item) => item.id === profile.id) ?? latestProfile;
-      const result = await invokeWithVaultAccess<AiConnectionTestResult>("ai_test_profile", {
+      const result = await invoke<AiConnectionTestResult>("ai_test_profile", {
         id: testedProfile.id,
         provider: testedProfile.provider,
         authMode: testedProfile.auth_mode,
@@ -544,7 +543,7 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
     setModelsLoadingId(profile.id);
     setError(null);
     try {
-      const models = await invokeWithVaultAccess<string[]>("ai_list_models", {
+      const models = await invoke<string[]>("ai_list_models", {
         profileId: profile.id,
         provider: profile.provider,
         authMode: profile.auth_mode,
@@ -562,8 +561,7 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
   const addCredential = async (profileId: string, label: string, value: string) => {
     setError(null);
     try {
-      await prepareVaultForWrite();
-      await invokeWithVaultAccess("ai_add_credential", { profileId, label, value });
+      await invoke("ai_add_credential", { profileId, label, value });
       await refreshCredentials(profileId);
       markHealthStale(profileId);
       showSavedToast(t("settings.ai.keyAdded"));
@@ -576,8 +574,7 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
   const replaceCredential = async (profileId: string, id: string, value: string) => {
     setError(null);
     try {
-      await prepareVaultForWrite();
-      await invokeWithVaultAccess("ai_replace_credential", { id, value });
+      await invoke("ai_replace_credential", { id, value });
       await refreshCredentials(profileId);
       markHealthStale(profileId);
       showSavedToast(t("settings.ai.keyReplaced"));
@@ -602,7 +599,7 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
   const deleteCredential = async (profileId: string, id: string) => {
     setError(null);
     try {
-      await invokeWithVaultAccess("ai_delete_credential", { id });
+      await invoke("ai_delete_credential", { id });
       await refreshCredentials(profileId);
       markHealthStale(profileId);
     } catch (nextError) {
@@ -628,7 +625,6 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
     setError(null);
     try {
       const oauthProfile = { ...profile, auth_mode: "oauth" as const, base_url: null };
-      await prepareVaultForWrite();
       const status = await invoke<OAuthStatus>("openai_oauth_login");
       setOauthStatus(status);
       replaceProfiles(updateOne(profilesRef.current, oauthProfile.id, oauthProfile));
@@ -642,18 +638,36 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
     }
   };
 
-  const securePendingCredentials = async () => {
-    setSecuringPendingCredentials(true);
+  const migrateCredentials = async () => {
+    setMigratingCredentials(true);
     setError(null);
     try {
-      await prepareVaultForWrite();
-      const encrypted = await invokeWithVaultAccess<number>("vault_encrypt_pending_local_migrations");
+      await invokeWithCredentialMigration<number>("vault_migrate_to_local");
       await refreshVaultStatus();
-      showSavedToast(t("settings.ai.pendingCredentialsSecured", { count: encrypted }));
+      showSavedToast(t("settings.ai.pendingCredentialsSecured"));
     } catch (nextError) {
-      setError(errorText(nextError));
+      const code = errorText(nextError);
+      if (code === "VAULT_USER_CANCELLED") return;
+      const partial = code.match(/VAULT_PARTIAL_MIGRATION:imported=(\d+):pending=(\d+):/);
+      if (partial) {
+        await refreshVaultStatus().catch(() => {});
+        setError(t("settings.ai.credentialMigrationPartial", {
+          imported: Number(partial[1]),
+          pending: Number(partial[2]),
+        }));
+      } else if (code.includes("VAULT_MASTER_KEY_MISSING")) {
+        setError(t("settings.ai.credentialMigrationMasterMissing"));
+      } else if (code.includes("VAULT_ACCESS_DENIED")) {
+        setError(t("settings.ai.credentialMigrationDenied"));
+      } else if (code.includes("VAULT_DATA_CORRUPT") || code.includes("VAULT_MASTER_KEY_INVALID")) {
+        setError(t("settings.ai.credentialMigrationCorrupt"));
+      } else if (code.includes("VAULT_ACCESS_UNAVAILABLE")) {
+        setError(t("settings.ai.credentialMigrationUnavailable"));
+      } else {
+        setError(code);
+      }
     } finally {
-      setSecuringPendingCredentials(false);
+      setMigratingCredentials(false);
     }
   };
 
@@ -661,7 +675,7 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
     setOauthLoading(true);
     setError(null);
     try {
-      await invokeWithVaultAccess("openai_oauth_logout");
+      await invoke("openai_oauth_logout");
       setOauthStatus({ connected: false, account_id: null });
       const affectedIds = profilesRef.current
         .filter((profile) => profile.provider === "openai" && profile.auth_mode === "oauth")
@@ -705,20 +719,20 @@ export default function AiSettings({ showSavedToast, onSaveRef, onDirtyChange }:
         </Button>
       </div>
 
-      {(vaultStatus?.pendingLocalMigrationCount ?? 0) > 0 && (
+      {(vaultStatus?.pendingMigrationCount ?? 0) > 0 && (
         <div role="status" className="mb-3 flex items-center justify-between gap-3 rounded-md border border-amber-300/70 bg-amber-50 px-3 py-2 text-[11px] leading-5 text-amber-950 dark:border-amber-500/35 dark:bg-amber-950/25 dark:text-amber-100">
           <div className="min-w-0">
-            <p className="font-medium">{t("settings.ai.pendingCredentialsTitle", { count: vaultStatus?.pendingLocalMigrationCount ?? 0 })}</p>
+            <p className="font-medium">{t("settings.ai.pendingCredentialsTitle", { count: vaultStatus?.pendingMigrationCount ?? 0 })}</p>
             <p className="text-amber-900/80 dark:text-amber-100/75">{t("settings.ai.pendingCredentialsHint")}</p>
           </div>
           <Button
             variant="secondary"
             size="sm"
-            onClick={() => void securePendingCredentials()}
-            disabled={securingPendingCredentials || busyId != null || saving}
+            onClick={() => void migrateCredentials()}
+            disabled={migratingCredentials || busyId != null || saving}
             className="shrink-0"
           >
-            {securingPendingCredentials ? <Loader2 size={14} className="animate-spin" /> : null}
+            {migratingCredentials ? <Loader2 size={14} className="animate-spin" /> : null}
             {t("settings.ai.pendingCredentialsAction")}
           </Button>
         </div>

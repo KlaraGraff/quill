@@ -12,7 +12,6 @@ import type {
   LearningModuleContent,
 } from "./types";
 import LearningCardView from "./LearningCardView";
-import { invokeWithVaultAccess } from "../../utils/vaultAccess";
 import { LearningCardStreamParser } from "./streaming";
 
 interface LearningCardResponse extends LearningCardResult {
@@ -211,7 +210,7 @@ export default function LearningCardController({
           return;
         }
 
-        const response = await invokeWithVaultAccess<LearningCardResponse>("ai_learning_card", {
+        const response = await invoke<LearningCardResponse>("ai_learning_card", {
           text: interaction.text,
           context: interaction.context,
           kind: interaction.kind,
@@ -219,7 +218,7 @@ export default function LearningCardController({
           chapter: chapter || null,
           cardConfig: JSON.stringify(config),
           requestId,
-        }, () => active);
+        });
         if (!active) return;
         setResult(response);
         setLoading(false);

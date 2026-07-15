@@ -32,7 +32,7 @@ pub fn get_all_settings(
     };
 
     // This status is deliberately metadata-only. Opening the app, settings,
-    // or a reader window must never cause a system Keychain prompt.
+    // or a reader window never reads the historical Keychain vault.
     let configured = router::has_configured_service(&db);
     settings.insert("ai_api_key_configured".to_string(), configured.to_string());
 
@@ -47,11 +47,6 @@ pub fn ai_api_key_configured(db: State<'_, Db>) -> bool {
 #[tauri::command]
 pub fn vault_status(secrets: State<'_, Secrets>) -> AppResult<crate::secrets::VaultStatus> {
     secrets.status()
-}
-
-#[tauri::command]
-pub fn vault_prepare_write(secrets: State<'_, Secrets>) -> AppResult<()> {
-    secrets.prepare_write()
 }
 
 #[tauri::command]
@@ -73,8 +68,8 @@ pub fn vault_deny(
 }
 
 #[tauri::command]
-pub fn vault_encrypt_pending_local_migrations(secrets: State<'_, Secrets>) -> AppResult<i64> {
-    secrets.encrypt_pending_local_migrations()
+pub fn vault_migrate_to_local(secrets: State<'_, Secrets>) -> AppResult<i64> {
+    secrets.migrate_to_local()
 }
 
 #[tauri::command]

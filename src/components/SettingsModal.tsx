@@ -15,6 +15,16 @@ import { useSettings } from "../hooks/useSettings";
 
 export type SettingsSection = "general" | "appearance" | "reading" | "ai" | "tools" | "librarySync" | "mcp" | "about";
 
+const XL_PREVIEW_QUERY = "(min-width: 1280px)";
+const FOCUSABLE_SELECTOR = [
+  "button:not([disabled])",
+  "[href]",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "[tabindex]:not([tabindex='-1'])",
+].join(",");
+
 interface SettingsModalProps {
   open: boolean;
   onClose: () => void;
@@ -28,6 +38,14 @@ export default function SettingsModal({ open, onClose, initialSection = "general
   const { settings, loading, refresh, save, saveBulk } = useSettings();
   const modalRef = useRef<HTMLDivElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const previewRef = useRef<HTMLElement>(null);
+  const previewCloseRef = useRef<HTMLButtonElement>(null);
+  const previewPreviousFocusRef = useRef<HTMLElement | null>(null);
+  const toolsPreviewRef = useRef<ToolsPreviewState | null>(null);
+  const overlayPreviewRef = useRef(false);
+  const onCloseRef = useRef(onClose);
+  const [isXlViewport, setIsXlViewport] = useState(() => window.matchMedia(XL_PREVIEW_QUERY).matches);
+  const overlayPreviewOpen = toolsPreview !== null && !isXlViewport;
 
   // Toast state
   const [showToast, setShowToast] = useState(false);
@@ -49,32 +67,47 @@ export default function SettingsModal({ open, onClose, initialSection = "general
   }, [activeSection, open]);
 
   useEffect(() => {
+    const query = window.matchMedia(XL_PREVIEW_QUERY);
+    const handleChange = (event: MediaQueryListEvent) => setIsXlViewport(event.matches);
+    setIsXlViewport(query.matches);
+    query.addEventListener("change", handleChange);
+    return () => query.removeEventListener("change", handleChange);
+  }, []);
+
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
+  useEffect(() => {
+    toolsPreviewRef.current = toolsPreview;
+    overlayPreviewRef.current = overlayPreviewOpen;
+  }, [overlayPreviewOpen, toolsPreview]);
+
+  useEffect(() => {
     if (!open) return;
     previousFocusRef.current = document.activeElement as HTMLElement | null;
     const modal = modalRef.current;
-    const focusableSelector = [
-      "button:not([disabled])",
-      "[href]",
-      "input:not([disabled])",
-      "select:not([disabled])",
-      "textarea:not([disabled])",
-      "[tabindex]:not([tabindex='-1'])",
-    ].join(",");
     window.requestAnimationFrame(() => {
-      modal?.querySelector<HTMLElement>(focusableSelector)?.focus();
+      modal?.querySelector<HTMLElement>(FOCUSABLE_SELECTOR)?.focus();
     });
     const handler = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
-        onClose();
+        const preview = toolsPreviewRef.current;
+        if (preview) {
+          preview.onDismiss();
+        } else {
+          onCloseRef.current();
+        }
         return;
       }
       if (e.key !== "Tab" || !modal) return;
-      const focusable = Array.from(modal.querySelectorAll<HTMLElement>(focusableSelector))
+      const focusScope = overlayPreviewRef.current ? previewRef.current : modal;
+      const focusable = Array.from(focusScope?.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR) ?? [])
         .filter((element) => !element.hasAttribute("disabled") && element.getClientRects().length > 0);
       if (focusable.length === 0) {
         e.preventDefault();
-        modal.focus();
+        focusScope?.focus();
         return;
       }
       const first = focusable[0];
@@ -93,7 +126,19 @@ export default function SettingsModal({ open, onClose, initialSection = "general
       previousFocusRef.current?.focus();
       previousFocusRef.current = null;
     };
-  }, [open, onClose]);
+  }, [open]);
+
+  useEffect(() => {
+    if (!overlayPreviewOpen) return;
+    previewPreviousFocusRef.current = document.activeElement as HTMLElement | null;
+    const animationFrame = window.requestAnimationFrame(() => previewCloseRef.current?.focus());
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+      const previousFocus = previewPreviousFocusRef.current;
+      previewPreviousFocusRef.current = null;
+      if (previousFocus?.isConnected) previousFocus.focus();
+    };
+  }, [overlayPreviewOpen]);
 
   // AI save state (must be before early return)
   const [aiDirty, setAiDirty] = useState(false);
@@ -157,6 +202,8 @@ export default function SettingsModal({ open, onClose, initialSection = "general
         }}
       >
         <div
+          inert={overlayPreviewOpen ? true : undefined}
+          aria-hidden={overlayPreviewOpen ? true : undefined}
           className="flex shrink-0 flex-col overflow-hidden sm:flex-row"
           style={{ width: "min(780px, calc(100vw - 32px))" }}
         >
@@ -257,12 +304,17 @@ export default function SettingsModal({ open, onClose, initialSection = "general
 
         {toolsPreview && (
           <aside
+            ref={previewRef}
+            role={overlayPreviewOpen ? "dialog" : undefined}
+            aria-modal={overlayPreviewOpen ? true : undefined}
             aria-label={t("settings.tools.preview")}
-            className="absolute inset-y-0 left-0 right-0 z-20 overflow-y-auto border-l border-border bg-bg-surface p-4 shadow-[-12px_0_30px_rgba(0,0,0,0.12)] md:left-auto md:w-[min(680px,calc(100vw_-_260px))] xl:static xl:z-auto xl:min-w-[420px] xl:flex-1 xl:shadow-none"
+            tabIndex={overlayPreviewOpen ? -1 : undefined}
+            className="absolute inset-y-0 left-0 right-0 z-20 flex min-h-0 flex-col overflow-hidden border-l border-border bg-bg-surface p-4 shadow-[-12px_0_30px_rgba(0,0,0,0.12)] md:left-auto md:w-[min(680px,calc(100vw_-_260px))] xl:static xl:z-auto xl:min-w-[420px] xl:flex-1 xl:shadow-none"
             style={{ scrollbarGutter: "stable" }}
           >
-            <div className="mb-2 flex justify-end">
+            <div className="mb-2 flex shrink-0 justify-end">
               <button
+                ref={previewCloseRef}
                 type="button"
                 onClick={toolsPreview.onDismiss}
                 aria-label={t("common.close")}
@@ -272,15 +324,17 @@ export default function SettingsModal({ open, onClose, initialSection = "general
                 <X size={15} />
               </button>
             </div>
-            <CardPreview
-              kind={toolsPreview.kind}
-              config={toolsPreview.config}
-              explanationLanguage={toolsPreview.explanationLanguage}
-              targetLanguage={toolsPreview.targetLanguage}
-              learnerLevel={toolsPreview.learnerLevel}
-              explanationMode={toolsPreview.explanationMode}
-              showMenu={toolsPreview.showMenu}
-            />
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              <CardPreview
+                kind={toolsPreview.kind}
+                config={toolsPreview.config}
+                explanationLanguage={toolsPreview.explanationLanguage}
+                targetLanguage={toolsPreview.targetLanguage}
+                learnerLevel={toolsPreview.learnerLevel}
+                explanationMode={toolsPreview.explanationMode}
+                showMenu={toolsPreview.showMenu}
+              />
+            </div>
           </aside>
         )}
       </div>

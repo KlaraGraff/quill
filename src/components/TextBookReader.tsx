@@ -9,12 +9,15 @@ import {
   type MarkerStyleConfigV1,
 } from "./marker-style";
 import type { PageColumns, ReaderSettingsState } from "./ReaderSettings";
+import { prefersReducedMotion } from "./page-turn-transition";
 import type { Highlight } from "../hooks/useBookmarks";
 import {
   classifySelection,
   contextForRange,
+  expandRangeToWordBoundaries,
   isInteractiveReaderTarget,
   normalizeInteractionText,
+  replaceDocumentSelection,
   selectedRange,
   viewportRectForRange,
   wordRangeAtPoint,
@@ -43,7 +46,6 @@ interface TextBookReaderProps {
   onRegisterNavigation: (navigate: (location: string, flash?: boolean) => void) => void;
   onRegisterPageNavigation?: (navigation: TextBookPageNavigation) => void;
   onHighlightClick: (highlight: Highlight, rect: DOMRect, fallbackText?: string) => void;
-  singleWordClickAction?: "menu" | "none";
   doubleClickQuickLookup?: boolean;
   markerStyle: MarkerStyleConfigV1;
 }
@@ -528,7 +530,6 @@ function TextBookReader({
   onRegisterNavigation,
   onRegisterPageNavigation,
   onHighlightClick,
-  singleWordClickAction = "menu",
   doubleClickQuickLookup = true,
   markerStyle,
 }: TextBookReaderProps) {
@@ -555,6 +556,9 @@ function TextBookReader({
   const flashTimerRef = useRef<number | null>(null);
   const wordClickTimerRef = useRef<number | null>(null);
   const selectionMenuTimerRef = useRef<number | null>(null);
+  const activePointerIdRef = useRef<number | null>(null);
+  const pointerCaptureTargetRef = useRef<HTMLElement | null>(null);
+  const selectionNormalizationUntilRef = useRef(0);
   const forceClickSuppressedUntilRef = useRef(0);
   const [flashOffset, setFlashOffset] = useState<number | null>(null);
   const isPaginated = settings.readingMode === "paginated";
@@ -570,6 +574,7 @@ function TextBookReader({
     () => new Map(documentBlocks.map((block) => [block.source_start, block])),
     [documentBlocks],
   );
+  const firstDocumentBlockStart = documentBlocks[0]?.source_start;
   const readerFontFamily = getFontFamily(settings.font);
   const automaticWordSet = useMemo(
     () => new Set(settings.showLookupMarkers
@@ -813,7 +818,11 @@ function TextBookReader({
     const targetIndex = Math.min(maximumIndex, Math.max(0, spreadIndex));
     container.scrollTo({
       left: targetIndex * viewportWidth,
-      behavior: behavior ?? (pageTurnAnimation === "slide" ? "smooth" : "auto"),
+      behavior: behavior ?? (
+        pageTurnAnimation === "slide" && !prefersReducedMotion()
+          ? "smooth"
+          : "auto"
+      ),
     });
   }, [isPaginated, pageTurnAnimation]);
 
@@ -827,7 +836,7 @@ function TextBookReader({
     }
     container.scrollBy({
       top: direction * Math.max(1, container.clientHeight - 64),
-      behavior: pageTurnAnimation === "slide" ? "smooth" : "auto",
+      behavior: pageTurnAnimation === "slide" && !prefersReducedMotion() ? "smooth" : "auto",
     });
   }, [isPaginated, pageTurnAnimation, scrollToSpread]);
 
@@ -856,6 +865,7 @@ function TextBookReader({
       ? sourceOffsetToRenderedOffset(targetBlock, resolved.start)
       : 0;
     initialLocationRef.current = textLocation(resolved.start);
+    const effectiveBehavior = behavior === "smooth" && prefersReducedMotion() ? "auto" : behavior;
     if (isPaginated) {
       const targetRect = rectAtRenderedOffset(target, renderedOffset) ?? target.getBoundingClientRect();
       const containerRect = containerRef.current.getBoundingClientRect();
@@ -863,9 +873,9 @@ function TextBookReader({
       const pageSlotWidth = viewportWidth / effectivePageColumns;
       const targetLeft = containerRef.current.scrollLeft + targetRect.left - containerRect.left;
       const physicalPage = Math.max(0, Math.floor(targetLeft / Math.max(1, pageSlotWidth)));
-      scrollToSpread(Math.floor(physicalPage / effectivePageColumns), behavior);
+      scrollToSpread(Math.floor(physicalPage / effectivePageColumns), effectiveBehavior);
     } else {
-      scrollRenderedOffsetIntoView(containerRef.current, target, renderedOffset, behavior);
+      scrollRenderedOffsetIntoView(containerRef.current, target, renderedOffset, effectiveBehavior);
     }
     if (flash) {
       setFlashOffset(resolved.start);
@@ -1072,7 +1082,8 @@ function TextBookReader({
     trigger: ReaderInteraction["trigger"],
   ): ReaderInteraction | null => {
       const text = range.toString().trim();
-      if (!text) return null;
+      const normalizedText = normalizeInteractionText(text);
+      if (!text || !normalizedText) return null;
       const startBlock = blockFromNode(range.startContainer);
       const endBlock = blockFromNode(range.endContainer);
       if (!startBlock || !endBlock) return null;
@@ -1103,7 +1114,7 @@ function TextBookReader({
           ? "word"
           : classifySelection(text, locale),
         text,
-        normalizedText: normalizeInteractionText(text),
+        normalizedText,
         context: contextForRange(range, startBlock.textContent || text),
         location: textLocation(start, end),
         anchorRect: viewportRectForRange(range),
@@ -1130,20 +1141,20 @@ function TextBookReader({
   const handleTextClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     cancelWordClick();
     if (Date.now() < forceClickSuppressedUntilRef.current) return;
-    if (singleWordClickAction === "none") return;
     if (event.button !== 0 || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
     if (isInteractiveReaderTarget(event.target) || (event.target as Element | null)?.closest?.("mark")) return;
     const selection = window.getSelection();
     if (selection && !selection.isCollapsed) return;
     const range = wordRangeAtPoint(window.document, event.clientX, event.clientY);
     if (!range || !containerRef.current?.contains(range.startContainer)) return;
+    replaceDocumentSelection(window.document, range);
     const interaction = interactionFromRange(range, "word-menu");
     if (!interaction?.normalizedText) return;
     wordClickTimerRef.current = window.setTimeout(() => {
       wordClickTimerRef.current = null;
       onInteraction(interaction);
     }, 240);
-  }, [cancelWordClick, interactionFromRange, onInteraction, singleWordClickAction]);
+  }, [cancelWordClick, interactionFromRange, onInteraction]);
 
   const handleTextDoubleClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     cancelWordClick();
@@ -1158,15 +1169,15 @@ function TextBookReader({
     onInteraction(interaction);
   }, [cancelSelectionMenu, cancelWordClick, doubleClickQuickLookup, interactionFromRange, onInteraction]);
 
-  const scheduleSelectionMenu = useCallback(() => {
+  const scheduleSelectionMenu = useCallback((delay = 150, includeWord = false) => {
     cancelSelectionMenu();
     selectionMenuTimerRef.current = window.setTimeout(() => {
       selectionMenuTimerRef.current = null;
       const range = selectedRange(window.document);
       if (!range || !containerRef.current?.contains(range.commonAncestorContainer)) return;
       const interaction = interactionFromRange(range, "selection-menu");
-      if (interaction && interaction.kind !== "word") onInteraction(interaction);
-    }, 150);
+      if (interaction && (includeWord || interaction.kind !== "word")) onInteraction(interaction);
+    }, delay);
   }, [cancelSelectionMenu, interactionFromRange, onInteraction]);
 
   const handleTextContextMenu = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
@@ -1181,9 +1192,15 @@ function TextBookReader({
   }, [cancelSelectionMenu, cancelWordClick, interactionFromRange, onInteraction]);
 
   useEffect(() => {
-    window.document.addEventListener("selectionchange", scheduleSelectionMenu);
+    const handleSelectionChange = () => {
+      if (
+        activePointerIdRef.current === null
+        && Date.now() >= selectionNormalizationUntilRef.current
+      ) scheduleSelectionMenu();
+    };
+    window.document.addEventListener("selectionchange", handleSelectionChange);
     return () => {
-      window.document.removeEventListener("selectionchange", scheduleSelectionMenu);
+      window.document.removeEventListener("selectionchange", handleSelectionChange);
       cancelSelectionMenu();
     };
   }, [cancelSelectionMenu, scheduleSelectionMenu]);
@@ -1196,13 +1213,80 @@ function TextBookReader({
       cancelWordClick();
       cancelSelectionMenu();
     };
-    container.addEventListener("webkitmouseforcewillbegin", preserveSystemForceClick);
     container.addEventListener("webkitmouseforcedown", preserveSystemForceClick);
     return () => {
-      container.removeEventListener("webkitmouseforcewillbegin", preserveSystemForceClick);
       container.removeEventListener("webkitmouseforcedown", preserveSystemForceClick);
     };
   }, [cancelSelectionMenu, cancelWordClick]);
+
+  const finalizePointerSelection = useCallback((pointerId?: number, openMenu = true) => {
+    const activePointerId = activePointerIdRef.current;
+    if (activePointerId === null || (pointerId !== undefined && pointerId !== activePointerId)) return;
+    activePointerIdRef.current = null;
+    const captureTarget = pointerCaptureTargetRef.current;
+    pointerCaptureTargetRef.current = null;
+    try {
+      if (captureTarget?.hasPointerCapture(activePointerId)) {
+        captureTarget.releasePointerCapture(activePointerId);
+      }
+    } catch {
+      // Pointer capture is best-effort and may already be released by WebKit.
+    }
+    if (!openMenu || Date.now() < forceClickSuppressedUntilRef.current) {
+      cancelSelectionMenu();
+      return;
+    }
+    const range = selectedRange(window.document);
+    const expanded = range && containerRef.current?.contains(range.commonAncestorContainer)
+      ? expandRangeToWordBoundaries(range, window.document.documentElement.lang || undefined)
+      : null;
+    if (expanded) {
+      selectionNormalizationUntilRef.current = Date.now() + 80;
+      replaceDocumentSelection(window.document, expanded);
+    }
+    if (expanded) scheduleSelectionMenu(30, true);
+    else cancelSelectionMenu();
+  }, [cancelSelectionMenu, scheduleSelectionMenu]);
+
+  const handleSelectionPointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    activePointerIdRef.current = event.pointerId;
+    pointerCaptureTargetRef.current = event.currentTarget;
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Some WebKit reader surfaces reject capture; window listeners are the fallback.
+    }
+    cancelSelectionMenu();
+  }, [cancelSelectionMenu]);
+
+  const handleSelectionPointerUp = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    finalizePointerSelection(event.pointerId);
+  }, [finalizePointerSelection]);
+
+  const handleSelectionPointerCancel = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    finalizePointerSelection(event.pointerId, false);
+  }, [finalizePointerSelection]);
+
+  const handleLostPointerCapture = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    finalizePointerSelection(event.pointerId);
+  }, [finalizePointerSelection]);
+
+  useEffect(() => {
+    const handlePointerUp = (event: PointerEvent) => finalizePointerSelection(event.pointerId);
+    const handlePointerCancel = (event: PointerEvent) => finalizePointerSelection(event.pointerId, false);
+    const handleWindowBlur = () => finalizePointerSelection(undefined, false);
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerCancel);
+    window.addEventListener("blur", handleWindowBlur);
+    return () => {
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerCancel);
+      window.removeEventListener("blur", handleWindowBlur);
+      activePointerIdRef.current = null;
+      pointerCaptureTargetRef.current = null;
+    };
+  }, [finalizePointerSelection]);
 
   const typography = useMemo(() => ({
     backgroundColor: getThemeStyles(settings.theme).body,
@@ -1239,12 +1323,18 @@ function TextBookReader({
           "data-text-source-end": block.source_end,
         };
         if (block.kind === "heading") {
+          const startsChapterPage = isPaginated
+            && block.starts_page === true
+            && block.source_start !== firstDocumentBlockStart;
+          const headingStyle = startsChapterPage
+            ? { breakBefore: "column", pageBreakBefore: "always" } as React.CSSProperties
+            : undefined;
           return block.depth === 0 ? (
-            <h2 {...attributes} className={`mb-8 mt-14 text-[1.35em] font-semibold leading-snug ${className}`}>
+            <h2 {...attributes} style={headingStyle} className={`mb-8 mt-14 text-[1.35em] font-semibold leading-snug ${className}`}>
               {content}
             </h2>
           ) : (
-            <h3 {...attributes} className={`mb-6 mt-10 text-[1.15em] font-semibold leading-snug ${className}`}>
+            <h3 {...attributes} style={headingStyle} className={`mb-6 mt-10 text-[1.15em] font-semibold leading-snug ${className}`}>
               {content}
             </h3>
           );
@@ -1260,8 +1350,10 @@ function TextBookReader({
     automaticExceptionSet,
     automaticWordSet,
     document,
+    firstDocumentBlockStart,
     flashOffset,
     highlights,
+    isPaginated,
     markerStyle,
     onHighlightClick,
     readerFontFamily,
@@ -1271,13 +1363,18 @@ function TextBookReader({
   return (
     <div
       ref={containerRef}
-      className={`h-full overscroll-contain ${isPaginated
+      data-reader-theme={settings.theme}
+      className={`text-book-reader h-full overscroll-contain ${isPaginated
         ? "overflow-x-auto overflow-y-hidden [&::-webkit-scrollbar]:hidden"
         : "overflow-y-auto overflow-x-hidden"}`}
       style={typography}
       onClick={handleTextClick}
       onDoubleClick={handleTextDoubleClick}
       onContextMenu={handleTextContextMenu}
+      onPointerDown={handleSelectionPointerDown}
+      onPointerUp={handleSelectionPointerUp}
+      onPointerCancel={handleSelectionPointerCancel}
+      onLostPointerCapture={handleLostPointerCapture}
     >
       {document && (
         <article

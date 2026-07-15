@@ -2,7 +2,7 @@ interface ToggleProps {
   checked: boolean;
   onChange: (checked: boolean) => void;
   disabled?: boolean;
-  label?: string;
+  label: string;
 }
 
 export default function Toggle({ checked, onChange, disabled, label }: ToggleProps) {

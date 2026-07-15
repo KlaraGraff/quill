@@ -32,7 +32,7 @@ export default function VaultAccessDialog() {
   if (!request) return null;
 
   const confirm = () => {
-    // Close this explanatory layer before macOS presents its own secure prompt.
+    // Close the explanation before macOS presents its own secure prompt.
     completeVaultAccess(request.id, true);
   };
 

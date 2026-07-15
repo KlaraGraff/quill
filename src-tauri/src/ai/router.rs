@@ -1,7 +1,7 @@
 //! Provider-neutral AI request routing and API credential failover.
 //!
-//! Secrets never leave this module: the database stores only an encrypted-vault
-//! reference, masked suffix, priority, and health metadata for each key.
+//! Secret values never leave the Rust backend. Profile metadata stores only a
+//! local secret reference, masked suffix, priority, and health state.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
@@ -259,6 +259,16 @@ fn suffix(value: &str) -> String {
         .chars()
         .rev()
         .collect()
+}
+
+fn compensation_failure(
+    operation: &str,
+    primary: &dyn std::fmt::Display,
+    compensation: &dyn std::fmt::Display,
+) -> AppError {
+    AppError::Other(format!(
+        "{operation}: primary=[{primary}]; compensation=[{compensation}]"
+    ))
 }
 
 pub fn migrate_legacy_config(db: &Db, secrets: &Secrets) -> AppResult<()> {
@@ -1440,12 +1450,21 @@ pub fn delete_profile(db: &Db, secrets: &Secrets, id: &str) -> AppResult<()> {
     let mut removed = Vec::with_capacity(snapshots.len());
     for (secret_ref, snapshot) in &snapshots {
         if let Err(error) = secrets.delete(secret_ref) {
+            let mut rollback_errors = Vec::new();
             for (_, removed_snapshot) in &removed {
                 if let Err(restore_error) = secrets.restore_state(removed_snapshot) {
                     log::error!(
-                        "ai router: failed to restore encrypted credential after delete rollback: {restore_error}"
+                        "ai router: failed to restore local credential after delete rollback: {restore_error}"
                     );
+                    rollback_errors.push(restore_error.to_string());
                 }
+            }
+            if !rollback_errors.is_empty() {
+                return Err(compensation_failure(
+                    "AI_PROFILE_SECRET_DELETE_ROLLBACK_FAILED",
+                    &error,
+                    &rollback_errors.join(" | "),
+                ));
             }
             return Err(error);
         }
@@ -1470,12 +1489,21 @@ pub fn delete_profile(db: &Db, secrets: &Secrets, id: &str) -> AppResult<()> {
         Ok(())
     })();
     if let Err(error) = delete_result {
+        let mut rollback_errors = Vec::new();
         for (_, snapshot) in &removed {
             if let Err(restore_error) = secrets.restore_state(snapshot) {
                 log::error!(
-                    "ai router: failed to restore encrypted credential after metadata rollback: {restore_error}"
+                    "ai router: failed to restore local credential after metadata rollback: {restore_error}"
                 );
+                rollback_errors.push(restore_error.to_string());
             }
+        }
+        if !rollback_errors.is_empty() {
+            return Err(compensation_failure(
+                "AI_PROFILE_METADATA_DELETE_ROLLBACK_FAILED",
+                &error,
+                &rollback_errors.join(" | "),
+            ));
         }
         return Err(error);
     }
@@ -1519,7 +1547,13 @@ pub fn add_credential(
     let priority = match insert_result {
         Ok(priority) => priority,
         Err(error) => {
-            let _ = secrets.delete(&secret_ref);
+            if let Err(cleanup_error) = secrets.delete(&secret_ref) {
+                return Err(compensation_failure(
+                    "AI_CREDENTIAL_ADD_ROLLBACK_FAILED",
+                    &error,
+                    &cleanup_error,
+                ));
+            }
             return Err(error);
         }
     };
@@ -1554,7 +1588,13 @@ pub fn replace_credential(db: &Db, secrets: &Secrets, id: &str, value: &str) -> 
     secrets.set(&secret_ref, value)?;
     let conn = db.conn.lock().map_err(|e| AppError::Other(e.to_string()))?;
     if let Err(error) = conn.execute("UPDATE ai_credentials SET masked_suffix = ?1, state = 'active', cooldown_until = NULL, last_error_kind = NULL, updated_at = ?2 WHERE id = ?3", params![suffix(value), now(), id]) {
-        let _ = secrets.restore_state(&previous);
+        if let Err(restore_error) = secrets.restore_state(&previous) {
+            return Err(compensation_failure(
+                "AI_CREDENTIAL_REPLACE_ROLLBACK_FAILED",
+                &error,
+                &restore_error,
+            ));
+        }
         return Err(error.into());
     }
     Ok(())
@@ -1623,13 +1663,26 @@ pub fn delete_credential(db: &Db, secrets: &Secrets, id: &str) -> AppResult<()> 
     let changed = match delete_result {
         Ok(changed) => changed,
         Err(error) => {
-            secrets.restore_state(&snapshot)?;
+            if let Err(restore_error) = secrets.restore_state(&snapshot) {
+                return Err(compensation_failure(
+                    "AI_CREDENTIAL_DELETE_ROLLBACK_FAILED",
+                    &error,
+                    &restore_error,
+                ));
+            }
             return Err(error.into());
         }
     };
     if changed != 1 {
-        secrets.restore_state(&snapshot)?;
-        return Err(AppError::Other("AI_CREDENTIAL_NOT_FOUND".to_string()));
+        let not_found = AppError::Other("AI_CREDENTIAL_NOT_FOUND".to_string());
+        if let Err(restore_error) = secrets.restore_state(&snapshot) {
+            return Err(compensation_failure(
+                "AI_CREDENTIAL_DELETE_ROLLBACK_FAILED",
+                &not_found,
+                &restore_error,
+            ));
+        }
+        return Err(not_found);
     }
     Ok(())
 }
@@ -1975,10 +2028,8 @@ pub fn has_configured_service(db: &Db) -> bool {
     })
 }
 
-/// Validate access to the first usable credential a routed stream would use before
-/// the command detaches into a background task. This lets Tauri return the
-/// vault confirmation requirement to the webview, where the user can approve
-/// it and retry, instead of degrading it into an asynchronous stream error.
+/// Validate that a routed stream has a locally readable credential before the
+/// command detaches into a background task.
 pub fn ensure_stream_credentials_accessible(db: &Db, secrets: &Secrets) -> AppResult<()> {
     let timestamp = now();
     for profile in profiles(db, true)?.into_iter().filter(|profile| {
@@ -1991,9 +2042,8 @@ pub fn ensure_stream_credentials_accessible(db: &Db, secrets: &Secrets) -> AppRe
             return Ok(());
         }
         if profile.view.auth_mode == "oauth" && profile.view.provider == "openai" {
-            // Probe only the first required token here. Once the vault is
-            // unlocked, the detached OAuth path can read the complete token
-            // set without introducing another system credential request.
+            // Probe only the first required token here. The detached OAuth path
+            // reads the remaining values from the same local database.
             if secrets
                 .get("oauth_access_token")?
                 .is_some_and(|value| !value.trim().is_empty())
@@ -2185,7 +2235,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_credential_removes_metadata_and_ciphertext() {
+    fn deleting_credential_removes_metadata_and_local_secret() {
         let directory = tempfile::TempDir::new().unwrap();
         let db = Db::init(directory.path()).unwrap();
         let secrets = Secrets::init_in_memory().unwrap();
@@ -2214,11 +2264,11 @@ mod tests {
         delete_credential(&db, &secrets, &credential.id).unwrap();
 
         assert!(credential_by_id(&db, &credential.id).is_err());
-        assert!(!secrets.has_encrypted_secret(&secret_ref).unwrap());
+        assert_eq!(secrets.get(&secret_ref).unwrap(), None);
     }
 
     #[test]
-    fn deleting_profile_removes_all_credential_ciphertext() {
+    fn deleting_profile_removes_all_local_credentials() {
         let directory = tempfile::TempDir::new().unwrap();
         let db = Db::init(directory.path()).unwrap();
         let secrets = Secrets::init_in_memory().unwrap();
@@ -2256,18 +2306,106 @@ mod tests {
 
         assert!(profile_by_id(&db, &profile.id).is_err());
         for secret_ref in refs {
-            assert!(!secrets.has_encrypted_secret(&secret_ref).unwrap());
+            assert_eq!(secrets.get(&secret_ref).unwrap(), None);
         }
     }
 
     #[test]
-    fn stream_preflight_surfaces_a_locked_vault_synchronously() {
+    fn add_credential_reports_primary_and_cleanup_failures() {
         let directory = tempfile::TempDir::new().unwrap();
         let db = Db::init(directory.path()).unwrap();
         let secrets = Secrets::init_in_memory().unwrap();
         let profile = create_profile(
             &db,
-            "Locked vault".to_string(),
+            "Rollback add".to_string(),
+            "custom".to_string(),
+            "api_key".to_string(),
+            Some("https://api.example/v1".to_string()),
+            "model".to_string(),
+            0.2,
+            None,
+            true,
+        )
+        .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_credential_insert
+                 BEFORE INSERT ON ai_credentials
+                 BEGIN SELECT RAISE(ABORT, 'forced metadata insert failure'); END;",
+            )
+            .unwrap();
+        secrets.fail_next_delete_for_test();
+
+        let error = add_credential(
+            &db,
+            &secrets,
+            profile.id,
+            "Primary".to_string(),
+            "secret".to_string(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.starts_with("AI_CREDENTIAL_ADD_ROLLBACK_FAILED:"));
+        assert!(error.contains("forced metadata insert failure"));
+        assert!(error.contains("TEST_SECRET_DELETE_FAILED"));
+    }
+
+    #[test]
+    fn replace_credential_reports_primary_and_restore_failures() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let db = Db::init(directory.path()).unwrap();
+        let secrets = Secrets::init_in_memory().unwrap();
+        let profile = create_profile(
+            &db,
+            "Rollback replace".to_string(),
+            "custom".to_string(),
+            "api_key".to_string(),
+            Some("https://api.example/v1".to_string()),
+            "model".to_string(),
+            0.2,
+            None,
+            true,
+        )
+        .unwrap();
+        let credential = add_credential(
+            &db,
+            &secrets,
+            profile.id,
+            "Primary".to_string(),
+            "old-secret".to_string(),
+        )
+        .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_credential_update
+                 BEFORE UPDATE OF masked_suffix ON ai_credentials
+                 BEGIN SELECT RAISE(ABORT, 'forced metadata update failure'); END;",
+            )
+            .unwrap();
+        secrets.fail_next_restore_for_test();
+
+        let error = replace_credential(&db, &secrets, &credential.id, "new-secret")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.starts_with("AI_CREDENTIAL_REPLACE_ROLLBACK_FAILED:"));
+        assert!(error.contains("forced metadata update failure"));
+        assert!(error.contains("TEST_SECRET_RESTORE_FAILED"));
+    }
+
+    #[test]
+    fn stream_preflight_reads_local_credentials_without_vault_state() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let db = Db::init(directory.path()).unwrap();
+        let secrets = Secrets::init_in_memory().unwrap();
+        let profile = create_profile(
+            &db,
+            "Local credential".to_string(),
             "custom".to_string(),
             "api_key".to_string(),
             Some("https://api.example/v1".to_string()),
@@ -2287,11 +2425,7 @@ mod tests {
         .unwrap();
         secrets.lock_for_test().unwrap();
 
-        let error = ensure_stream_credentials_accessible(&db, &secrets)
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.starts_with("VAULT_CONFIRM_REQUIRED:unlock:"));
+        assert!(ensure_stream_credentials_accessible(&db, &secrets).is_ok());
     }
 
     #[test]

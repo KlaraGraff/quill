@@ -13,6 +13,7 @@ export interface TextBookBlock {
   source_end: number;
   source_spans: TextBookSourceSpan[];
   depth?: number;
+  starts_page?: boolean;
 }
 
 export interface TextBookChunk {

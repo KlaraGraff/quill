@@ -7,7 +7,7 @@ import { AlertTriangle, ChevronDown, ChevronRight, Plus, Trash2 } from "lucide-r
 import i18n from "../../i18n";
 import Select from "../ui/Select";
 import Toggle from "../ui/Toggle";
-import type { SettingsProps } from "./types";
+import { ROW_CONTROL_WIDTH, type SettingsProps } from "./types";
 import { LANGUAGE_OPTIONS } from "./languageOptions";
 
 interface CefrEstimate {
@@ -354,7 +354,7 @@ export default function GeneralSettings({ settings, loading, save, saveBulk, sho
           </p>
         </div>
         <Select
-          className="w-[130px] shrink-0"
+          className={ROW_CONTROL_WIDTH}
           value={cefrLevel}
           onChange={(level) => {
             setCefrLevel(level);
@@ -381,7 +381,7 @@ export default function GeneralSettings({ settings, loading, save, saveBulk, sho
           </p>
         </div>
         <Select
-          className="w-[185px] shrink-0"
+          className={ROW_CONTROL_WIDTH}
           value={explanationMode}
           onChange={(mode) => {
             setExplanationMode(mode);
@@ -409,7 +409,7 @@ export default function GeneralSettings({ settings, loading, save, saveBulk, sho
           </p>
         </div>
         <Select
-          className="w-[150px] shrink-0"
+          className={ROW_CONTROL_WIDTH}
           value={translationLanguage}
           onChange={(value) => {
             setTranslationLanguage(value);
@@ -725,7 +725,7 @@ export default function GeneralSettings({ settings, loading, save, saveBulk, sho
           <p className="text-[12px] text-text-muted mt-0.5">{t("settings.general.languageHint")}</p>
         </div>
         <Select
-          className="w-[130px] shrink-0"
+          className={ROW_CONTROL_WIDTH}
           value={language}
           onChange={(lang) => {
             setLanguage(lang);
@@ -745,6 +745,7 @@ export default function GeneralSettings({ settings, loading, save, saveBulk, sho
           <p className="text-[12px] text-text-muted mt-0.5">{t("settings.reading.autoSaveHint")}</p>
         </div>
         <Toggle
+          label={t("settings.reading.autoSave")}
           checked={autoSave}
           onChange={(v) => {
             setAutoSave(v);
@@ -760,7 +761,7 @@ export default function GeneralSettings({ settings, loading, save, saveBulk, sho
           <p className="text-[12px] text-text-muted mt-0.5">{t("settings.general.lookupHistoryRetentionHint")}</p>
         </div>
         <Select
-          className="w-[130px] shrink-0"
+          className={ROW_CONTROL_WIDTH}
           value={lookupHistoryRetention}
           onChange={async (days) => {
             setLookupHistoryRetention(days);

@@ -90,6 +90,7 @@ export default function McpSettings(_props: SettingsProps) {
           </p>
         </div>
         <Toggle
+          label={t("settings.mcp.claudeCode")}
           checked={status?.claude_code ?? false}
           onChange={(next) => onToggle("claude_code", next)}
           disabled={status == null || busy === "claude_code"}
@@ -107,6 +108,7 @@ export default function McpSettings(_props: SettingsProps) {
           </p>
         </div>
         <Toggle
+          label={t("settings.mcp.codex")}
           checked={status?.codex ?? false}
           onChange={(next) => onToggle("codex", next)}
           disabled={status == null || busy === "codex"}
@@ -133,6 +135,7 @@ export default function McpSettings(_props: SettingsProps) {
           </div>
         </div>
         <Toggle
+          label={t("settings.mcp.writeAccess")}
           checked={status?.write_enabled ?? false}
           onChange={onWriteToggle}
           disabled={status == null || writeBusy}

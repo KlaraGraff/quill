@@ -23,7 +23,7 @@ const sliderClass =
 
 export type ReadingMode = "scrolling" | "paginated";
 export type PageColumns = 1 | 2;
-export type PageTurnAnimation = "none" | "slide";
+export type PageTurnAnimation = "none" | "slide" | "fade" | "cover";
 
 export interface ReaderSettingsState {
   theme: ReaderTheme;
@@ -340,6 +340,9 @@ export default function ReaderSettings({
             <span className="text-[12px] font-medium">{t("readerSettings.twoPages")}</span>
           </button>
         </div>
+        <p className="mt-2 text-[11px] leading-4 text-text-muted">
+          {t("readerSettings.twoPagesHint")}
+        </p>
       </div>)}
 
       {settings.readingMode === "paginated" && (
@@ -350,6 +353,8 @@ export default function ReaderSettings({
             onChange={(value) => update({ pageTurnAnimation: value as PageTurnAnimation })}
             options={[
               { value: "slide", label: t("readerSettings.animationSlide") },
+              { value: "fade", label: t("readerSettings.animationFade") },
+              { value: "cover", label: t("readerSettings.animationCover") },
               { value: "none", label: t("readerSettings.animationNone") },
             ]}
           />
@@ -505,6 +510,7 @@ export default function ReaderSettings({
             <div key={key} className="flex items-center justify-between gap-4">
               <span className="text-[13px] text-text-primary">{t(label)}</span>
               <Toggle
+                label={t(label)}
                 checked={settings[key as keyof Pick<ReaderSettingsState, "showLookupMarkers" | "showNewVocabMarkers" | "showLearningMarkers" | "showMasteredMarkers">]}
                 onChange={(checked) => update({ [key]: checked } as Partial<ReaderSettingsState>)}
               />

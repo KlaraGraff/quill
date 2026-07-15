@@ -7,7 +7,6 @@ import { useTranslation } from "react-i18next";
 import Markdown from "react-markdown";
 import { LOOKUP_PROSE } from "./lookup-prose";
 import { aiErrorMessageKey, getAiErrorCode, isAiSettingsError, type AiErrorCode } from "../utils/aiError";
-import { invokeWithVaultAccess } from "../utils/vaultAccess";
 
 interface ExplainPopoverProps {
   x: number;
@@ -75,7 +74,7 @@ function useExplainStream(
       );
 
       try {
-        await invokeWithVaultAccess("ai_explain", {
+        await invoke("ai_explain", {
           passage,
           surrounding: surrounding || null,
           bookTitle: bookTitle || null,

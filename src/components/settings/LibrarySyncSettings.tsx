@@ -339,6 +339,7 @@ export default function LibrarySyncSettings(_props: SettingsProps) {
                 </p>
               </div>
               <Toggle
+                label={t("settings.librarySync.toggle")}
                 checked={syncOn}
                 onChange={onToggleClick}
                 disabled={!available && !syncOn}

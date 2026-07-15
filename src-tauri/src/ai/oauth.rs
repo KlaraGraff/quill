@@ -293,9 +293,8 @@ pub fn save_tokens(secrets: &Secrets, tokens: &OAuthTokens) -> AppResult<()> {
     ])
 }
 
-/// Metadata-only status used while rendering settings. Reading token values
-/// here would ask the operating system for vault access merely because the
-/// user opened Settings.
+/// Metadata-only status used while rendering settings. The webview never needs
+/// the locally stored token values themselves.
 pub fn has_token_metadata(secrets: &Secrets) -> bool {
     secrets.has_stored_secret_metadata("oauth_access_token")
         || secrets.has_stored_secret_metadata("oauth_refresh_token")

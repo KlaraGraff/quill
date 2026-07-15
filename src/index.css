@@ -122,6 +122,156 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+.text-book-reader::selection,
+.text-book-reader *::selection {
+  background: rgba(124, 58, 237, 0.24);
+  color: inherit;
+}
+.text-book-reader[data-reader-theme="paper"]::selection,
+.text-book-reader[data-reader-theme="paper"] *::selection {
+  background: rgba(163, 106, 49, 0.28);
+}
+.text-book-reader[data-reader-theme="quiet"]::selection,
+.text-book-reader[data-reader-theme="quiet"] *::selection {
+  background: rgba(216, 180, 254, 0.34);
+}
+.text-book-reader[data-reader-theme="dark"]::selection,
+.text-book-reader[data-reader-theme="dark"] *::selection {
+  background: rgba(167, 139, 250, 0.38);
+}
+
+.reader-page-viewport {
+  view-transition-name: reader-page;
+}
+
+.reader-page-fade-out {
+  opacity: 0;
+  transition: opacity 120ms ease-in;
+}
+
+.reader-page-fade-in {
+  animation: reader-page-fade-in 150ms ease-out;
+}
+
+.reader-page-cover-next {
+  animation: reader-page-cover-next 240ms ease-out;
+}
+
+.reader-page-cover-previous {
+  animation: reader-page-cover-previous 240ms ease-out;
+}
+
+.reader-page-slide-out-next {
+  animation: reader-page-slide-out-next 110ms ease-in both;
+}
+
+.reader-page-slide-out-previous {
+  animation: reader-page-slide-out-previous 110ms ease-in both;
+}
+
+.reader-page-slide-in-next {
+  animation: reader-page-slide-in-next 170ms ease-out both;
+}
+
+.reader-page-slide-in-previous {
+  animation: reader-page-slide-in-previous 170ms ease-out both;
+}
+
+html[data-reader-page-animation="slide"][data-reader-page-direction="next"]::view-transition-old(reader-page) {
+  animation: reader-page-slide-out-next 220ms ease-in-out both;
+}
+
+html[data-reader-page-animation="slide"][data-reader-page-direction="next"]::view-transition-new(reader-page) {
+  animation: reader-page-slide-in-next 220ms ease-in-out both;
+}
+
+html[data-reader-page-animation="slide"][data-reader-page-direction="previous"]::view-transition-old(reader-page) {
+  animation: reader-page-slide-out-previous 220ms ease-in-out both;
+}
+
+html[data-reader-page-animation="slide"][data-reader-page-direction="previous"]::view-transition-new(reader-page) {
+  animation: reader-page-slide-in-previous 220ms ease-in-out both;
+}
+
+html[data-reader-page-animation="fade"]::view-transition-old(reader-page) {
+  animation: reader-page-fade-out 120ms ease-in both;
+}
+
+html[data-reader-page-animation="fade"]::view-transition-new(reader-page) {
+  animation: reader-page-fade-in 150ms ease-out both;
+}
+
+html[data-reader-page-animation="cover"]::view-transition-old(reader-page) {
+  animation: none;
+}
+
+html[data-reader-page-animation="cover"][data-reader-page-direction="next"]::view-transition-new(reader-page) {
+  animation: reader-page-cover-next 240ms ease-out both;
+}
+
+html[data-reader-page-animation="cover"][data-reader-page-direction="previous"]::view-transition-new(reader-page) {
+  animation: reader-page-cover-previous 240ms ease-out both;
+}
+
+@keyframes reader-page-fade-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+@keyframes reader-page-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes reader-page-cover-next {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+@keyframes reader-page-cover-previous {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(0); }
+}
+
+@keyframes reader-page-slide-out-next {
+  from { transform: translateX(0); }
+  to { transform: translateX(-100%); }
+}
+
+@keyframes reader-page-slide-out-previous {
+  from { transform: translateX(0); }
+  to { transform: translateX(100%); }
+}
+
+@keyframes reader-page-slide-in-next {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+@keyframes reader-page-slide-in-previous {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reader-page-viewport,
+  .reader-page-fade-out,
+  .reader-page-fade-in,
+  .reader-page-cover-next,
+  .reader-page-cover-previous,
+  .reader-page-slide-out-next,
+  .reader-page-slide-out-previous,
+  .reader-page-slide-in-next,
+  .reader-page-slide-in-previous {
+    animation: none !important;
+    transition: none !important;
+  }
+  ::view-transition-old(reader-page),
+  ::view-transition-new(reader-page) {
+    animation-duration: 0s !important;
+  }
+}
+
 /* Transparent scrollbar track, subtle thumb */
 ::-webkit-scrollbar {
   width: 8px;

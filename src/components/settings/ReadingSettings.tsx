@@ -13,7 +13,7 @@ import {
 } from "../reader-settings";
 import { loadCustomFonts, type CustomFontRecord } from "../custom-fonts";
 import { notifyReadingAssistanceSettingsChanged } from "../reading-assistance-events";
-import type { SettingsProps } from "./types";
+import { ROW_CONTROL_WIDTH, type SettingsProps } from "./types";
 
 const READER_THEME_OPTIONS: {
   value: ReaderTheme;
@@ -158,7 +158,7 @@ export default function ReadingSettings({ settings, loading, refresh, save, show
           <p className="text-[12px] text-text-muted mt-0.5">{t("settings.layout.fontFamilyHint")}</p>
         </div>
         <Select
-          className="w-[190px] shrink-0"
+          className={ROW_CONTROL_WIDTH}
           value={fontFamily}
           onChange={(v) => { setFontFamily(v); save("font_family", v); showSavedToast(); }}
           options={fontOptions}

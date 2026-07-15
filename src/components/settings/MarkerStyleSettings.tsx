@@ -13,6 +13,7 @@ import { fonts } from "../reader-settings";
 import { installCustomFontFaces, type CustomFontRecord } from "../custom-fonts";
 import Select from "../ui/Select";
 import Toggle from "../ui/Toggle";
+import { ROW_CONTROL_WIDTH } from "./types";
 
 interface MarkerStyleSettingsProps {
   value: MarkerStyleConfigV1;
@@ -168,7 +169,7 @@ function StyleEditor({
             <p className="text-[11px] font-medium text-text-primary">{t("settings.tools.markers.font")}</p>
             <p className="text-[10px] leading-4 text-text-muted">{t("settings.tools.markers.fontHint")}</p>
           </div>
-          <Select className="w-[180px] shrink-0" value={value.font} onChange={(font) => update("font", font)} options={fontOptions} />
+          <Select className={ROW_CONTROL_WIDTH} value={value.font} onChange={(font) => update("font", font)} options={fontOptions} />
         </div>
       </div>
     </section>
@@ -210,7 +211,7 @@ export default function MarkerStyleSettings({ value, onChange }: MarkerStyleSett
           <p className="text-[11px] leading-[17px] text-text-muted">{t("settings.tools.markers.wordScopeHint")}</p>
         </div>
         <Select
-          className="w-[190px] shrink-0"
+          className={ROW_CONTROL_WIDTH}
           value={value.markMatchingWords ? "book" : "current"}
           onChange={(scope) => onChange({ ...value, markMatchingWords: scope === "book" })}
           options={[
@@ -227,7 +228,11 @@ export default function MarkerStyleSettings({ value, onChange }: MarkerStyleSett
           <p className="text-[13px] font-medium text-text-primary">{t("settings.tools.markers.automaticFollowsManual")}</p>
           <p className="text-[11px] leading-[17px] text-text-muted">{t("settings.tools.markers.automaticFollowsManualHint")}</p>
         </div>
-        <Toggle checked={value.automaticFollowsManual} onChange={(automaticFollowsManual) => onChange({ ...value, automaticFollowsManual })} />
+        <Toggle
+          label={t("settings.tools.markers.automaticFollowsManual")}
+          checked={value.automaticFollowsManual}
+          onChange={(automaticFollowsManual) => onChange({ ...value, automaticFollowsManual })}
+        />
       </div>
 
       {!value.automaticFollowsManual && (

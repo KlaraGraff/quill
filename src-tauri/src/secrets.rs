@@ -3,23 +3,20 @@ use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
 };
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
-use keyring::credential::CredentialPersistence;
 use keyring::Entry;
-use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
 
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
 
-// This is the intentionally chosen Quill Personal vault namespace. It differs
-// from the bundle identifier to preserve the Keychain identity introduced by
-// the credential-vault release; changing it requires an explicit migration.
+// Historical v1.4 vault identity. It is read only during the explicit one-time
+// migration and is never touched by routine credential reads or writes.
 const VAULT_KEYCHAIN_SERVICE: &str = "com.ryoyamada.quill";
 const VAULT_MASTER_ACCOUNT: &str = "vault-master-key-v1";
 const LEGACY_KEYCHAIN_SERVICES: &[&str] = &[
@@ -39,48 +36,28 @@ const SENSITIVE_KEYS: &[&str] = &[
     "oauth_account_id",
 ];
 
-enum MasterKeyState {
-    Locked,
-    Ready(Zeroizing<Vec<u8>>),
-    Denied,
-    Unavailable,
-}
-
-struct VaultSession {
-    master_key: MasterKeyState,
-    pending_master_request: Option<String>,
-    legacy_candidates: HashSet<String>,
-    authorized_legacy_keys: HashSet<String>,
-    denied_legacy_keys: HashSet<String>,
-    missing_legacy_entries: HashSet<String>,
-    pending_imports: HashMap<String, String>,
-}
-
-impl Default for VaultSession {
-    fn default() -> Self {
-        Self {
-            master_key: MasterKeyState::Locked,
-            pending_master_request: None,
-            legacy_candidates: HashSet::new(),
-            authorized_legacy_keys: HashSet::new(),
-            denied_legacy_keys: HashSet::new(),
-            missing_legacy_entries: HashSet::new(),
-            pending_imports: HashMap::new(),
-        }
-    }
+#[derive(Default)]
+struct MigrationSession {
+    master_key: Option<Zeroizing<Vec<u8>>>,
+    master_key_error: Option<String>,
+    authorized: bool,
+    pending_request: Option<String>,
+    #[cfg(test)]
+    fail_next_delete: bool,
+    #[cfg(test)]
+    fail_next_restore: bool,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VaultStatus {
-    state: &'static str,
     encrypted_secret_count: i64,
-    pending_local_migration_count: i64,
-    pending_local_migration_oldest_at: Option<i64>,
+    legacy_keychain_candidate_count: i64,
+    pending_migration_count: i64,
 }
 
 #[derive(Clone)]
-pub struct EncryptedSecretSnapshot {
+struct EncryptedSecretSnapshot {
     key: String,
     nonce: Vec<u8>,
     ciphertext: Vec<u8>,
@@ -93,49 +70,49 @@ pub struct EncryptedSecretSnapshot {
 pub struct SecretStateSnapshot {
     key: String,
     encrypted: Option<EncryptedSecretSnapshot>,
-    legacy_value: Option<String>,
+    local_value: Option<String>,
+    local_created_at: Option<i64>,
     legacy_candidate_created_at: Option<i64>,
     tombstone_created_at: Option<i64>,
 }
 
-/// Sensitive values are encrypted in a local-only SQLite vault. The operating
-/// system credential store contains exactly one random master key, never one
-/// item per API key.
+/// Local credential storage for API keys and OAuth tokens.
+///
+/// Routine reads and writes use only the local `secrets` table. The old v1.4
+/// encrypted vault and its Keychain master key remain available exclusively to
+/// the user-triggered migration command.
 #[derive(Clone)]
 pub struct Secrets {
     pub conn: Arc<Mutex<Connection>>,
-    session: Arc<Mutex<VaultSession>>,
+    migration_session: Arc<Mutex<MigrationSession>>,
     operation_lock: Arc<Mutex<()>>,
     use_keychain: bool,
+    #[cfg(test)]
+    legacy_keychain_values: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Secrets {
     pub fn init(local_dir: &PathBuf) -> AppResult<Self> {
         fs::create_dir_all(local_dir)?;
         let db_path = local_dir.join("secrets.db");
+        Self::prepare_private_file(&db_path)?;
         let conn = Connection::open(&db_path)?;
         Self::initialize_schema(&conn)?;
-
-        if !matches!(
-            keyring::default::default_credential_builder().persistence(),
-            CredentialPersistence::UntilDelete
-        ) {
-            return Err(AppError::Other(
-                "SYSTEM_CREDENTIAL_STORE_NOT_PERSISTENT".to_string(),
-            ));
-        }
+        Self::harden_sqlite_files(&db_path)?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
-            session: Arc::new(Mutex::new(VaultSession::default())),
+            migration_session: Arc::new(Mutex::new(MigrationSession::default())),
             operation_lock: Arc::new(Mutex::new(())),
             use_keychain: true,
+            #[cfg(test)]
+            legacy_keychain_values: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     fn initialize_schema(conn: &Connection) -> AppResult<()> {
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
+            "PRAGMA journal_mode=DELETE;
              PRAGMA secure_delete=ON;
              CREATE TABLE IF NOT EXISTS secrets (
                  key TEXT PRIMARY KEY,
@@ -159,9 +136,13 @@ impl Secrets {
                  created_at INTEGER NOT NULL
              );",
         )?;
-        // Older vault databases used a two-column `secrets` table. The
-        // timestamp lets the UI surface a persistent migration reminder
-        // without ever reading a credential value.
+        let journal_mode =
+            conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))?;
+        if !matches!(journal_mode.as_str(), "delete" | "memory") {
+            return Err(AppError::Other(format!(
+                "CREDENTIAL_DB_JOURNAL_MODE_UNSAFE:{journal_mode}"
+            )));
+        }
         let has_created_at = conn
             .prepare("PRAGMA table_info(secrets)")?
             .query_map([], |row| row.get::<_, String>(1))?
@@ -176,48 +157,96 @@ impl Secrets {
         Ok(())
     }
 
-    /// This command is intentionally metadata-only and never accesses Keychain.
+    #[cfg(unix)]
+    fn prepare_private_file(path: &Path) -> AppResult<()> {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn prepare_private_file(path: &Path) -> AppResult<()> {
+        use std::fs::OpenOptions;
+
+        OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(())
+    }
+
+    fn harden_sqlite_files(db_path: &Path) -> AppResult<()> {
+        Self::prepare_private_file(db_path)?;
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut path = db_path.as_os_str().to_os_string();
+            path.push(suffix);
+            let path = PathBuf::from(path);
+            if path.exists() {
+                Self::harden_existing_file(&path)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn harden_existing_file(path: &Path) -> AppResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn harden_existing_file(_path: &Path) -> AppResult<()> {
+        Ok(())
+    }
+
+    /// Metadata only. This never opens or probes the operating-system store.
     pub fn status(&self) -> AppResult<VaultStatus> {
-        let (
-            encrypted_secret_count,
-            pending_local_migration_count,
-            pending_local_migration_oldest_at,
-        ) = {
-            let conn = self
-                .conn
-                .lock()
-                .map_err(|error| AppError::Other(error.to_string()))?;
-            let encrypted =
-                conn.query_row("SELECT COUNT(*) FROM encrypted_secrets", [], |row| {
-                    row.get(0)
-                })?;
-            let pending = conn.query_row("SELECT COUNT(*) FROM secrets", [], |row| row.get(0))?;
-            let oldest =
-                conn.query_row("SELECT MIN(created_at) FROM secrets", [], |row| row.get(0))?;
-            (encrypted, pending, oldest)
-        };
-        let session = self
-            .session
+        let conn = self
+            .conn
             .lock()
             .map_err(|error| AppError::Other(error.to_string()))?;
-        let state = match session.master_key {
-            MasterKeyState::Locked => "locked",
-            MasterKeyState::Ready(_) => "ready",
-            MasterKeyState::Denied => "denied",
-            MasterKeyState::Unavailable => "unavailable",
-        };
+        let encrypted_secret_count =
+            conn.query_row("SELECT COUNT(*) FROM encrypted_secrets", [], |row| {
+                row.get(0)
+            })?;
+        let legacy_keychain_candidate_count = conn.query_row(
+            "SELECT COUNT(*) FROM legacy_secret_candidates c
+             WHERE NOT EXISTS (SELECT 1 FROM secrets s WHERE s.key = c.key)
+               AND NOT EXISTS (
+                   SELECT 1 FROM secret_migration_tombstones t WHERE t.key = c.key
+               )",
+            [],
+            |row| row.get(0),
+        )?;
+        let pending_migration_count = conn.query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT key FROM encrypted_secrets
+                 UNION
+                 SELECT c.key FROM legacy_secret_candidates c
+                 WHERE NOT EXISTS (SELECT 1 FROM secrets s WHERE s.key = c.key)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM secret_migration_tombstones t WHERE t.key = c.key
+                   )
+             )",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(VaultStatus {
-            state,
             encrypted_secret_count,
-            pending_local_migration_count,
-            pending_local_migration_oldest_at,
+            legacy_keychain_candidate_count,
+            pending_migration_count,
         })
     }
 
-    /// Called only after the user accepts Quill's explanatory confirmation.
-    /// No other method may turn a locked vault into a Keychain access request.
+    /// Called only after the user accepts the migration explanation.
     pub fn authorize(&self, reason: &str, request_id: Option<&str>) -> AppResult<()> {
-        if !matches!(reason, "create" | "unlock" | "import") {
+        if reason != "migrate" {
             return Err(AppError::Other(
                 "VAULT_CONFIRMATION_REASON_INVALID".to_string(),
             ));
@@ -226,337 +255,317 @@ impl Secrets {
             .operation_lock
             .lock()
             .map_err(|error| AppError::Other(error.to_string()))?;
-
         {
             let mut session = self
-                .session
+                .migration_session
                 .lock()
                 .map_err(|error| AppError::Other(error.to_string()))?;
-            let master_ready = matches!(session.master_key, MasterKeyState::Ready(_));
-            if reason == "import" {
-                // Import approval and vault unlock are separate capabilities.
-                // Resolve and validate the requested legacy item even when the
-                // master key is already cached.
-                Self::authorize_pending_import(&mut session, request_id)?;
-                if master_ready {
-                    return Ok(());
-                }
-            } else {
-                Self::authorize_pending_master(&mut session, request_id)?;
-                if master_ready {
-                    return Ok(());
-                }
-            }
-            session.master_key = MasterKeyState::Locked;
+            Self::consume_pending_request(&mut session, request_id)?;
+            session.authorized = true;
+            session.master_key = None;
+            session.master_key_error = None;
         }
 
+        if self.encrypted_secret_count()? == 0 {
+            return Ok(());
+        }
         if !self.use_keychain {
             let mut session = self
-                .session
+                .migration_session
                 .lock()
                 .map_err(|error| AppError::Other(error.to_string()))?;
-            session.master_key = MasterKeyState::Ready(Zeroizing::new(vec![7_u8; 32]));
-            session.pending_master_request = None;
+            session.master_key = Some(Zeroizing::new(vec![7_u8; 32]));
             return Ok(());
         }
 
-        let entry = Entry::new(VAULT_KEYCHAIN_SERVICE, VAULT_MASTER_ACCOUNT)
-            .map_err(|error| self.record_keychain_error(error))?;
-        let master_key = match entry.get_password() {
-            Ok(encoded) => self.decode_master_key(&encoded)?,
-            Err(keyring::Error::NoEntry) => {
-                if self.encrypted_secret_count()? > 0 {
-                    self.set_master_state(MasterKeyState::Unavailable)?;
-                    return Err(AppError::Other("VAULT_MASTER_KEY_MISSING".to_string()));
-                }
-                let mut key = Zeroizing::new(vec![0_u8; 32]);
-                OsRng.fill_bytes(key.as_mut_slice());
-                let encoded = Zeroizing::new(STANDARD_NO_PAD.encode(key.as_slice()));
-                if let Err(error) = entry.set_password(encoded.as_str()) {
-                    return Err(self.record_keychain_error(error));
-                }
-                key
+        let master_key = (|| -> AppResult<Zeroizing<Vec<u8>>> {
+            let entry = Entry::new(VAULT_KEYCHAIN_SERVICE, VAULT_MASTER_ACCOUNT)
+                .map_err(Self::keychain_error)?;
+            let encoded = entry.get_password().map_err(Self::keychain_error)?;
+            Self::decode_master_key(&encoded)
+        })();
+        let master_key = match master_key {
+            Ok(master_key) => master_key,
+            Err(AppError::Other(code))
+                if matches!(
+                    code.as_str(),
+                    "VAULT_MASTER_KEY_MISSING" | "VAULT_MASTER_KEY_INVALID"
+                ) =>
+            {
+                // A missing or malformed v1.4 master key must not prevent the
+                // same explicit migration action from recovering independent
+                // per-item credentials saved by still older releases.
+                let mut session = self
+                    .migration_session
+                    .lock()
+                    .map_err(|error| AppError::Other(error.to_string()))?;
+                session.master_key_error = Some(code);
+                return Ok(());
             }
-            Err(error) => return Err(self.record_keychain_error(error)),
+            Err(error) => {
+                self.clear_migration_session()?;
+                return Err(error);
+            }
         };
-
         let mut session = self
-            .session
+            .migration_session
             .lock()
             .map_err(|error| AppError::Other(error.to_string()))?;
-        session.master_key = MasterKeyState::Ready(master_key);
-        session.pending_master_request = None;
+        session.master_key = Some(master_key);
+        session.master_key_error = None;
         Ok(())
     }
 
-    /// Starts a deliberate create/unlock attempt without touching Keychain.
-    /// This is used by explicit settings actions after a prior denial.
-    pub fn prepare_write(&self) -> AppResult<()> {
-        let reason = if self.encrypted_secret_count()? > 0 {
-            "unlock"
-        } else {
-            "create"
-        };
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        if matches!(session.master_key, MasterKeyState::Ready(_)) {
-            return Ok(());
-        }
-        session.master_key = MasterKeyState::Locked;
-        let request_id = Self::pending_master_request(&mut session);
-        Err(AppError::Other(format!(
-            "VAULT_CONFIRM_REQUIRED:{reason}:{request_id}"
-        )))
-    }
-
-    /// Records an in-app cancellation without touching the operating-system
-    /// credential store. The session remains denied until an explicit retry.
     pub fn deny(&self, reason: &str, request_id: Option<&str>) -> AppResult<()> {
-        let mut session = self
-            .session
+        if reason != "migrate" {
+            return Err(AppError::Other(
+                "VAULT_CONFIRMATION_REASON_INVALID".to_string(),
+            ));
+        }
+        let _operation = self
+            .operation_lock
             .lock()
             .map_err(|error| AppError::Other(error.to_string()))?;
-        match reason {
-            "create" | "unlock" => {
-                Self::deny_pending_master(&mut session, request_id)?;
-                session.master_key = MasterKeyState::Denied;
-            }
-            "import" => {
-                let request_id = request_id
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| AppError::Other("VAULT_IMPORT_REQUEST_INVALID".to_string()))?;
-                let key = session
-                    .pending_imports
-                    .remove(request_id)
-                    .ok_or_else(|| AppError::Other("VAULT_IMPORT_REQUEST_EXPIRED".to_string()))?;
-                session.authorized_legacy_keys.remove(&key);
-                session.denied_legacy_keys.insert(key);
-            }
-            _ => {
-                return Err(AppError::Other(
-                    "VAULT_CONFIRMATION_REASON_INVALID".to_string(),
-                ))
-            }
-        }
+        let mut session = self
+            .migration_session
+            .lock()
+            .map_err(|error| AppError::Other(error.to_string()))?;
+        Self::consume_pending_request(&mut session, request_id)?;
+        session.authorized = false;
+        session.master_key = None;
+        session.master_key_error = None;
         Ok(())
     }
 
     pub fn get(&self, key: &str) -> AppResult<Option<String>> {
-        if let Some((nonce, ciphertext)) = self.encrypted_value(key)? {
-            let master_key = self.master_key_or_confirmation("unlock")?;
-            return self
-                .decrypt_value(key, &nonce, &ciphertext, master_key.as_slice())
-                .map(Some);
-        }
-
-        if self.has_migration_tombstone(key)? {
-            return Ok(None);
-        }
-        if !self.is_legacy_candidate(key)? {
-            return Ok(None);
-        }
-
-        if self.legacy_import_is_denied(key)? {
-            return Err(AppError::Other("VAULT_ACCESS_DENIED".to_string()));
-        }
-
-        // Serialize the check/authorize/import sequence. Without this second
-        // boundary, concurrent AI requests could both pass the authorization
-        // check and show two macOS prompts after the first one was denied.
-        let _operation = self
-            .operation_lock
+        let conn = self
+            .conn
             .lock()
             .map_err(|error| AppError::Other(error.to_string()))?;
-        if let Some((nonce, ciphertext)) = self.encrypted_value(key)? {
-            let master_key = self.master_key_or_confirmation("unlock")?;
-            return self
-                .decrypt_value(key, &nonce, &ciphertext, master_key.as_slice())
-                .map(Some);
-        }
-        if self.has_migration_tombstone(key)? {
-            return Ok(None);
-        }
-        if self.legacy_import_is_denied(key)? {
-            return Err(AppError::Other("VAULT_ACCESS_DENIED".to_string()));
-        }
-        if !self.legacy_import_is_authorized(key)? {
-            let mut session = self
-                .session
-                .lock()
-                .map_err(|error| AppError::Other(error.to_string()))?;
-            let request_id = session
-                .pending_imports
-                .iter()
-                .find_map(|(request_id, pending_key)| {
-                    (pending_key == key).then(|| request_id.clone())
-                })
-                .unwrap_or_else(|| {
-                    let request_id = uuid::Uuid::new_v4().to_string();
-                    session
-                        .pending_imports
-                        .insert(request_id.clone(), key.to_string());
-                    request_id
-                });
-            return Err(AppError::Other(format!(
-                "VAULT_CONFIRM_REQUIRED:import:{request_id}"
-            )));
-        }
-
-        let master_key = match self.master_key_or_confirmation("import") {
-            Ok(master_key) => master_key,
-            Err(AppError::Other(message)) if message.starts_with("VAULT_CONFIRM_REQUIRED:") => {
-                return Err(AppError::Other(message));
-            }
-            Err(error) => return Err(error),
-        };
-
-        if let Some(value) = self.local_legacy_value(key)? {
-            self.store_encrypted(key, &value, master_key.as_slice())?;
-            self.finish_legacy_import(key)?;
-            return Ok(Some(value));
-        }
-        if !self.use_keychain {
-            return Ok(None);
-        }
-
-        for service in LEGACY_KEYCHAIN_SERVICES {
-            if self.legacy_entry_is_missing(service, key)? {
-                continue;
-            }
-            let entry = match Entry::new(service, key) {
-                Ok(entry) => entry,
-                Err(error) => {
-                    self.revoke_legacy_authorization(key)?;
-                    return Err(Self::keychain_error(error));
-                }
-            };
-            match entry.get_password() {
-                Ok(value) => {
-                    self.store_encrypted(key, &value, master_key.as_slice())?;
-                    // Do not delete the legacy item here. SecItemDelete may
-                    // present a second authorization prompt immediately after
-                    // a successful read. The encrypted record takes precedence,
-                    // and removing the migration candidate prevents future
-                    // legacy lookups by this app.
-                    self.finish_legacy_import(key)?;
-                    log::info!("secrets: imported a legacy credential into the encrypted vault");
-                    return Ok(Some(value));
-                }
-                Err(keyring::Error::NoEntry) => {
-                    self.mark_legacy_entry_missing(service, key)?;
-                }
-                Err(error) => {
-                    // The master key is already unlocked here. A denial applies
-                    // only to this legacy item, so require a fresh in-app import
-                    // confirmation next time without locking the whole vault.
-                    self.deny_legacy_import(key)?;
-                    return Err(Self::keychain_error(error));
-                }
-            }
-        }
-        self.record_migration_tombstone(key)?;
-        self.finish_legacy_import(key)?;
-        Ok(None)
+        Ok(conn
+            .query_row(
+                "SELECT value FROM secrets WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     pub fn set(&self, key: &str, value: &str) -> AppResult<()> {
-        let reason = if self.encrypted_secret_count()? > 0 {
-            "unlock"
-        } else {
-            "create"
-        };
         let _operation = self
             .operation_lock
             .lock()
             .map_err(|error| AppError::Other(error.to_string()))?;
-        let master_key = self.master_key_or_confirmation(reason)?;
-        self.store_encrypted(key, value, master_key.as_slice())
-    }
-
-    pub fn set_many(&self, values: &[(&str, Option<&str>)]) -> AppResult<()> {
-        let reason = if self.encrypted_secret_count()? > 0 {
-            "unlock"
-        } else {
-            "create"
-        };
-        let _operation = self
-            .operation_lock
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        let master_key = self.master_key_or_confirmation(reason)?;
-        let encrypted = values
-            .iter()
-            .map(|(key, value)| {
-                value
-                    .map(|value| self.encrypt_value(key, value, master_key.as_slice()))
-                    .transpose()
-                    .map(|payload| ((*key).to_string(), payload))
-            })
-            .collect::<AppResult<Vec<_>>>()?;
         let conn = self
             .conn
             .lock()
             .map_err(|error| AppError::Other(error.to_string()))?;
         let tx = conn.unchecked_transaction()?;
-        for (key, payload) in encrypted {
-            match payload {
-                Some((nonce, ciphertext)) => {
-                    Self::store_encrypted_in_transaction(&tx, &key, &nonce, &ciphertext)?;
-                }
-                None => Self::delete_in_transaction(&tx, &key)?,
+        Self::store_local_in_transaction(&tx, key, value)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_many(&self, values: &[(&str, Option<&str>)]) -> AppResult<()> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .map_err(|error| AppError::Other(error.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| AppError::Other(error.to_string()))?;
+        let tx = conn.unchecked_transaction()?;
+        for (key, value) in values {
+            match value {
+                Some(value) => Self::store_local_in_transaction(&tx, key, value)?,
+                None => Self::delete_in_transaction(&tx, key)?,
             }
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// Encrypt plaintext values that were deliberately staged during a legacy
-    /// upgrade. Callers must first obtain explicit vault authorization through
-    /// `prepare_write`; this method never reads Keychain by itself.
-    pub fn encrypt_pending_local_migrations(&self) -> AppResult<i64> {
+    /// Imports all readable old-vault values into local storage in one
+    /// transaction. A local value always wins over its older encrypted copy.
+    /// No call site other than the explicit AI-settings migration action may
+    /// invoke this method.
+    pub fn migrate_to_local(&self) -> AppResult<i64> {
         let _operation = self
             .operation_lock
             .lock()
             .map_err(|error| AppError::Other(error.to_string()))?;
-        let master_key = self.master_key_or_confirmation("unlock")?;
-        let pending = {
+        if self.status()?.pending_migration_count == 0 {
+            self.clear_migration_session()?;
+            return Ok(0);
+        }
+        let (master_key, mut migration_error) = {
+            let mut session = self
+                .migration_session
+                .lock()
+                .map_err(|error| AppError::Other(error.to_string()))?;
+            if !session.authorized {
+                let request_id = session
+                    .pending_request
+                    .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+                    .clone();
+                return Err(AppError::Other(format!(
+                    "VAULT_CONFIRM_REQUIRED:migrate:{request_id}"
+                )));
+            }
+            (
+                session
+                    .master_key
+                    .as_ref()
+                    .map(|key| Zeroizing::new(key.as_slice().to_vec())),
+                session.master_key_error.clone(),
+            )
+        };
+
+        let (encrypted, local_keys, candidates) = {
             let conn = self
                 .conn
                 .lock()
                 .map_err(|error| AppError::Other(error.to_string()))?;
-            let mut statement = conn.prepare("SELECT key, value FROM secrets")?;
-            let values = statement
+            let encrypted = conn
+                .prepare(
+                    "SELECT key, nonce, ciphertext, algorithm, key_version
+                     FROM encrypted_secrets ORDER BY key",
+                )?
                 .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
-            values
+            let local_keys = conn
+                .prepare("SELECT key FROM secrets")?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<HashSet<_>, _>>()?;
+            let candidates = conn
+                .prepare(
+                    "SELECT c.key FROM legacy_secret_candidates c
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM secret_migration_tombstones t WHERE t.key = c.key
+                     )
+                     ORDER BY c.key",
+                )?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            (encrypted, local_keys, candidates)
         };
 
-        let encrypted = pending
-            .iter()
-            .map(|(key, value)| {
-                self.encrypt_value(key, value, master_key.as_slice())
-                    .map(|payload| (key.as_str(), payload))
-            })
-            .collect::<AppResult<Vec<_>>>()?;
-        let count = encrypted.len() as i64;
-        if count == 0 {
-            return Ok(0);
+        let mut imported: HashMap<String, Zeroizing<String>> = HashMap::new();
+        let mut encrypted_keys_to_delete = Vec::new();
+        for (name, nonce, ciphertext, algorithm, key_version) in encrypted {
+            if local_keys.contains(&name) {
+                // The local value is already the active value. This preserves
+                // the established migration rule while removing its obsolete
+                // encrypted duplicate in the same transaction below.
+                encrypted_keys_to_delete.push(name);
+                continue;
+            }
+            let Some(key) = master_key.as_ref() else {
+                migration_error.get_or_insert_with(|| "VAULT_MASTER_KEY_MISSING".to_string());
+                continue;
+            };
+            if algorithm != VAULT_ALGORITHM || key_version != VAULT_KEY_VERSION {
+                migration_error.get_or_insert_with(|| "VAULT_DATA_CORRUPT".to_string());
+                continue;
+            }
+            match Self::decrypt_value(&name, &nonce, &ciphertext, key.as_slice()) {
+                Ok(value) => {
+                    encrypted_keys_to_delete.push(name.clone());
+                    imported.insert(name, Zeroizing::new(value));
+                }
+                Err(error) => {
+                    migration_error.get_or_insert_with(|| error.to_string());
+                }
+            }
         }
 
+        let mut missing_candidates = Vec::new();
+        for candidate in &candidates {
+            if local_keys.contains(candidate) || imported.contains_key(candidate) {
+                continue;
+            }
+            let mut found = None;
+            if self.use_keychain {
+                for service in LEGACY_KEYCHAIN_SERVICES {
+                    let entry = Entry::new(service, candidate).map_err(Self::keychain_error)?;
+                    match entry.get_password() {
+                        Ok(value) => {
+                            found = Some(Zeroizing::new(value));
+                            break;
+                        }
+                        Err(keyring::Error::NoEntry) => {}
+                        Err(error) => return Err(Self::keychain_error(error)),
+                    }
+                }
+            }
+            #[cfg(test)]
+            if !self.use_keychain {
+                found = self
+                    .legacy_keychain_values
+                    .lock()
+                    .map_err(|error| AppError::Other(error.to_string()))?
+                    .get(candidate)
+                    .cloned()
+                    .map(Zeroizing::new);
+            }
+            match found {
+                Some(value) => {
+                    imported.insert(candidate.clone(), value);
+                }
+                None => missing_candidates.push(candidate.clone()),
+            }
+        }
+
+        let imported_count = imported.len() as i64;
         let conn = self
             .conn
             .lock()
             .map_err(|error| AppError::Other(error.to_string()))?;
         let tx = conn.unchecked_transaction()?;
-        for (key, (nonce, ciphertext)) in encrypted {
-            Self::store_encrypted_in_transaction(&tx, key, &nonce, &ciphertext)?;
+        for (key, value) in &imported {
+            Self::store_local_in_transaction(&tx, key, value.as_str())?;
+        }
+        for key in encrypted_keys_to_delete {
+            tx.execute("DELETE FROM encrypted_secrets WHERE key = ?1", params![key])?;
+        }
+        for candidate in &candidates {
+            tx.execute(
+                "DELETE FROM legacy_secret_candidates WHERE key = ?1",
+                params![candidate],
+            )?;
+        }
+        for candidate in missing_candidates {
+            tx.execute(
+                "INSERT INTO secret_migration_tombstones (key, created_at)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET created_at = excluded.created_at",
+                params![candidate, chrono::Utc::now().timestamp_millis()],
+            )?;
         }
         tx.commit()?;
-        Ok(count)
+        drop(conn);
+        self.clear_migration_session()?;
+        let remaining = self.status()?.pending_migration_count;
+        log::info!(
+            "secrets: migrated {imported_count} credential(s) to local storage; {remaining} pending"
+        );
+        if remaining > 0 {
+            if let Some(error) = migration_error {
+                return Err(AppError::Other(format!(
+                    "VAULT_PARTIAL_MIGRATION:imported={imported_count}:pending={remaining}:{error}"
+                )));
+            }
+        }
+        Ok(imported_count)
     }
 
     pub fn snapshot_state(&self, key: &str) -> AppResult<SecretStateSnapshot> {
@@ -581,11 +590,11 @@ impl Secrets {
                 },
             )
             .optional()?;
-        let legacy_value = conn
+        let local = conn
             .query_row(
-                "SELECT value FROM secrets WHERE key = ?1",
+                "SELECT value, created_at FROM secrets WHERE key = ?1",
                 params![key],
-                |row| row.get(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()?;
         let legacy_candidate_created_at = conn
@@ -605,26 +614,28 @@ impl Secrets {
         Ok(SecretStateSnapshot {
             key: key.to_string(),
             encrypted,
-            legacy_value,
+            local_value: local.as_ref().map(|value| value.0.clone()),
+            local_created_at: local.map(|value| value.1),
             legacy_candidate_created_at,
             tombstone_created_at,
         })
     }
 
-    #[cfg(test)]
-    pub fn has_encrypted_secret(&self, key: &str) -> AppResult<bool> {
-        let conn = self
-            .conn
+    pub fn restore_state(&self, snapshot: &SecretStateSnapshot) -> AppResult<()> {
+        let _operation = self
+            .operation_lock
             .lock()
             .map_err(|error| AppError::Other(error.to_string()))?;
-        Ok(conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM encrypted_secrets WHERE key = ?1)",
-            params![key],
-            |row| row.get::<_, i64>(0),
-        )? != 0)
-    }
-
-    pub fn restore_state(&self, snapshot: &SecretStateSnapshot) -> AppResult<()> {
+        #[cfg(test)]
+        {
+            let mut session = self
+                .migration_session
+                .lock()
+                .map_err(|error| AppError::Other(error.to_string()))?;
+            if std::mem::take(&mut session.fail_next_restore) {
+                return Err(AppError::Other("TEST_SECRET_RESTORE_FAILED".to_string()));
+            }
+        }
         let conn = self
             .conn
             .lock()
@@ -658,10 +669,10 @@ impl Secrets {
                 ],
             )?;
         }
-        if let Some(value) = snapshot.legacy_value.as_ref() {
+        if let Some(value) = snapshot.local_value.as_ref() {
             tx.execute(
-                "INSERT INTO secrets (key, value) VALUES (?1, ?2)",
-                params![snapshot.key, value],
+                "INSERT INTO secrets (key, value, created_at) VALUES (?1, ?2, ?3)",
+                params![snapshot.key, value, snapshot.local_created_at.unwrap_or(0)],
             )?;
         }
         if let Some(created_at) = snapshot.legacy_candidate_created_at {
@@ -677,26 +688,26 @@ impl Secrets {
             )?;
         }
         tx.commit()?;
-        drop(conn);
-        self.restore_legacy_candidate_in_session(snapshot)?;
         Ok(())
     }
 
     pub fn delete_prefix(&self, prefix: &str) -> AppResult<()> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .map_err(|error| AppError::Other(error.to_string()))?;
         let conn = self
             .conn
             .lock()
             .map_err(|error| AppError::Other(error.to_string()))?;
-        let mut keys = {
-            let mut statement = conn.prepare(
+        let mut keys = conn
+            .prepare(
                 "SELECT key FROM encrypted_secrets WHERE key LIKE ?1
-                 UNION SELECT key FROM secrets WHERE key LIKE ?1",
-            )?;
-            let values = statement
-                .query_map(params![format!("{prefix}%")], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            values
-        };
+                 UNION SELECT key FROM secrets WHERE key LIKE ?1
+                 UNION SELECT key FROM legacy_secret_candidates WHERE key LIKE ?1",
+            )?
+            .query_map(params![format!("{prefix}%")], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
         keys.extend(
             SENSITIVE_KEYS
                 .iter()
@@ -706,18 +717,28 @@ impl Secrets {
         keys.sort();
         keys.dedup();
         let tx = conn.unchecked_transaction()?;
-        for key in &keys {
-            Self::delete_in_transaction(&tx, key)?;
+        for key in keys {
+            Self::delete_in_transaction(&tx, &key)?;
         }
         tx.commit()?;
-        drop(conn);
-        for key in keys {
-            self.forget_legacy_candidate_in_session(&key)?;
-        }
         Ok(())
     }
 
     pub fn delete(&self, key: &str) -> AppResult<()> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .map_err(|error| AppError::Other(error.to_string()))?;
+        #[cfg(test)]
+        {
+            let mut session = self
+                .migration_session
+                .lock()
+                .map_err(|error| AppError::Other(error.to_string()))?;
+            if std::mem::take(&mut session.fail_next_delete) {
+                return Err(AppError::Other("TEST_SECRET_DELETE_FAILED".to_string()));
+            }
+        }
         let conn = self
             .conn
             .lock()
@@ -725,8 +746,6 @@ impl Secrets {
         let tx = conn.unchecked_transaction()?;
         Self::delete_in_transaction(&tx, key)?;
         tx.commit()?;
-        drop(conn);
-        self.forget_legacy_candidate_in_session(key)?;
         Ok(())
     }
 
@@ -745,40 +764,30 @@ impl Secrets {
         Ok(())
     }
 
-    fn forget_legacy_candidate_in_session(&self, key: &str) -> AppResult<()> {
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        session.legacy_candidates.remove(key);
-        session.authorized_legacy_keys.remove(key);
-        session.denied_legacy_keys.remove(key);
-        session
-            .pending_imports
-            .retain(|_, pending_key| pending_key != key);
+    fn store_local_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        key: &str,
+        value: &str,
+    ) -> AppResult<()> {
+        tx.execute(
+            "INSERT INTO secrets (key, value, created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                 created_at = excluded.created_at",
+            params![key, value, chrono::Utc::now().timestamp_millis()],
+        )?;
+        tx.execute("DELETE FROM encrypted_secrets WHERE key = ?1", params![key])?;
+        tx.execute(
+            "DELETE FROM legacy_secret_candidates WHERE key = ?1",
+            params![key],
+        )?;
+        tx.execute(
+            "DELETE FROM secret_migration_tombstones WHERE key = ?1",
+            params![key],
+        )?;
         Ok(())
     }
 
-    fn restore_legacy_candidate_in_session(&self, snapshot: &SecretStateSnapshot) -> AppResult<()> {
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        if snapshot.legacy_candidate_created_at.is_some() || snapshot.legacy_value.is_some() {
-            session.legacy_candidates.insert(snapshot.key.clone());
-        } else {
-            session.legacy_candidates.remove(&snapshot.key);
-        }
-        session.authorized_legacy_keys.remove(&snapshot.key);
-        session.denied_legacy_keys.remove(&snapshot.key);
-        session
-            .pending_imports
-            .retain(|_, pending_key| pending_key != &snapshot.key);
-        Ok(())
-    }
-
-    /// Move already-plaintext legacy settings out of the main database without
-    /// touching Keychain. Encryption is deferred until the user confirms import.
+    /// Move older plaintext settings into the local-only credential database.
     pub fn migrate_from_settings(&self, db: &Db) -> AppResult<()> {
         let values: Vec<(String, String)> = {
             let db_conn = db
@@ -799,62 +808,50 @@ impl Secrets {
                 })
                 .collect()
         };
-        for (key, value) in values {
-            {
-                let conn = self
-                    .conn
-                    .lock()
-                    .map_err(|error| AppError::Other(error.to_string()))?;
-                conn.execute(
-                    "INSERT INTO secrets (key, value, created_at) VALUES (?1, ?2, ?3)
-                     ON CONFLICT(key) DO UPDATE SET value = excluded.value,
-                         created_at = excluded.created_at",
-                    params![key, value, chrono::Utc::now().timestamp_millis()],
-                )?;
-            }
-            let db_conn = db
-                .conn
-                .lock()
-                .map_err(|error| AppError::Other(error.to_string()))?;
-            db_conn.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+        if values.is_empty() {
+            return Ok(());
         }
-        Ok(())
-    }
-
-    /// Register only metadata-backed legacy items. This never reads Keychain
-    /// and prevents unrelated status checks from prompting for nonexistent
-    /// OAuth or API-key entries.
-    pub fn register_legacy_candidates(&self, db: &Db) -> AppResult<()> {
-        let mut candidates = {
+        {
             let conn = self
                 .conn
                 .lock()
                 .map_err(|error| AppError::Other(error.to_string()))?;
-            let values = conn
-                .prepare(
-                    "SELECT key FROM secrets
-                     UNION SELECT key FROM legacy_secret_candidates",
-                )?
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<Result<HashSet<_>, _>>()?;
-            values
-        };
+            let tx = conn.unchecked_transaction()?;
+            for (key, value) in &values {
+                Self::store_local_in_transaction(&tx, key, value)?;
+            }
+            tx.commit()?;
+        }
         let db_conn = db
             .conn
             .lock()
             .map_err(|error| AppError::Other(error.to_string()))?;
-        candidates.extend(
-            db_conn
+        let tx = db_conn.unchecked_transaction()?;
+        for (key, _) in values {
+            tx.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Rebuild migration hints from profile metadata without probing Keychain.
+    /// This covers users who jump directly from a pre-vault version: their
+    /// profile rows already exist, so the single-profile migration has no work
+    /// to do, while the referenced value may still live only in Keychain.
+    pub fn register_legacy_candidates(&self, db: &Db) -> AppResult<()> {
+        let (mut candidates, has_oauth_profile) = {
+            let conn = db.reader();
+            let candidates = conn
                 .prepare("SELECT secret_ref FROM ai_credentials")?
                 .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        let has_oauth_profile = db_conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM ai_profiles WHERE auth_mode = 'oauth')",
-            [],
-            |row| row.get::<_, i64>(0),
-        )? != 0;
-        drop(db_conn);
+                .collect::<Result<Vec<_>, _>>()?;
+            let has_oauth_profile = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM ai_profiles WHERE auth_mode = 'oauth')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+            (candidates, has_oauth_profile)
+        };
         if has_oauth_profile {
             candidates.extend(
                 SENSITIVE_KEYS
@@ -863,181 +860,80 @@ impl Secrets {
                     .map(|key| (*key).to_string()),
             );
         }
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        session.legacy_candidates = candidates;
+        candidates.sort();
+        candidates.dedup();
+        for candidate in candidates {
+            self.register_legacy_candidate(&candidate)?;
+        }
         Ok(())
     }
 
-    /// Persist a metadata-only hint that an older release may have stored this
-    /// logical secret in Keychain. This method never opens or probes Keychain.
+    /// Persist a metadata-only hint without reading the old Keychain item.
     pub fn register_legacy_candidate(&self, key: &str) -> AppResult<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|error| AppError::Other(error.to_string()))?;
         conn.execute(
-            "INSERT INTO legacy_secret_candidates (key, created_at) VALUES (?1, ?2)
+            "INSERT INTO legacy_secret_candidates (key, created_at)
+             SELECT ?1, ?2
+             WHERE NOT EXISTS (SELECT 1 FROM secrets WHERE key = ?1)
+               AND NOT EXISTS (SELECT 1 FROM encrypted_secrets WHERE key = ?1)
+               AND NOT EXISTS (
+                   SELECT 1 FROM secret_migration_tombstones WHERE key = ?1
+               )
              ON CONFLICT(key) DO NOTHING",
             params![key, chrono::Utc::now().timestamp_millis()],
         )?;
-        drop(conn);
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        session.legacy_candidates.insert(key.to_string());
         Ok(())
-    }
-
-    #[cfg(test)]
-    fn persisted_legacy_candidates(&self) -> AppResult<Vec<String>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        let mut statement =
-            conn.prepare("SELECT key FROM legacy_secret_candidates ORDER BY key")?;
-        let candidates = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(candidates)
     }
 
     pub fn has_stored_secret_metadata(&self, key: &str) -> bool {
         let Ok(conn) = self.conn.lock() else {
             return false;
         };
-        let stored = conn
-            .query_row(
-                "SELECT EXISTS(
+        conn.query_row(
+            "SELECT EXISTS(
                  SELECT 1 FROM encrypted_secrets WHERE key = ?1
                  UNION ALL SELECT 1 FROM secrets WHERE key = ?1
                  UNION ALL SELECT 1 FROM legacy_secret_candidates WHERE key = ?1
              )",
-                params![key],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap_or(0)
-            != 0;
-        drop(conn);
-        stored
-            || self
-                .session
-                .lock()
-                .is_ok_and(|session| session.legacy_candidates.contains(key))
+            params![key],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            != 0
     }
 
     pub fn is_sensitive_key(key: &str) -> bool {
         SENSITIVE_KEYS.contains(&key) || key.starts_with("ai_api_key/") || key.starts_with("oauth_")
     }
 
-    fn encrypted_value(&self, key: &str) -> AppResult<Option<(Vec<u8>, Vec<u8>)>> {
+    fn encrypted_secret_count(&self) -> AppResult<i64> {
         let conn = self
             .conn
             .lock()
             .map_err(|error| AppError::Other(error.to_string()))?;
-        let value = conn
-            .query_row(
-                "SELECT nonce, ciphertext FROM encrypted_secrets
-                 WHERE key = ?1 AND algorithm = ?2 AND key_version = ?3",
-                params![key, VAULT_ALGORITHM, VAULT_KEY_VERSION],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        Ok(value)
+        Ok(
+            conn.query_row("SELECT COUNT(*) FROM encrypted_secrets", [], |row| {
+                row.get(0)
+            })?,
+        )
     }
 
-    fn local_legacy_value(&self, key: &str) -> AppResult<Option<String>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        Ok(conn
-            .query_row(
-                "SELECT value FROM secrets WHERE key = ?1",
-                params![key],
-                |row| row.get(0),
-            )
-            .optional()?)
-    }
-
-    fn store_encrypted(&self, key: &str, value: &str, master_key: &[u8]) -> AppResult<()> {
-        let (nonce_bytes, ciphertext) = self.encrypt_value(key, value, master_key)?;
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        let tx = conn.unchecked_transaction()?;
-        Self::store_encrypted_in_transaction(&tx, key, &nonce_bytes, &ciphertext)?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    fn encrypt_value(
-        &self,
-        key: &str,
-        value: &str,
-        master_key: &[u8],
-    ) -> AppResult<([u8; 12], Vec<u8>)> {
-        let cipher = Aes256Gcm::new_from_slice(master_key)
-            .map_err(|_| AppError::Other("VAULT_MASTER_KEY_INVALID".to_string()))?;
-        let mut nonce_bytes = [0_u8; 12];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let aad = Self::aad_for(key);
-        let ciphertext = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce_bytes),
-                Payload {
-                    msg: value.as_bytes(),
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| AppError::Other("VAULT_ENCRYPTION_FAILED".to_string()))?;
-        Ok((nonce_bytes, ciphertext))
-    }
-
-    fn store_encrypted_in_transaction(
-        tx: &rusqlite::Transaction<'_>,
-        key: &str,
-        nonce_bytes: &[u8; 12],
-        ciphertext: &[u8],
-    ) -> AppResult<()> {
-        tx.execute(
-            "INSERT INTO encrypted_secrets
-                 (key, nonce, ciphertext, algorithm, key_version, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(key) DO UPDATE SET
-                 nonce = excluded.nonce,
-                 ciphertext = excluded.ciphertext,
-                 algorithm = excluded.algorithm,
-                 key_version = excluded.key_version,
-                 updated_at = excluded.updated_at",
-            params![
-                key,
-                nonce_bytes.as_slice(),
-                ciphertext,
-                VAULT_ALGORITHM,
-                VAULT_KEY_VERSION,
-                chrono::Utc::now().timestamp_millis()
-            ],
-        )?;
-        tx.execute("DELETE FROM secrets WHERE key = ?1", params![key])?;
-        tx.execute(
-            "DELETE FROM legacy_secret_candidates WHERE key = ?1",
-            params![key],
-        )?;
-        tx.execute(
-            "DELETE FROM secret_migration_tombstones WHERE key = ?1",
-            params![key],
-        )?;
-        Ok(())
+    fn decode_master_key(encoded: &str) -> AppResult<Zeroizing<Vec<u8>>> {
+        let decoded = Zeroizing::new(
+            STANDARD_NO_PAD
+                .decode(encoded)
+                .map_err(|_| AppError::Other("VAULT_MASTER_KEY_INVALID".to_string()))?,
+        );
+        if decoded.len() != 32 {
+            return Err(AppError::Other("VAULT_MASTER_KEY_INVALID".to_string()));
+        }
+        Ok(decoded)
     }
 
     fn decrypt_value(
-        &self,
         key: &str,
         nonce: &[u8],
         ciphertext: &[u8],
@@ -1071,235 +967,38 @@ impl Secrets {
         aad
     }
 
-    fn decode_master_key(&self, encoded: &str) -> AppResult<Zeroizing<Vec<u8>>> {
-        let decoded = match STANDARD_NO_PAD.decode(encoded) {
-            Ok(decoded) => Zeroizing::new(decoded),
-            Err(_) => {
-                self.set_master_state(MasterKeyState::Unavailable)?;
-                return Err(AppError::Other("VAULT_MASTER_KEY_INVALID".to_string()));
-            }
-        };
-        if decoded.len() != 32 {
-            self.set_master_state(MasterKeyState::Unavailable)?;
-            return Err(AppError::Other("VAULT_MASTER_KEY_INVALID".to_string()));
-        }
-        Ok(decoded)
-    }
-
-    fn master_key_or_confirmation(&self, reason: &str) -> AppResult<Zeroizing<Vec<u8>>> {
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        match &session.master_key {
-            MasterKeyState::Ready(key) => Ok(Zeroizing::new(key.as_slice().to_vec())),
-            MasterKeyState::Locked => {
-                let request_id = Self::pending_master_request(&mut session);
-                Err(AppError::Other(format!(
-                    "VAULT_CONFIRM_REQUIRED:{reason}:{request_id}"
-                )))
-            }
-            MasterKeyState::Denied => Err(AppError::Other("VAULT_ACCESS_DENIED".to_string())),
-            MasterKeyState::Unavailable => {
-                Err(AppError::Other("VAULT_ACCESS_UNAVAILABLE".to_string()))
-            }
-        }
-    }
-
-    fn pending_master_request(session: &mut VaultSession) -> String {
-        session
-            .pending_master_request
-            .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
-            .clone()
-    }
-
-    fn authorize_pending_master(
-        session: &mut VaultSession,
+    fn consume_pending_request(
+        session: &mut MigrationSession,
         request_id: Option<&str>,
     ) -> AppResult<()> {
         let request_id = request_id
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| AppError::Other("VAULT_MASTER_REQUEST_INVALID".to_string()))?;
-        if session.pending_master_request.as_deref() != Some(request_id) {
-            return Err(AppError::Other("VAULT_MASTER_REQUEST_EXPIRED".to_string()));
+            .ok_or_else(|| AppError::Other("VAULT_MIGRATION_REQUEST_INVALID".to_string()))?;
+        if session.pending_request.as_deref() != Some(request_id) {
+            return Err(AppError::Other(
+                "VAULT_MIGRATION_REQUEST_EXPIRED".to_string(),
+            ));
         }
-        session.pending_master_request = None;
+        session.pending_request = None;
         Ok(())
     }
 
-    fn deny_pending_master(session: &mut VaultSession, request_id: Option<&str>) -> AppResult<()> {
-        Self::authorize_pending_master(session, request_id)
-    }
-
-    fn legacy_import_is_authorized(&self, key: &str) -> AppResult<bool> {
-        let session = self
-            .session
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        Ok(session.authorized_legacy_keys.contains(key))
-    }
-
-    fn legacy_import_is_denied(&self, key: &str) -> AppResult<bool> {
-        let session = self
-            .session
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        Ok(session.denied_legacy_keys.contains(key))
-    }
-
-    fn legacy_entry_cache_key(service: &str, key: &str) -> String {
-        format!("{service}\0{key}")
-    }
-
-    fn legacy_entry_is_missing(&self, service: &str, key: &str) -> AppResult<bool> {
-        let session = self
-            .session
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        Ok(session
-            .missing_legacy_entries
-            .contains(&Self::legacy_entry_cache_key(service, key)))
-    }
-
-    fn mark_legacy_entry_missing(&self, service: &str, key: &str) -> AppResult<()> {
+    fn clear_migration_session(&self) -> AppResult<()> {
         let mut session = self
-            .session
+            .migration_session
             .lock()
             .map_err(|error| AppError::Other(error.to_string()))?;
-        session
-            .missing_legacy_entries
-            .insert(Self::legacy_entry_cache_key(service, key));
+        session.master_key = None;
+        session.master_key_error = None;
+        session.authorized = false;
+        session.pending_request = None;
         Ok(())
-    }
-
-    fn revoke_legacy_authorization(&self, key: &str) -> AppResult<()> {
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        session.authorized_legacy_keys.remove(key);
-        Ok(())
-    }
-
-    fn deny_legacy_import(&self, key: &str) -> AppResult<()> {
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        session.authorized_legacy_keys.remove(key);
-        session.denied_legacy_keys.insert(key.to_string());
-        session
-            .pending_imports
-            .retain(|_, pending_key| pending_key != key);
-        Ok(())
-    }
-
-    fn finish_legacy_import(&self, key: &str) -> AppResult<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        conn.execute(
-            "DELETE FROM legacy_secret_candidates WHERE key = ?1",
-            params![key],
-        )?;
-        drop(conn);
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        session.legacy_candidates.remove(key);
-        session.authorized_legacy_keys.remove(key);
-        session.denied_legacy_keys.remove(key);
-        session
-            .pending_imports
-            .retain(|_, pending_key| pending_key != key);
-        Ok(())
-    }
-
-    fn is_legacy_candidate(&self, key: &str) -> AppResult<bool> {
-        let session = self
-            .session
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        Ok(session.legacy_candidates.contains(key))
-    }
-
-    fn authorize_pending_import(
-        session: &mut VaultSession,
-        request_id: Option<&str>,
-    ) -> AppResult<()> {
-        let request_id = request_id
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| AppError::Other("VAULT_IMPORT_REQUEST_INVALID".to_string()))?;
-        let key = session
-            .pending_imports
-            .remove(request_id)
-            .ok_or_else(|| AppError::Other("VAULT_IMPORT_REQUEST_EXPIRED".to_string()))?;
-        session.denied_legacy_keys.remove(&key);
-        session.authorized_legacy_keys.insert(key);
-        Ok(())
-    }
-
-    fn encrypted_secret_count(&self) -> AppResult<i64> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        Ok(
-            conn.query_row("SELECT COUNT(*) FROM encrypted_secrets", [], |row| {
-                row.get(0)
-            })?,
-        )
-    }
-
-    fn has_migration_tombstone(&self, key: &str) -> AppResult<bool> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        Ok(conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM secret_migration_tombstones WHERE key = ?1)",
-            params![key],
-            |row| row.get::<_, i64>(0),
-        )? != 0)
-    }
-
-    fn record_migration_tombstone(&self, key: &str) -> AppResult<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        conn.execute(
-            "INSERT INTO secret_migration_tombstones (key, created_at) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET created_at = excluded.created_at",
-            params![key, chrono::Utc::now().timestamp_millis()],
-        )?;
-        Ok(())
-    }
-
-    fn set_master_state(&self, state: MasterKeyState) -> AppResult<()> {
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|error| AppError::Other(error.to_string()))?;
-        session.master_key = state;
-        Ok(())
-    }
-
-    fn record_keychain_error(&self, error: keyring::Error) -> AppError {
-        let app_error = Self::keychain_error(error);
-        let state = if matches!(&app_error, AppError::Other(message) if message == "VAULT_ACCESS_DENIED")
-        {
-            MasterKeyState::Denied
-        } else {
-            MasterKeyState::Unavailable
-        };
-        let _ = self.set_master_state(state);
-        app_error
     }
 
     fn keychain_error(error: keyring::Error) -> AppError {
+        if matches!(&error, keyring::Error::NoEntry) {
+            return AppError::Other("VAULT_MASTER_KEY_MISSING".to_string());
+        }
         if Self::keychain_os_status(&error).is_some_and(Self::is_denied_os_status) {
             return AppError::Other("VAULT_ACCESS_DENIED".to_string());
         }
@@ -1307,8 +1006,6 @@ impl Secrets {
         let denied = description.contains("cancel")
             || description.contains("denied")
             || description.contains("auth")
-            // macOS commonly returns errSecAuthFailed for a rejected prompt,
-            // a cancelled prompt, or an incorrect login Keychain password.
             || description.contains("-25293")
             || description.contains("user canceled")
             || description.contains("user cancelled")
@@ -1350,41 +1047,90 @@ impl Secrets {
         Self::initialize_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
-            session: Arc::new(Mutex::new(VaultSession {
-                master_key: MasterKeyState::Ready(Zeroizing::new(vec![7_u8; 32])),
-                pending_master_request: None,
-                legacy_candidates: HashSet::new(),
-                authorized_legacy_keys: HashSet::new(),
-                denied_legacy_keys: HashSet::new(),
-                missing_legacy_entries: HashSet::new(),
-                pending_imports: HashMap::new(),
-            })),
+            migration_session: Arc::new(Mutex::new(MigrationSession::default())),
             operation_lock: Arc::new(Mutex::new(())),
             use_keychain: false,
+            legacy_keychain_values: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     pub fn lock_for_test(&self) -> AppResult<()> {
-        let mut session = self
-            .session
+        self.clear_migration_session()
+    }
+
+    pub fn has_encrypted_secret(&self, key: &str) -> AppResult<bool> {
+        let conn = self
+            .conn
             .lock()
             .map_err(|error| AppError::Other(error.to_string()))?;
-        session.master_key = MasterKeyState::Locked;
-        session.pending_master_request = None;
-        Ok(())
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM encrypted_secrets WHERE key = ?1)",
+            params![key],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
     }
 
-    // Test-only state transitions keep production helpers private to the
-    // production impl while allowing denial behavior to be verified directly.
-    fn deny_master_for_test(&self) -> AppResult<()> {
-        self.set_master_state(MasterKeyState::Denied)
+    fn store_encrypted_for_test(&self, key: &str, value: &str, nonce: [u8; 12]) {
+        let master_key = [7_u8; 32];
+        let cipher = Aes256Gcm::new_from_slice(&master_key).unwrap();
+        let aad = Self::aad_for(key);
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: value.as_bytes(),
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO encrypted_secrets
+                     (key, nonce, ciphertext, algorithm, key_version, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    key,
+                    nonce.as_slice(),
+                    ciphertext,
+                    VAULT_ALGORITHM,
+                    VAULT_KEY_VERSION,
+                    1_i64
+                ],
+            )
+            .unwrap();
     }
 
-    fn master_confirmation_request(&self, reason: &str) -> AppResult<String> {
-        Ok(self
-            .master_key_or_confirmation(reason)
-            .unwrap_err()
-            .to_string())
+    fn authorize_pending_migration_for_test(&self) {
+        let error = self.migrate_to_local().unwrap_err().to_string();
+        let request_id = error.rsplit(':').next().unwrap();
+        self.authorize("migrate", Some(request_id)).unwrap();
+    }
+
+    fn authorize_pending_migration_with_master_error_for_test(&self, error: &str) {
+        let request = self.migrate_to_local().unwrap_err().to_string();
+        let request_id = request.rsplit(':').next().unwrap();
+        let mut session = self.migration_session.lock().unwrap();
+        Self::consume_pending_request(&mut session, Some(request_id)).unwrap();
+        session.authorized = true;
+        session.master_key = None;
+        session.master_key_error = Some(error.to_string());
+    }
+
+    pub fn seed_legacy_keychain_value_for_test(&self, key: &str, value: &str) {
+        self.legacy_keychain_values
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), value.to_string());
+    }
+
+    pub fn fail_next_delete_for_test(&self) {
+        self.migration_session.lock().unwrap().fail_next_delete = true;
+    }
+
+    pub fn fail_next_restore_for_test(&self) {
+        self.migration_session.lock().unwrap().fail_next_restore = true;
     }
 }
 
@@ -1393,91 +1139,113 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encrypted_round_trip_uses_fresh_nonces() {
+    fn local_round_trip_never_requires_migration_authorization() {
         let secrets = Secrets::init_in_memory().unwrap();
+        let secure_delete = secrets
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA secure_delete", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(secure_delete, 1);
         secrets.set("ai_api_key/test", "secret-value").unwrap();
-        let first = secrets.encrypted_value("ai_api_key/test").unwrap().unwrap();
+        secrets.lock_for_test().unwrap();
         assert_eq!(
             secrets.get("ai_api_key/test").unwrap().as_deref(),
             Some("secret-value")
         );
-
-        secrets.set("ai_api_key/test", "secret-value").unwrap();
-        let second = secrets.encrypted_value("ai_api_key/test").unwrap().unwrap();
-        assert_ne!(first.0, second.0);
-        assert_ne!(first.1, b"secret-value");
+        assert!(!secrets.has_encrypted_secret("ai_api_key/test").unwrap());
     }
 
     #[test]
-    fn aad_prevents_ciphertext_from_moving_between_keys() {
+    fn encrypted_vault_is_migrated_only_after_explicit_authorization() {
         let secrets = Secrets::init_in_memory().unwrap();
-        secrets.set("ai_api_key/one", "secret-value").unwrap();
-        let (nonce, ciphertext) = secrets.encrypted_value("ai_api_key/one").unwrap().unwrap();
-        let key = secrets.master_key_or_confirmation("unlock").unwrap();
-        assert!(secrets
-            .decrypt_value("ai_api_key/two", &nonce, &ciphertext, key.as_slice())
-            .is_err());
-    }
+        secrets.store_encrypted_for_test("ai_api_key/legacy", "legacy-key", [1_u8; 12]);
 
-    #[test]
-    fn deletion_tombstone_prevents_legacy_resurrection() {
-        let secrets = Secrets::init_in_memory().unwrap();
-        secrets.set("oauth_access_token", "token").unwrap();
-        secrets.delete("oauth_access_token").unwrap();
-        assert_eq!(secrets.get("oauth_access_token").unwrap(), None);
-    }
+        assert_eq!(secrets.get("ai_api_key/legacy").unwrap(), None);
+        let error = secrets.migrate_to_local().unwrap_err().to_string();
+        assert!(error.starts_with("VAULT_CONFIRM_REQUIRED:migrate:"));
+        let request_id = error.rsplit(':').next().unwrap();
+        secrets.authorize("migrate", Some(request_id)).unwrap();
 
-    #[test]
-    fn denied_master_key_stops_the_session_from_prompting_again() {
-        let secrets = Secrets::init_in_memory().unwrap();
-        secrets.set("ai_api_key/test", "secret-value").unwrap();
-        secrets.deny_master_for_test().unwrap();
-
-        let error = secrets.get("ai_api_key/test").unwrap_err().to_string();
-        assert_eq!(error, "VAULT_ACCESS_DENIED");
-    }
-
-    #[test]
-    fn master_authorization_requires_the_current_backend_request_id() {
-        let secrets = Secrets::init_in_memory().unwrap();
-        secrets.lock_for_test().unwrap();
-        let request = secrets.master_confirmation_request("create").unwrap();
-        let request_id = request.rsplit(':').next().unwrap();
-
-        let stale = secrets.authorize("create", Some("00000000-0000-0000-0000-000000000000"));
+        assert_eq!(secrets.migrate_to_local().unwrap(), 1);
         assert_eq!(
-            stale.unwrap_err().to_string(),
-            "VAULT_MASTER_REQUEST_EXPIRED"
+            secrets.get("ai_api_key/legacy").unwrap().as_deref(),
+            Some("legacy-key")
         );
-
-        secrets.authorize("create", Some(request_id)).unwrap();
-        assert!(secrets.master_key_or_confirmation("unlock").is_ok());
+        assert!(!secrets.has_encrypted_secret("ai_api_key/legacy").unwrap());
+        assert_eq!(secrets.status().unwrap().pending_migration_count, 0);
     }
 
     #[test]
-    fn denied_master_request_invalidates_all_concurrent_confirmations() {
+    fn newer_local_value_wins_and_old_ciphertext_is_removed() {
         let secrets = Secrets::init_in_memory().unwrap();
-        secrets.lock_for_test().unwrap();
-        let first = secrets.master_confirmation_request("unlock").unwrap();
-        let second = secrets.master_confirmation_request("unlock").unwrap();
-        assert_eq!(first, second);
-        let request_id = first.rsplit(':').next().unwrap();
+        secrets.store_encrypted_for_test("ai_api_key/shared", "old-key", [2_u8; 12]);
+        {
+            let conn = secrets.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO secrets (key, value, created_at) VALUES (?1, ?2, ?3)",
+                params!["ai_api_key/shared", "new-key", 2_i64],
+            )
+            .unwrap();
+        }
+        secrets.authorize_pending_migration_for_test();
 
-        secrets.deny("unlock", Some(request_id)).unwrap();
+        assert_eq!(secrets.migrate_to_local().unwrap(), 0);
         assert_eq!(
-            secrets
-                .authorize("unlock", Some(request_id))
-                .unwrap_err()
-                .to_string(),
-            "VAULT_MASTER_REQUEST_EXPIRED"
+            secrets.get("ai_api_key/shared").unwrap().as_deref(),
+            Some("new-key")
         );
+        assert!(!secrets.has_encrypted_secret("ai_api_key/shared").unwrap());
+    }
+
+    #[test]
+    fn corrupt_vault_row_is_retained_while_readable_rows_migrate() {
+        let secrets = Secrets::init_in_memory().unwrap();
+        secrets.store_encrypted_for_test("ai_api_key/good", "good", [3_u8; 12]);
+        secrets.store_encrypted_for_test("ai_api_key/bad", "bad", [4_u8; 12]);
+        secrets
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE encrypted_secrets SET ciphertext = zeroblob(16)
+                 WHERE key = 'ai_api_key/bad'",
+                [],
+            )
+            .unwrap();
+        secrets.authorize_pending_migration_for_test();
+
+        let error = secrets.migrate_to_local().unwrap_err().to_string();
+        assert!(error.starts_with("VAULT_PARTIAL_MIGRATION:imported=1:pending=1:"));
+        assert!(error.ends_with("VAULT_DATA_CORRUPT"));
         assert_eq!(
-            secrets
-                .master_key_or_confirmation("unlock")
-                .unwrap_err()
-                .to_string(),
-            "VAULT_ACCESS_DENIED"
+            secrets.get("ai_api_key/good").unwrap().as_deref(),
+            Some("good")
         );
+        assert!(!secrets.has_encrypted_secret("ai_api_key/good").unwrap());
+        assert!(secrets.has_encrypted_secret("ai_api_key/bad").unwrap());
+    }
+
+    #[test]
+    fn missing_master_key_does_not_block_per_item_legacy_import() {
+        let secrets = Secrets::init_in_memory().unwrap();
+        secrets.store_encrypted_for_test("ai_api_key/vault", "vault-key", [9_u8; 12]);
+        secrets
+            .register_legacy_candidate("ai_api_key/per-item")
+            .unwrap();
+        secrets.seed_legacy_keychain_value_for_test("ai_api_key/per-item", "legacy-key");
+        secrets.authorize_pending_migration_with_master_error_for_test("VAULT_MASTER_KEY_MISSING");
+
+        let error = secrets.migrate_to_local().unwrap_err().to_string();
+        assert!(error.starts_with("VAULT_PARTIAL_MIGRATION:imported=1:pending=1:"));
+        assert!(error.ends_with("VAULT_MASTER_KEY_MISSING"));
+        assert_eq!(
+            secrets.get("ai_api_key/per-item").unwrap().as_deref(),
+            Some("legacy-key")
+        );
+        assert!(secrets.has_encrypted_secret("ai_api_key/vault").unwrap());
+        assert_eq!(secrets.status().unwrap().pending_migration_count, 1);
     }
 
     #[test]
@@ -1503,52 +1271,93 @@ mod tests {
     }
 
     #[test]
-    fn pending_local_migrations_are_encrypted_in_one_explicit_operation() {
-        let secrets = Secrets::init_in_memory().unwrap();
-        {
-            let conn = secrets.conn.lock().unwrap();
-            conn.execute(
-                "INSERT INTO secrets (key, value, created_at) VALUES (?1, ?2, ?3)",
-                params!["ai_api_key/legacy", "plaintext-key", 123_i64],
-            )
-            .unwrap();
-        }
-
-        let status = secrets.status().unwrap();
-        assert_eq!(status.pending_local_migration_count, 1);
-        assert_eq!(status.pending_local_migration_oldest_at, Some(123));
-
-        assert_eq!(secrets.encrypt_pending_local_migrations().unwrap(), 1);
-        assert!(secrets.has_encrypted_secret("ai_api_key/legacy").unwrap());
-        assert_eq!(
-            secrets.get("ai_api_key/legacy").unwrap().as_deref(),
-            Some("plaintext-key")
-        );
-        assert_eq!(secrets.status().unwrap().pending_local_migration_count, 0);
-    }
-
-    #[test]
-    fn legacy_candidate_is_persisted_without_reading_a_secret() {
-        let secrets = Secrets::init_in_memory().unwrap();
-        secrets.register_legacy_candidate("ai_api_key").unwrap();
-        assert_eq!(
-            secrets.persisted_legacy_candidates().unwrap(),
-            vec!["ai_api_key".to_string()]
-        );
-        assert_eq!(secrets.get("unrelated_key").unwrap(), None);
-    }
-
-    #[test]
-    fn deleting_a_credential_also_removes_its_legacy_candidate() {
+    fn deleting_a_credential_prevents_legacy_resurrection() {
         let secrets = Secrets::init_in_memory().unwrap();
         secrets
             .register_legacy_candidate("ai_api_key/legacy")
             .unwrap();
-
         secrets.delete("ai_api_key/legacy").unwrap();
 
-        assert!(secrets.persisted_legacy_candidates().unwrap().is_empty());
         assert!(!secrets.has_stored_secret_metadata("ai_api_key/legacy"));
+        assert_eq!(secrets.status().unwrap().pending_migration_count, 0);
+    }
+
+    #[test]
+    fn migration_authorization_rejects_stale_request_ids() {
+        let secrets = Secrets::init_in_memory().unwrap();
+        secrets.store_encrypted_for_test("ai_api_key/legacy", "key", [5_u8; 12]);
+        let error = secrets.migrate_to_local().unwrap_err().to_string();
+        let request_id = error.rsplit(':').next().unwrap();
+
+        let stale = secrets.authorize("migrate", Some("00000000-0000-0000-0000-000000000000"));
+        assert_eq!(
+            stale.unwrap_err().to_string(),
+            "VAULT_MIGRATION_REQUEST_EXPIRED"
+        );
+        secrets.deny("migrate", Some(request_id)).unwrap();
+        assert_eq!(secrets.get("ai_api_key/legacy").unwrap(), None);
+    }
+
+    #[test]
+    fn jump_upgrade_registers_missing_keychain_refs_from_existing_profiles() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let db = Db::init(directory.path()).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO ai_profiles
+                     (id, label, provider, auth_mode, base_url, model, temperature,
+                      keep_alive, enabled, priority, created_at, updated_at)
+                 VALUES ('api', 'API', 'custom', 'api_key', 'https://example.test/v1',
+                         'model', 0.3, NULL, 1, 0, 1, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO ai_profiles
+                     (id, label, provider, auth_mode, base_url, model, temperature,
+                      keep_alive, enabled, priority, created_at, updated_at)
+                 VALUES ('oauth', 'OAuth', 'openai', 'oauth', NULL,
+                         'model', 0.3, NULL, 1, 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO ai_credentials
+                     (id, profile_id, label, secret_ref, masked_suffix, enabled,
+                      priority, state, created_at, updated_at)
+                 VALUES ('credential', 'api', 'Primary', 'ai_api_key/jump', '1234',
+                         1, 0, 'active', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let secrets = Secrets::init_in_memory().unwrap();
+
+        secrets.register_legacy_candidates(&db).unwrap();
+
+        let candidates = secrets
+            .conn
+            .lock()
+            .unwrap()
+            .prepare("SELECT key FROM legacy_secret_candidates ORDER BY key")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            candidates,
+            vec![
+                "ai_api_key/jump".to_string(),
+                "oauth_access_token".to_string(),
+                "oauth_account_id".to_string(),
+                "oauth_expires_at".to_string(),
+                "oauth_refresh_token".to_string(),
+            ]
+        );
+        assert_eq!(secrets.status().unwrap().pending_migration_count, 5);
+        assert_eq!(secrets.get("ai_api_key/jump").unwrap(), None);
     }
 
     #[test]
@@ -1559,21 +1368,29 @@ mod tests {
         assert!(!Secrets::is_denied_os_status(-25291));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn missing_legacy_entry_cache_is_scoped_to_service_and_key() {
-        let secrets = Secrets::init_in_memory().unwrap();
-        secrets
-            .mark_legacy_entry_missing("legacy.service", "ai_api_key/one")
-            .unwrap();
+    fn file_store_is_created_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
 
-        assert!(secrets
-            .legacy_entry_is_missing("legacy.service", "ai_api_key/one")
-            .unwrap());
-        assert!(!secrets
-            .legacy_entry_is_missing("legacy.service", "ai_api_key/two")
-            .unwrap());
-        assert!(!secrets
-            .legacy_entry_is_missing("other.service", "ai_api_key/one")
-            .unwrap());
+        let dir = std::env::temp_dir().join(format!("quill-secrets-{}", uuid::Uuid::new_v4()));
+        let secrets = Secrets::init(&dir).unwrap();
+        let journal_mode = secrets
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .unwrap();
+        assert_eq!(journal_mode, "delete");
+        drop(secrets);
+        let mode = fs::metadata(dir.join("secrets.db"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(!dir.join("secrets.db-wal").exists());
+        assert!(!dir.join("secrets.db-shm").exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 }

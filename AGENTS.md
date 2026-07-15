@@ -44,16 +44,17 @@ Core vocabulary:
 
 ## Development Commands
 
-- Install deps: `pnpm install`.
-- Start frontend dev server: `pnpm dev`.
-- Start Tauri app in dev: `pnpm tauri dev`.
-- Frontend typecheck: `pnpm exec tsc --noEmit`.
-- Frontend lint: `pnpm run lint`.
-- Frontend build: `pnpm build`.
+- Install deps: `npm ci`.
+- Start frontend dev server: `npm run dev`.
+- Start Tauri app in dev: `npm run tauri dev`.
+- Frontend typecheck: `npx tsc --noEmit`.
+- Frontend lint: `npm run lint`.
+- Frontend build: `npm run build`.
+- Frontend unit tests: `npm run test:unit`.
 - Rust check: `cd src-tauri && cargo check`.
 - Rust tests: `cd src-tauri && cargo test`.
 - Rust lint: `cd src-tauri && cargo clippy -- -D warnings`.
-- Package desktop app: `pnpm run package`.
+- Package desktop app: `npm run package`.
 
 Prefer the smallest check that covers the change. For frontend changes, run typecheck and lint. For Rust behavior, run the relevant `cargo test` target; for sync changes, run sync-focused tests before broadening.
 
@@ -66,6 +67,7 @@ Prefer the smallest check that covers the change. For frontend changes, run type
 - Keep comments rare and useful. Explain non-obvious intent, not mechanics.
 - Keep UI aligned with `design/quill-desktop.pen` when a node or frame is referenced by the user.
 - Keep `src/i18n/en.json` and `src/i18n/zh.json` in sync when adding user-facing strings.
+- Use `ROW_CONTROL_WIDTH` or `ROW_CONTROL_WIDTH_COMPACT` for row controls in settings instead of local width literals.
 - Treat sync and file-copy changes as data-safety sensitive. Preserve the invariant that the app must not repoint storage or disable sync until required local files are actually reachable.
 - Do not add repo conventions only to an agent-specific file. Update this file and leave tool-specific files as compatibility entrypoints if needed.
 

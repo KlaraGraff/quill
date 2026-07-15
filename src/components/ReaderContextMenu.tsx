@@ -8,13 +8,12 @@ import {
   Sparkles,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import type { InteractionKind } from "./reader-interaction";
+import type { InteractionKind, SerializableRect } from "./reader-interaction";
 
 export type ReaderMenuAction = "primary" | "ask-ai" | "save" | "highlight" | "translate" | "copy";
 
 interface ReaderContextMenuProps {
-  x: number;
-  y: number;
+  anchorRect: SerializableRect;
   text: string;
   kind: InteractionKind;
   marked?: boolean;
@@ -34,8 +33,7 @@ interface ReaderContextMenuProps {
 }
 
 export default function ReaderContextMenu({
-  x,
-  y,
+  anchorRect,
   text,
   kind,
   marked = false,
@@ -62,13 +60,13 @@ export default function ReaderContextMenu({
   }, [onToggleMark, order, showTranslate]);
 
   useEffect(() => {
-    const buttons = menuRef.current?.querySelectorAll<HTMLButtonElement>("[role='menuitem']");
+    const buttons = menuRef.current?.querySelectorAll<HTMLButtonElement>("[role='menuitem']:not(:disabled)");
     buttons?.[0]?.focus();
     const handleClickOutside = (event: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(event.target as Node)) onClose();
     };
     const handleKeyDown = (event: KeyboardEvent) => {
-      const items = Array.from(menuRef.current?.querySelectorAll<HTMLButtonElement>("[role='menuitem']") ?? []);
+      const items = Array.from(menuRef.current?.querySelectorAll<HTMLButtonElement>("[role='menuitem']:not(:disabled)") ?? []);
       if (event.key === "Escape") {
         event.preventDefault();
         onClose();
@@ -97,10 +95,20 @@ export default function ReaderContextMenu({
     if (!element) return;
     const positionMenu = () => {
       const rect = element.getBoundingClientRect();
-      const left = Math.max(8, Math.min(x, window.innerWidth - rect.width - 8));
-      const top = y + rect.height <= window.innerHeight - 8
-        ? y
-        : Math.max(8, y - rect.height - 8);
+      const gap = 8;
+      const roomRight = window.innerWidth - anchorRect.right - gap;
+      const roomLeft = anchorRect.left - gap;
+      const canPlaceBeside = roomRight >= rect.width || roomLeft >= rect.width;
+      const left = roomRight >= rect.width
+        ? anchorRect.right + gap
+        : roomLeft >= rect.width
+          ? anchorRect.left - rect.width - gap
+          : Math.max(gap, Math.min(anchorRect.right - rect.width, window.innerWidth - rect.width - gap));
+      const top = canPlaceBeside
+        ? Math.max(gap, Math.min(anchorRect.top, window.innerHeight - rect.height - gap))
+        : anchorRect.bottom + gap + rect.height <= window.innerHeight
+          ? anchorRect.bottom + gap
+          : Math.max(gap, anchorRect.top - rect.height - gap);
       element.style.left = `${left}px`;
       element.style.top = `${top}px`;
     };
@@ -112,7 +120,7 @@ export default function ReaderContextMenu({
       observer.disconnect();
       window.removeEventListener("resize", positionMenu);
     };
-  }, [x, y]);
+  }, [anchorRect]);
 
   const primaryIsLookup = kind !== "passage";
   const definitions: Record<ReaderMenuAction, { label: string; icon: typeof Sparkles; run: () => void }> = {
@@ -162,7 +170,7 @@ export default function ReaderContextMenu({
       role="menu"
       aria-label={text}
       className="fixed z-50 w-[220px] rounded-md border border-border bg-bg-surface py-1 shadow-context"
-      style={{ left: x, top: y }}
+      style={{ left: anchorRect.right, top: anchorRect.bottom + 8 }}
     >
       {actions.map((action) => {
         const definition = definitions[action];

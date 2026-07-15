@@ -10,7 +10,6 @@ import {
   type LearningCardKind,
   type SelectionMenuKind,
 } from "../learning-card";
-import Select from "../ui/Select";
 import Toggle from "../ui/Toggle";
 import CardDesignSettings from "./CardDesignSettings";
 import DensityHelpDialog from "./DensityHelpDialog";
@@ -91,7 +90,6 @@ export default function ToolsSettings({
   const [config, setConfig] = useState<CardDesignConfigV1>(createDefaultCardDesignConfig);
   const [autoHighlightLookupWords, setAutoHighlightLookupWords] = useState(true);
   const [markerStyle, setMarkerStyle] = useState<MarkerStyleConfigV1>(createDefaultMarkerStyleConfig);
-  const [singleWordClickAction, setSingleWordClickAction] = useState<"menu" | "none">("menu");
   const [doubleClickQuickLookup, setDoubleClickQuickLookup] = useState(true);
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
   const hydratedRef = useRef(false);
@@ -105,7 +103,6 @@ export default function ToolsSettings({
     setConfig(parsed);
     setAutoHighlightLookupWords(settings.auto_highlight_lookup_words !== "false");
     setMarkerStyle(parseMarkerStyleConfig(settings[MARKER_STYLE_SETTING_KEY]));
-    setSingleWordClickAction(settings.single_word_click_action === "none" ? "none" : "menu");
     setDoubleClickQuickLookup(settings.double_click_quick_lookup !== "false");
     hydratedRef.current = true;
   }, [settings, loading]);
@@ -232,37 +229,18 @@ export default function ToolsSettings({
       {view === "interaction" && (
         <div className="mx-auto w-full max-w-[620px]">
           <SettingsRow
-            title={t("settings.tools.interaction.singleClick")}
-            subtitle={t("settings.tools.interaction.singleClickHint")}
+            title={t("settings.tools.interaction.doubleClick")}
+            subtitle={t("settings.tools.interaction.doubleClickHint")}
           >
-            <Select
-              className="w-[150px] shrink-0"
-              value={singleWordClickAction}
-              onChange={(action) => {
-                const next = action === "none" ? "none" : "menu";
-                setSingleWordClickAction(next);
-                persistLegacy("single_word_click_action", next);
+            <Toggle
+              label={t("settings.tools.interaction.doubleClick")}
+              checked={doubleClickQuickLookup}
+              onChange={(enabled) => {
+                setDoubleClickQuickLookup(enabled);
+                persistLegacy("double_click_quick_lookup", String(enabled));
               }}
-              options={[
-                { value: "menu", label: t("settings.tools.interaction.openMenu") },
-                { value: "none", label: t("settings.tools.interaction.noAction") },
-              ]}
             />
           </SettingsRow>
-          <div className="border-t border-border-light">
-            <SettingsRow
-              title={t("settings.tools.interaction.doubleClick")}
-              subtitle={t("settings.tools.interaction.doubleClickHint")}
-            >
-              <Toggle
-                checked={doubleClickQuickLookup}
-                onChange={(enabled) => {
-                  setDoubleClickQuickLookup(enabled);
-                  persistLegacy("double_click_quick_lookup", String(enabled));
-                }}
-              />
-            </SettingsRow>
-          </div>
           <p className="border-t border-border-light px-1 py-3 text-[11px] leading-[18px] text-text-muted">
             {t("settings.tools.interaction.forceClickHint")}
           </p>
@@ -362,6 +340,7 @@ export default function ToolsSettings({
               })}
             >
               <Toggle
+                label={t("settings.tools.autoHighlightLookupWords", { defaultValue: "查词后自动标记" })}
                 checked={autoHighlightLookupWords}
                 onChange={(enabled) => {
                   setAutoHighlightLookupWords(enabled);

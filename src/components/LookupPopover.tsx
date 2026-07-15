@@ -7,7 +7,6 @@ import { useTranslation } from "react-i18next";
 import Markdown from "react-markdown";
 import { LOOKUP_PROSE } from "./lookup-prose";
 import { aiErrorMessageKey, getAiErrorCode, isAiSettingsError, type AiErrorCode } from "../utils/aiError";
-import { invokeWithVaultAccess } from "../utils/vaultAccess";
 
 const TRANSLATION_MARKER = "[[QUILL_TRANSLATION]]";
 
@@ -90,7 +89,7 @@ function useStreamingLookup(
       );
 
       try {
-        await invokeWithVaultAccess("ai_lookup", {
+        await invoke("ai_lookup", {
           word,
           sentence,
           bookTitle: bookTitle || null,

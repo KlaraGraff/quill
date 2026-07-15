@@ -21,4 +21,16 @@ export default tseslint.config(
       ],
     },
   },
+  {
+    files: ["src/components/settings/**/*.{ts,tsx}"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector: "JSXAttribute[name.name='role'][value.value='switch']",
+          message: "Use the shared ui/Toggle component instead of implementing a switch in settings.",
+        },
+      ],
+    },
+  },
 );

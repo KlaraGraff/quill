@@ -2,7 +2,9 @@ import { useState, type DragEvent } from "react";
 import { ArrowDown, ArrowUp, ChevronDown, ChevronRight, GripVertical } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import Select from "../ui/Select";
+import Toggle from "../ui/Toggle";
 import type { CardModuleConfig, LearningModuleDefinition, ModuleDensity } from "../learning-card";
+import { ROW_CONTROL_WIDTH } from "./types";
 
 interface CardModuleRowProps {
   definition: LearningModuleDefinition;
@@ -13,22 +15,6 @@ interface CardModuleRowProps {
   onMove: (from: number, to: number) => void;
   onDragStart: (index: number, event: DragEvent<HTMLElement>) => void;
   onDrop: (index: number, event: DragEvent<HTMLElement>) => void;
-}
-
-function Switch({ checked, disabled, label, onChange }: { checked: boolean; disabled?: boolean; label: string; onChange: (value: boolean) => void }) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={label}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${checked ? "bg-accent" : "bg-border"} disabled:cursor-default disabled:opacity-50`}
-    >
-      <span className={`absolute top-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${checked ? "translate-x-[22px]" : "translate-x-0.5"}`} />
-    </button>
-  );
 }
 
 export default function CardModuleRow({
@@ -102,7 +88,7 @@ export default function CardModuleRow({
           <p className="break-words text-[11px] leading-[1.5] text-text-muted">{t(definition.descriptionKey)}</p>
           <div className="flex min-h-9 items-center justify-between gap-3">
             <span className="text-[12px] text-text-secondary">{t("settings.tools.showModule")}</span>
-            <Switch
+            <Toggle
               checked={value.enabled}
               disabled={definition.required}
               label={t("settings.tools.toggleModule", { name: t(definition.labelKey) })}
@@ -111,7 +97,7 @@ export default function CardModuleRow({
           </div>
           <div className="flex min-h-9 items-center justify-between gap-3">
             <span className="text-[12px] text-text-secondary">{t("settings.tools.expandedByDefault")}</span>
-            <Switch
+            <Toggle
               checked={value.defaultExpanded}
               label={t("settings.tools.toggleExpanded", { name: t(definition.labelKey) })}
               onChange={(defaultExpanded) => onChange({ ...value, defaultExpanded })}
@@ -120,7 +106,7 @@ export default function CardModuleRow({
           <div className="flex min-h-9 items-center justify-between gap-3">
             <span className="text-[12px] text-text-secondary">{t("settings.tools.moduleDensity")}</span>
             <Select
-              className="w-[132px] shrink-0"
+              className={ROW_CONTROL_WIDTH}
               value={value.density}
               onChange={(density) => onChange({ ...value, density: density as ModuleDensity })}
               options={[

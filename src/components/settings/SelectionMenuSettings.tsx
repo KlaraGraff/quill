@@ -1,6 +1,7 @@
 import { useState, type DragEvent } from "react";
 import { ArrowDown, ArrowUp, GripVertical } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import Toggle from "../ui/Toggle";
 import {
   MENU_ACTION_DEFINITIONS,
   reorderArray,
@@ -12,21 +13,6 @@ interface SelectionMenuSettingsProps {
   kind: SelectionMenuKind;
   value: SelectionMenuItemConfig[];
   onChange: (value: SelectionMenuItemConfig[]) => void;
-}
-
-function Switch({ checked, label, onChange }: { checked: boolean; label: string; onChange: (value: boolean) => void }) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={label}
-      onClick={() => onChange(!checked)}
-      className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${checked ? "bg-accent" : "bg-border"}`}
-    >
-      <span className={`absolute top-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${checked ? "translate-x-[22px]" : "translate-x-0.5"}`} />
-    </button>
-  );
 }
 
 export default function SelectionMenuSettings({ kind, value, onChange }: SelectionMenuSettingsProps) {
@@ -98,7 +84,7 @@ export default function SelectionMenuSettings({ kind, value, onChange }: Selecti
               >
                 <ArrowDown size={12} />
               </button>
-              <Switch
+              <Toggle
                 checked={item.enabled}
                 label={t("settings.tools.toggleMenuAction", { name: label })}
                 onChange={(enabled) => onChange(value.map((current, itemIndex) => itemIndex === index ? { ...current, enabled } : current))}

@@ -1,6 +1,5 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { invokeWithVaultAccess } from "../../utils/vaultAccess";
 import { Bookmark, Copy, Highlighter, Languages, Loader2, MessageSquareMore, RotateCcw, WandSparkles } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
@@ -80,8 +79,11 @@ export default function CardPreview({
 }: CardPreviewProps) {
   const { t } = useTranslation();
   const frameRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const previewRequestRef = useRef<string | null>(null);
   const [availableWidth, setAvailableWidth] = useState(704);
+  const [availableHeight, setAvailableHeight] = useState(430);
+  const [menuHeight, setMenuHeight] = useState(0);
   const [realResult, setRealResult] = useState<LearningCardResult | null>(null);
   const [realLoading, setRealLoading] = useState(false);
   const [realError, setRealError] = useState<string | null>(null);
@@ -169,12 +171,18 @@ export default function CardPreview({
   useEffect(() => {
     const element = frameRef.current;
     if (!element) return;
-    const update = () => setAvailableWidth(Math.max(0, Math.round(element.getBoundingClientRect().width)));
+    const update = () => {
+      const rect = element.getBoundingClientRect();
+      setAvailableWidth(Math.max(0, Math.round(rect.width)));
+      setAvailableHeight(Math.max(0, Math.round(rect.height)));
+      setMenuHeight(Math.max(0, Math.round(menuRef.current?.getBoundingClientRect().height ?? 0)));
+    };
     update();
     const observer = new ResizeObserver(update);
     observer.observe(element);
+    if (menuRef.current) observer.observe(menuRef.current);
     return () => observer.disconnect();
-  }, []);
+  }, [showMenu]);
 
   const menuKind: SelectionMenuKind = kind;
   const previewMarkStates: PreviewMarkState[] = kind === "word"
@@ -194,7 +202,7 @@ export default function CardPreview({
     setRealLoading(true);
     setRealError(null);
     try {
-      const response = await invokeWithVaultAccess<LearningCardResult>("ai_learning_card", {
+      const response = await invoke<LearningCardResult>("ai_learning_card", {
         text: localResult.sourceText,
         context: localResult.modules.source_excerpt?.quote ?? localResult.sourceText,
         kind,
@@ -217,7 +225,7 @@ export default function CardPreview({
   };
 
   return (
-    <div className="min-w-0 lg:sticky lg:top-0">
+    <div className="flex h-full min-h-0 min-w-0 flex-col lg:sticky lg:top-0">
       <div className="mb-2 flex min-h-8 items-center justify-between gap-3">
         <div>
           <p className="text-[10px] font-semibold uppercase tracking-[0.3px] text-text-muted">
@@ -256,10 +264,10 @@ export default function CardPreview({
       {realError && <p role="alert" className="mb-2 break-words text-[11px] text-danger-text">{realError}</p>}
       <div
         ref={frameRef}
-        className="flex min-h-[460px] min-w-0 flex-col items-center gap-3 overflow-hidden rounded-md border border-border bg-bg-muted p-3"
+        className="flex min-h-[460px] min-w-0 flex-1 flex-col items-center gap-3 overflow-hidden rounded-md border border-border bg-bg-muted p-3"
       >
         {showMenu && (
-          <div className="flex max-w-full flex-col items-center gap-2">
+          <div ref={menuRef} className="flex max-w-full shrink-0 flex-col items-center gap-2">
             <div className="flex items-center gap-2 text-[10px] text-text-muted">
               <span>{t("settings.tools.menu.previewState")}</span>
               <div className="flex rounded-md bg-bg-input p-0.5">
@@ -322,7 +330,7 @@ export default function CardPreview({
           result={result}
           config={config}
           availableWidth={availableWidth}
-          maxHeight={showMenu ? 400 : 430}
+          maxHeight={Math.max(360, availableHeight - 24 - (showMenu ? menuHeight + 12 : 0))}
           presentationMode
         />
       </div>
