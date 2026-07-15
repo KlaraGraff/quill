@@ -23,7 +23,7 @@ interface CardPreviewProps {
   learnerLevel?: string;
   explanationMode?: string;
   showMenu?: boolean;
-  lastTouchedId?: string | null;
+  lastTouched?: { id: string; nonce: number } | null;
   testText?: string;
   testNonce?: number;
   customActionTest?: { name: string; prompt: string; text: string; nonce: number };
@@ -74,6 +74,68 @@ const ADAPTIVE_EXPLANATION_PREVIEWS: Record<
   },
 };
 
+const SCROLL_DURATION_MS = 350;
+const TARGET_WAIT_MS = 1_200;
+
+function easeInOutCubic(progress: number) {
+  return progress < 0.5
+    ? 4 * progress * progress * progress
+    : 1 - Math.pow(-2 * progress + 2, 3) / 2;
+}
+
+function scrollToModule(
+  container: HTMLElement,
+  target: HTMLElement,
+  onComplete: () => void,
+): () => void {
+  const containerRect = container.getBoundingClientRect();
+  const targetRect = target.getBoundingClientRect();
+  const start = container.scrollTop;
+  const desired = start
+    + targetRect.top
+    - containerRect.top
+    - (container.clientHeight - targetRect.height) / 2;
+  const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
+  const destination = Math.max(0, Math.min(maxScroll, desired));
+  const distance = destination - start;
+  let animationFrame = 0;
+  let cancelled = false;
+  let startedAt: number | null = null;
+
+  const cancel = () => {
+    cancelled = true;
+    window.cancelAnimationFrame(animationFrame);
+    container.removeEventListener("wheel", cancel);
+    container.removeEventListener("touchstart", cancel);
+    container.removeEventListener("pointerdown", cancel);
+  };
+  const finish = () => {
+    cancel();
+    onComplete();
+  };
+  const step = (timestamp: number) => {
+    if (cancelled) return;
+    startedAt ??= timestamp;
+    const progress = Math.min(1, (timestamp - startedAt) / SCROLL_DURATION_MS);
+    container.scrollTop = start + distance * easeInOutCubic(progress);
+    if (progress < 1) {
+      animationFrame = window.requestAnimationFrame(step);
+    } else {
+      finish();
+    }
+  };
+
+  container.addEventListener("wheel", cancel, { passive: true });
+  container.addEventListener("touchstart", cancel, { passive: true });
+  container.addEventListener("pointerdown", cancel, { passive: true });
+  if (Math.abs(distance) < 1) {
+    finish();
+  } else {
+    animationFrame = window.requestAnimationFrame(step);
+  }
+  return cancel;
+}
+
 export default function CardPreview({
   kind,
   config,
@@ -82,7 +144,7 @@ export default function CardPreview({
   learnerLevel = "B1",
   explanationMode = "adaptive_bilingual",
   showMenu = false,
-  lastTouchedId = null,
+  lastTouched = null,
   testText,
   testNonce,
   customActionTest,
@@ -91,6 +153,10 @@ export default function CardPreview({
   const frameRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const previewRequestRef = useRef<string | null>(null);
+  const scrollCancelRef = useRef<(() => void) | null>(null);
+  const targetFrameRef = useRef(0);
+  const highlightTimerRef = useRef(0);
+  const scrollContextRef = useRef({ config, kind, lastTouched });
   const [availableWidth, setAvailableWidth] = useState(704);
   const [availableHeight, setAvailableHeight] = useState(430);
   const [menuHeight, setMenuHeight] = useState(0);
@@ -156,8 +222,16 @@ export default function CardPreview({
         },
       };
     }
+    for (const module of config.cards[kind].modules) {
+      if (!module.enabled || !module.id.startsWith("custom_")) continue;
+      const definition = config.cards[kind].customModules[module.id as `custom_${string}`];
+      if (!definition) continue;
+      fixture.modules[module.id] = {
+        summary: t("settings.tools.custom.previewPlaceholder", { name: definition.name }),
+      };
+    }
     return fixture;
-  }, [explanationLanguage, explanationMode, kind, learnerLevel, targetLanguage]);
+  }, [config, explanationLanguage, explanationMode, kind, learnerLevel, t, targetLanguage]);
 
   useEffect(() => {
     if (previewRequestRef.current) {
@@ -198,20 +272,62 @@ export default function CardPreview({
   }, [showMenu]);
 
   useEffect(() => {
-    if (!lastTouchedId) return;
-    const timer = window.setTimeout(() => {
-      const escaped = CSS.escape(lastTouchedId);
+    scrollContextRef.current = { config, kind, lastTouched };
+  }, [config, kind, lastTouched]);
+
+  useEffect(() => {
+    const { config: currentConfig, kind: currentKind, lastTouched: currentTouch } = scrollContextRef.current;
+    if (!currentTouch) return;
+    const { id } = currentTouch;
+    const cardModule = currentConfig.cards[currentKind].modules.find((module) => module.id === id);
+    const menuItem = currentConfig.selectionMenus[currentKind].find((item) => item.id === id);
+    if (cardModule && !cardModule.enabled) return;
+    if (menuItem && !menuItem.enabled) return;
+
+    scrollCancelRef.current?.();
+    window.cancelAnimationFrame(targetFrameRef.current);
+    window.clearTimeout(highlightTimerRef.current);
+    const startedAt = performance.now();
+    let disposed = false;
+    const highlight = () => {
+      if (disposed) return;
+      setHighlightedId(id);
+      highlightTimerRef.current = window.setTimeout(() => {
+        setHighlightedId((current) => current === id ? null : current);
+      }, 800);
+    };
+    const findTarget = () => {
+      if (disposed) return;
+      const escaped = CSS.escape(id);
       const target = frameRef.current?.querySelector<HTMLElement>(
         `[data-module-id="${escaped}"],[data-menu-id="${escaped}"]`,
       );
-      target?.scrollIntoView({ block: "center", behavior: "smooth" });
-      setHighlightedId(lastTouchedId);
-      window.setTimeout(() => {
-        setHighlightedId((current) => current === lastTouchedId ? null : current);
-      }, 800);
-    }, 300);
-    return () => window.clearTimeout(timer);
-  }, [lastTouchedId]);
+      if (target && !target.closest('[data-module-exiting="true"]')) {
+        const container = target.closest<HTMLElement>("[data-card-scroll]");
+        scrollCancelRef.current = container
+          ? scrollToModule(container, target, highlight)
+          : null;
+        if (!container) highlight();
+        return;
+      }
+      if (performance.now() - startedAt < TARGET_WAIT_MS) {
+        targetFrameRef.current = window.requestAnimationFrame(findTarget);
+      }
+    };
+    targetFrameRef.current = window.requestAnimationFrame(findTarget);
+    return () => {
+      disposed = true;
+      window.cancelAnimationFrame(targetFrameRef.current);
+      scrollCancelRef.current?.();
+      scrollCancelRef.current = null;
+    };
+  }, [lastTouched?.nonce]);
+
+  useEffect(() => () => {
+    window.cancelAnimationFrame(targetFrameRef.current);
+    window.clearTimeout(highlightTimerRef.current);
+    scrollCancelRef.current?.();
+  }, []);
 
   const menuKind: SelectionMenuKind = kind;
   const previewMarkStates: PreviewMarkState[] = kind === "word"
@@ -437,6 +553,7 @@ export default function CardPreview({
           maxHeight={Math.max(360, availableHeight - 24 - (showMenu ? menuHeight + 12 : 0))}
           presentationMode
           highlightedModuleId={highlightedId}
+          animateModuleChanges
         />
       </div>
     </div>

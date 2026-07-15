@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, type ReactNode } from "react";
+import { useState, useEffect, useRef, useCallback, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { Globe, BookOpen, Bot, GraduationCap, Cloud, Info, Terminal, X, ChevronRight, Palette } from "lucide-react";
 import GeneralSettings from "./settings/GeneralSettings";
@@ -43,9 +43,30 @@ export default function SettingsModal({ open, onClose, initialSection = "general
   const previewPreviousFocusRef = useRef<HTMLElement | null>(null);
   const toolsPreviewRef = useRef<ToolsPreviewState | null>(null);
   const overlayPreviewRef = useRef(false);
+  const toolsNavigationGuardRef = useRef<((action: () => void) => void) | null>(null);
   const onCloseRef = useRef(onClose);
   const [isXlViewport, setIsXlViewport] = useState(() => window.matchMedia(XL_PREVIEW_QUERY).matches);
   const overlayPreviewOpen = toolsPreview !== null && !isXlViewport;
+  const setToolsNavigationGuard = useCallback((guard: ((action: () => void) => void) | null) => {
+    toolsNavigationGuardRef.current = guard;
+  }, []);
+  const requestClose = useCallback(() => {
+    const close = () => onCloseRef.current();
+    if (toolsNavigationGuardRef.current) {
+      toolsNavigationGuardRef.current(close);
+    } else {
+      close();
+    }
+  }, []);
+  const requestSection = (section: SettingsSection) => {
+    if (section === activeSection) return;
+    const changeSection = () => setActiveSection(section);
+    if (toolsNavigationGuardRef.current) {
+      toolsNavigationGuardRef.current(changeSection);
+    } else {
+      changeSection();
+    }
+  };
 
   // Toast state
   const [showToast, setShowToast] = useState(false);
@@ -97,7 +118,7 @@ export default function SettingsModal({ open, onClose, initialSection = "general
         if (preview) {
           preview.onDismiss();
         } else {
-          onCloseRef.current();
+          requestClose();
         }
         return;
       }
@@ -126,7 +147,7 @@ export default function SettingsModal({ open, onClose, initialSection = "general
       previousFocusRef.current?.focus();
       previousFocusRef.current = null;
     };
-  }, [open]);
+  }, [open, requestClose]);
 
   useEffect(() => {
     if (!overlayPreviewOpen) return;
@@ -169,7 +190,13 @@ export default function SettingsModal({ open, onClose, initialSection = "general
       case "appearance": return <AppearanceSettings {...settingsProps} />;
       case "reading": return <ReadingSettings {...settingsProps} />;
       case "ai": return <AiSettings {...settingsProps} onDirtyChange={setAiDirty} onSaveRef={(fn) => { aiSaveRef.current = fn; }} />;
-      case "tools": return <ToolsSettings {...settingsProps} onPreviewChange={setToolsPreview} />;
+      case "tools": return (
+        <ToolsSettings
+          {...settingsProps}
+          onPreviewChange={setToolsPreview}
+          onNavigationGuardChange={setToolsNavigationGuard}
+        />
+      );
       case "librarySync": return <LibrarySyncSettings {...settingsProps} />;
       case "mcp": return <McpSettings {...settingsProps} />;
       case "about": return <AboutSettings />;
@@ -182,7 +209,7 @@ export default function SettingsModal({ open, onClose, initialSection = "general
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-overlay"
       onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        if (e.target === e.currentTarget) requestClose();
       }}
     >
       <div
@@ -219,7 +246,7 @@ export default function SettingsModal({ open, onClose, initialSection = "general
                 return (
                   <button
                     key={section.id}
-                    onClick={() => setActiveSection(section.id)}
+                    onClick={() => requestSection(section.id)}
                     className={`flex h-[44px] w-full cursor-pointer items-center gap-2 rounded-[6px] px-2 text-left transition-colors sm:h-[56px] sm:gap-3 sm:rounded-[8px] sm:px-3 ${
                       isActive ? "bg-accent-bg" : "hover:bg-bg-input"
                     }`}
@@ -268,7 +295,7 @@ export default function SettingsModal({ open, onClose, initialSection = "general
                 </button>
               )}
               <button
-                onClick={onClose}
+                onClick={requestClose}
                 aria-label={t("common.close")}
                 title={t("common.close")}
                 className="size-7 flex items-center justify-center rounded-[10px] hover:bg-bg-input cursor-pointer"
@@ -333,7 +360,7 @@ export default function SettingsModal({ open, onClose, initialSection = "general
                 learnerLevel={toolsPreview.learnerLevel}
                 explanationMode={toolsPreview.explanationMode}
                 showMenu={toolsPreview.showMenu}
-                lastTouchedId={toolsPreview.lastTouchedId}
+                lastTouched={toolsPreview.lastTouched}
                 testText={toolsPreview.testText}
                 testNonce={toolsPreview.testNonce}
                 customActionTest={toolsPreview.customActionTest}

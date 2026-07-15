@@ -22,12 +22,21 @@ import {
 import Button from "../ui/Button";
 import Select from "../ui/Select";
 import Toggle from "../ui/Toggle";
+import ConfirmDialog from "./ConfirmDialog";
 
 export interface CustomImportSource {
   kind: LearningCardKind;
   id: CustomLearningId;
   name: string;
   prompt: string;
+}
+
+export interface UnsavedEditorController {
+  dirty: boolean;
+  canSave: boolean;
+  name: string;
+  save: () => boolean;
+  discard: () => void;
 }
 
 interface CustomActionEditorProps {
@@ -37,6 +46,20 @@ interface CustomActionEditorProps {
   onSave: (value: CustomLearningDefinition) => void;
   onDelete: () => void;
   onTest: (text: string, draft: CustomLearningDefinition) => void;
+  onDiscard?: () => void;
+  onGuardChange?: (controller: UnsavedEditorController | null) => void;
+  namePlaceholder?: string;
+  promptPlaceholder?: string;
+}
+
+function comparableDefinition(value: CustomLearningDefinition) {
+  return {
+    name: value.name.trim(),
+    prompt: value.prompt.trim(),
+    sourceRef: value.sourceRef ?? null,
+    follow: value.follow === true,
+    dirtySinceImport: value.dirtySinceImport === true,
+  };
 }
 
 export default function CustomActionEditor({
@@ -46,6 +69,10 @@ export default function CustomActionEditor({
   onSave,
   onDelete,
   onTest,
+  onDiscard,
+  onGuardChange,
+  namePlaceholder,
+  promptPlaceholder,
 }: CustomActionEditorProps) {
   const { t } = useTranslation();
   const [draft, setDraft] = useState(value);
@@ -56,15 +83,47 @@ export default function CustomActionEditor({
   const [history, setHistory] = useState<[string, string] | null>(null);
   const [historyIndex, setHistoryIndex] = useState<0 | 1>(1);
   const [optimizeLocked, setOptimizeLocked] = useState(false);
+  const [overwriteSource, setOverwriteSource] = useState<CustomImportSource | null>(null);
   const requestRef = useRef<string | null>(null);
+  const onSaveRef = useRef(onSave);
+  const onDiscardRef = useRef(onDiscard);
 
   useEffect(() => {
     setDraft(value);
     setOptimizeLocked(false);
   }, [value]);
+  useEffect(() => {
+    onSaveRef.current = onSave;
+    onDiscardRef.current = onDiscard;
+  }, [onDiscard, onSave]);
   useEffect(() => () => {
     if (requestRef.current) void invoke("ai_cancel", { requestId: requestRef.current });
   }, []);
+
+  const dirty = JSON.stringify(comparableDefinition(draft)) !== JSON.stringify(comparableDefinition(value));
+  const canSave = Boolean(draft.name.trim() && draft.prompt.trim());
+  useEffect(() => {
+    onGuardChange?.({
+      dirty,
+      canSave,
+      name: draft.name.trim(),
+      save: () => {
+        if (!canSave) return false;
+        onSaveRef.current({
+          ...draft,
+          name: draft.name.trim(),
+          prompt: draft.prompt.trim(),
+          updatedAt: Date.now(),
+        });
+        return true;
+      },
+      discard: () => {
+        setDraft(value);
+        onDiscardRef.current?.();
+      },
+    });
+  }, [canSave, dirty, draft, onGuardChange, value]);
+  useEffect(() => () => onGuardChange?.(null), [onGuardChange]);
 
   const edit = (patch: Partial<CustomLearningDefinition>) => {
     setDraft((current) => ({
@@ -136,6 +195,17 @@ export default function CustomActionEditor({
   const source = draft.sourceRef
     ? importSources.find((item) => item.kind === draft.sourceRef?.kind && item.id === draft.sourceRef?.id)
     : undefined;
+  const followSource = (nextSource: CustomImportSource) => {
+    setDraft((current) => ({
+      ...current,
+      name: nextSource.name,
+      prompt: nextSource.prompt,
+      follow: true,
+      dirtySinceImport: false,
+      updatedAt: Date.now(),
+    }));
+    setOverwriteSource(null);
+  };
 
   return (
     <div className="space-y-3 rounded-md bg-bg-muted p-3" data-no-drag>
@@ -143,6 +213,7 @@ export default function CustomActionEditor({
         <span className="mb-1 block text-[11px] text-text-muted">{t("settings.tools.custom.name")}</span>
         <input
           value={draft.name}
+          placeholder={namePlaceholder}
           maxLength={MAX_CUSTOM_NAME_LENGTH}
           onChange={(event) => edit({ name: event.target.value })}
           className="h-9 w-full rounded-md border border-border bg-bg-surface px-3 text-[12px] text-text-primary outline-none focus:border-accent"
@@ -153,6 +224,7 @@ export default function CustomActionEditor({
         <span className="relative block">
           <textarea
             value={draft.prompt}
+            placeholder={promptPlaceholder}
             maxLength={MAX_CUSTOM_PROMPT_LENGTH}
             rows={5}
             onChange={(event) => edit({ prompt: event.target.value })}
@@ -234,15 +306,11 @@ export default function CustomActionEditor({
                 return;
               }
               if (!source) return;
-              if (draft.dirtySinceImport && !window.confirm(t("settings.tools.custom.overwriteConfirm", { name: source.name }))) return;
-              setDraft((current) => ({
-                ...current,
-                name: source.name,
-                prompt: source.prompt,
-                follow: true,
-                dirtySinceImport: false,
-                updatedAt: Date.now(),
-              }));
+              if (draft.dirtySinceImport) {
+                setOverwriteSource(source);
+                return;
+              }
+              followSource(source);
             }}
           />
         </div>
@@ -267,14 +335,38 @@ export default function CustomActionEditor({
           className="flex h-8 items-center gap-1.5 rounded-md px-2 text-[11px] text-danger-text hover:bg-danger-bg"
         ><Trash2 size={13} />{t("common.delete")}</button>
         <div className="flex gap-2">
-          <Button variant="ghost" size="sm" onClick={() => setDraft(value)}><X size={13} />{t("common.cancel")}</Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              setDraft(value);
+              onDiscardRef.current?.();
+            }}
+          ><X size={13} />{t("common.cancel")}</Button>
           <Button
             size="sm"
-            disabled={!draft.name.trim() || !draft.prompt.trim()}
-            onClick={() => onSave({ ...draft, name: draft.name.trim(), prompt: draft.prompt.trim(), updatedAt: Date.now() })}
+            disabled={!canSave}
+            onClick={() => {
+              onSaveRef.current({
+                ...draft,
+                name: draft.name.trim(),
+                prompt: draft.prompt.trim(),
+                updatedAt: Date.now(),
+              });
+            }}
           ><Save size={13} />{t("common.save")}</Button>
         </div>
       </div>
+      {overwriteSource && (
+        <ConfirmDialog
+          title={t("settings.tools.custom.overwriteTitle", { name: overwriteSource.name })}
+          description={t("settings.tools.custom.overwriteConfirm", { name: overwriteSource.name })}
+          primaryLabel={t("settings.tools.custom.overwrite")}
+          onPrimary={() => followSource(overwriteSource)}
+          secondaryLabel={t("common.cancel")}
+          onSecondary={() => setOverwriteSource(null)}
+        />
+      )}
     </div>
   );
 }

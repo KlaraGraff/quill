@@ -1,4 +1,5 @@
 import { CircleHelp, Plus } from "lucide-react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import Select from "../ui/Select";
 import SortableList from "../ui/SortableList";
@@ -15,7 +16,10 @@ import {
   type CustomLearningId,
 } from "../learning-card";
 import CardModuleRow from "./CardModuleRow";
-import CustomActionEditor, { type CustomImportSource } from "./CustomActionEditor";
+import CustomActionEditor, {
+  type CustomImportSource,
+  type UnsavedEditorController,
+} from "./CustomActionEditor";
 import { ROW_CONTROL_WIDTH, ROW_CONTROL_WIDTH_COMPACT } from "./types";
 
 interface CardDesignSettingsProps {
@@ -26,10 +30,29 @@ interface CardDesignSettingsProps {
   onTouched?: (id: string) => void;
   importSources: CustomImportSource[];
   onTest: (text: string, customId: CustomLearningId, draft: CustomLearningDefinition, card: CardKindConfig) => void;
+  requestNavigation: (action: () => void) => void;
+  onEditorGuardChange: (controller: UnsavedEditorController | null) => void;
 }
 
-export default function CardDesignSettings({ kind, value, onChange, onOpenDensityHelp, onTouched, importSources, onTest }: CardDesignSettingsProps) {
+interface NewModuleDraft {
+  module: CardModuleConfig;
+  definition: CustomLearningDefinition;
+}
+
+export default function CardDesignSettings({
+  kind,
+  value,
+  onChange,
+  onOpenDensityHelp,
+  onTouched,
+  importSources,
+  onTest,
+  requestNavigation,
+  onEditorGuardChange,
+}: CardDesignSettingsProps) {
   const { t } = useTranslation();
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [newModule, setNewModule] = useState<NewModuleDraft | null>(null);
   const definitions = new Map(MODULE_DEFINITIONS[kind].map((item) => [item.id, item]));
 
   const updateModule = (index: number, module: CardModuleConfig) => {
@@ -41,6 +64,15 @@ export default function CardDesignSettings({ kind, value, onChange, onOpenDensit
     const modules = reorderArray(value.modules, from, to);
     if (modules !== value.modules) onChange({ ...value, modules });
     if (modules !== value.modules && value.modules[from]) onTouched?.(value.modules[from].id);
+  };
+  const toggleOpen = (id: string) => {
+    const nextId = openId === id ? null : id;
+    requestNavigation(() => {
+      if (newModule && openId === newModule.module.id && nextId !== newModule.module.id) {
+        setNewModule(null);
+      }
+      setOpenId(nextId);
+    });
   };
 
   return (
@@ -155,6 +187,8 @@ export default function CardDesignSettings({ kind, value, onChange, onOpenDensit
                 total={value.modules.length}
                 onChange={(next) => updateModule(index, next)}
                 onMove={move}
+                open={openId === module.id}
+                onToggleOpen={() => toggleOpen(module.id)}
                 editor={custom ? (
                   <CustomActionEditor
                     value={custom}
@@ -170,30 +204,83 @@ export default function CardDesignSettings({ kind, value, onChange, onOpenDensit
                       onChange({ ...value, modules: value.modules.filter((item) => item.id !== module.id), customModules });
                     }}
                     onTest={(text, draft) => onTest(text, module.id as CustomLearningId, draft, value)}
+                    onGuardChange={onEditorGuardChange}
                   />
                 ) : undefined}
               />
             );
           }}
         />
-        {Object.keys(value.customModules).length < MAX_CUSTOM_CARD_MODULES && (
+        {newModule && (
+          <CardModuleRow
+            definition={{
+              id: newModule.module.id,
+              labelKey: t("settings.tools.custom.newModule"),
+              descriptionKey: "settings.tools.custom.moduleHint",
+              custom: true,
+            }}
+            value={newModule.module}
+            index={value.modules.length}
+            total={value.modules.length + 1}
+            onChange={(module) => setNewModule((current) => current ? { ...current, module } : current)}
+            onMove={() => {}}
+            open={openId === newModule.module.id}
+            onToggleOpen={() => toggleOpen(newModule.module.id)}
+            unsaved
+            editor={(
+              <CustomActionEditor
+                value={newModule.definition}
+                importSources={importSources}
+                testPlaceholder={kind === "word" ? "serendipity" : kind === "phrase" ? "by and large" : "New ideas often emerge where established fields meet."}
+                namePlaceholder={t("settings.tools.custom.namePlaceholder")}
+                promptPlaceholder={t("settings.tools.custom.promptPlaceholder")}
+                onSave={(definition) => {
+                  onChange({
+                    ...value,
+                    modules: [...value.modules, newModule.module],
+                    customModules: {
+                      ...value.customModules,
+                      [newModule.module.id as CustomLearningId]: definition,
+                    },
+                  });
+                  setNewModule(null);
+                  onTouched?.(newModule.module.id);
+                }}
+                onDelete={() => {
+                  setNewModule(null);
+                  setOpenId(null);
+                }}
+                onDiscard={() => {
+                  setNewModule(null);
+                  setOpenId(null);
+                }}
+                onTest={(text, definition) => onTest(
+                  text,
+                  newModule.module.id as CustomLearningId,
+                  definition,
+                  {
+                    ...value,
+                    modules: [...value.modules, newModule.module],
+                  },
+                )}
+                onGuardChange={onEditorGuardChange}
+              />
+            )}
+          />
+        )}
+        {!newModule && Object.keys(value.customModules).length < MAX_CUSTOM_CARD_MODULES && (
           <button
             type="button"
             onClick={() => {
               const id = `custom_${crypto.randomUUID().replace(/-/g, "")}` as CustomLearningId;
               const now = Date.now();
-              const custom: CustomLearningDefinition = {
-                name: t("settings.tools.custom.defaultModuleName"),
-                prompt: t("settings.tools.custom.defaultPrompt"),
-                createdAt: now,
-                updatedAt: now,
-              };
-              onChange({
-                ...value,
-                modules: [...value.modules, { id, enabled: true, defaultExpanded: true, density: "inherit" }],
-                customModules: { ...value.customModules, [id]: custom },
+              requestNavigation(() => {
+                setNewModule({
+                  module: { id, enabled: true, defaultExpanded: true, density: "inherit" },
+                  definition: { name: "", prompt: "", createdAt: now, updatedAt: now },
+                });
+                setOpenId(id);
               });
-              onTouched?.(id);
             }}
             className="mt-2 flex h-8 items-center gap-1.5 rounded-md px-2 text-[11px] font-medium text-accent-text hover:bg-accent-bg"
           ><Plus size={13} />{t("settings.tools.custom.addModule")}</button>

@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { getEffectiveDensity, MODULE_DEFINITIONS } from "./config";
@@ -17,6 +17,15 @@ interface LearningCardModulesProps {
   content: Partial<Record<LearningModuleId, LearningModuleContent>>;
   loading?: boolean;
   highlightedModuleId?: string | null;
+  animateChanges?: boolean;
+}
+
+interface RenderedModule {
+  config: CardModuleConfig;
+  labelKey: string;
+  content?: LearningModuleContent;
+  visible: boolean;
+  animateEntrance: boolean;
 }
 
 function hasContent(content: LearningModuleContent | undefined) {
@@ -179,40 +188,140 @@ function ModuleSection({
   );
 }
 
-export default function LearningCardModules({ card, kind, content, loading = false, highlightedModuleId }: LearningCardModulesProps) {
-  const definitions = new Map(MODULE_DEFINITIONS[kind].map((item) => [item.id, item]));
-  const enabledModules = card.modules.filter((module) => module.enabled);
-  const lastCompletedIndex = enabledModules.reduce(
-    (last, module, index) => hasContent(content[module.id]) ? index : last,
-    -1,
+function AnimatedModule({
+  entry,
+  card,
+  loading,
+  highlighted,
+  onExited,
+}: {
+  entry: RenderedModule;
+  card: CardKindConfig;
+  loading: boolean;
+  highlighted: boolean;
+  onExited: () => void;
+}) {
+  const [shown, setShown] = useState(entry.visible && !entry.animateEntrance);
+
+  useEffect(() => {
+    if (!entry.visible) {
+      setShown(false);
+      const fallback = window.setTimeout(onExited, 300);
+      return () => window.clearTimeout(fallback);
+    }
+    const frame = window.requestAnimationFrame(() => setShown(true));
+    return () => window.cancelAnimationFrame(frame);
+  }, [entry.visible, onExited]);
+
+  return (
+    <div
+      data-module-exiting={entry.visible ? undefined : "true"}
+      className={`grid transition-[grid-template-rows,opacity] duration-[240ms] ease-in-out ${
+        shown ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0"
+      }`}
+      onTransitionEnd={(event) => {
+        if (event.currentTarget === event.target && !entry.visible && !shown) onExited();
+      }}
+    >
+      <div className="min-h-0 overflow-hidden">
+        <ModuleSection
+          config={entry.config}
+          card={card}
+          labelKey={entry.labelKey}
+          content={entry.content}
+          loading={loading}
+          highlighted={highlighted}
+        />
+      </div>
+    </div>
   );
-  const visibleModules = loading
-    ? enabledModules.slice(0, Math.min(enabledModules.length, Math.max(1, lastCompletedIndex + 2)))
-    : enabledModules;
+}
+
+export default function LearningCardModules({
+  card,
+  kind,
+  content,
+  loading = false,
+  highlightedModuleId,
+  animateChanges = false,
+}: LearningCardModulesProps) {
+  const currentModules = useMemo(() => {
+    const definitions = new Map(MODULE_DEFINITIONS[kind].map((item) => [item.id, item]));
+    const enabledModules = card.modules.filter((module) => module.enabled);
+    const lastCompletedIndex = enabledModules.reduce(
+      (last, module, index) => hasContent(content[module.id]) ? index : last,
+      -1,
+    );
+    const visibleModules = loading
+      ? enabledModules.slice(0, Math.min(enabledModules.length, Math.max(1, lastCompletedIndex + 2)))
+      : enabledModules;
+    return visibleModules.flatMap((module): RenderedModule[] => {
+      const custom = module.id.startsWith("custom_") ? card.customModules[module.id as `custom_${string}`] : undefined;
+      const definition = definitions.get(module.id) ?? (custom ? {
+        id: module.id,
+        labelKey: custom.name,
+        descriptionKey: "",
+        custom: true,
+      } : undefined);
+      return definition ? [{
+        config: module,
+        labelKey: definition.labelKey,
+        content: content[module.id],
+        visible: true,
+        animateEntrance: false,
+      }] : [];
+    });
+  }, [card, content, kind, loading]);
+  const [animatedModules, setAnimatedModules] = useState<RenderedModule[]>(currentModules);
+  const currentIdsRef = useRef(new Set(currentModules.map((entry) => entry.config.id)));
+
+  useEffect(() => {
+    currentIdsRef.current = new Set(currentModules.map((entry) => entry.config.id));
+  }, [currentModules]);
+
+  useEffect(() => {
+    if (!animateChanges) return;
+    setAnimatedModules((previous) => {
+      const previousById = new Map(previous.map((entry) => [entry.config.id, entry]));
+      const currentIds = new Set(currentModules.map((entry) => entry.config.id));
+      const next = currentModules.map((entry) => ({
+        ...entry,
+        animateEntrance: !previousById.has(entry.config.id),
+      }));
+      for (const entry of previous) {
+        if (!currentIds.has(entry.config.id)) next.push({ ...entry, visible: false });
+      }
+      return next;
+    });
+  }, [animateChanges, currentModules]);
+
+  const renderedModules = animateChanges ? animatedModules : currentModules;
 
   return (
     <div className="divide-y divide-border/60" aria-busy={loading || undefined}>
-      {visibleModules.map((module) => {
-        const custom = module.id.startsWith("custom_") ? card.customModules[module.id as `custom_${string}`] : undefined;
-        const definition = definitions.get(module.id) ?? (custom ? {
-          id: module.id,
-          labelKey: custom.name,
-          descriptionKey: "",
-          custom: true,
-        } : undefined);
-        if (!definition) return null;
-        return (
+      {renderedModules.map((entry) => animateChanges ? (
+        <AnimatedModule
+          key={entry.config.id}
+          entry={entry}
+          card={card}
+          loading={loading}
+          highlighted={highlightedModuleId === entry.config.id}
+          onExited={() => {
+            if (currentIdsRef.current.has(entry.config.id)) return;
+            setAnimatedModules((current) => current.filter((item) => item.config.id !== entry.config.id));
+          }}
+        />
+      ) : (
           <ModuleSection
-            key={module.id}
-            config={module}
+            key={entry.config.id}
+            config={entry.config}
             card={card}
-            labelKey={definition.custom ? definition.labelKey : definition.labelKey}
-            content={content[module.id]}
+            labelKey={entry.labelKey}
+            content={entry.content}
             loading={loading}
-            highlighted={highlightedModuleId === module.id}
+            highlighted={highlightedModuleId === entry.config.id}
           />
-        );
-      })}
+      ))}
     </div>
   );
 }

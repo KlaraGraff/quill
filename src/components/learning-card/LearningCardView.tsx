@@ -44,6 +44,7 @@ interface LearningCardViewProps {
   onViewAllNotes?: () => void;
   noteScope?: "book" | "global";
   highlightedModuleId?: string | null;
+  animateModuleChanges?: boolean;
   onNoteScopeChange?: (scope: "book" | "global") => void;
 }
 
@@ -74,6 +75,7 @@ export default function LearningCardView({
   onViewAllNotes,
   noteScope,
   highlightedModuleId,
+  animateModuleChanges = false,
   onNoteScopeChange,
 }: LearningCardViewProps) {
   const { t } = useTranslation();
@@ -127,7 +129,7 @@ export default function LearningCardView({
         )}
       </header>
 
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div className="min-h-0 flex-1 overflow-y-auto" data-card-scroll>
         {error ? (
           <div className="flex min-h-32 flex-col items-center justify-center gap-2 px-5 py-6 text-center" role="alert">
             <AlertCircle size={18} className="text-danger-text" />
@@ -145,7 +147,14 @@ export default function LearningCardView({
           </div>
         ) : (
           <>
-            <LearningCardModules card={card} kind={result.kind} content={result.modules} loading={loading} highlightedModuleId={highlightedModuleId} />
+            <LearningCardModules
+              card={card}
+              kind={result.kind}
+              content={result.modules}
+              loading={loading}
+              highlightedModuleId={highlightedModuleId}
+              animateChanges={animateModuleChanges}
+            />
             <LearningCardNotes
               notes={notes}
               editorOpen={noteEditorOpen}

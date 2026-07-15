@@ -69,6 +69,16 @@ export interface AiConnectionTestResult {
   tested_at: number;
   attempt_count: number;
   error_kind?: string;
+  attempts: AiConnectionTestAttempt[];
+}
+
+interface AiConnectionTestAttempt {
+  credential_id?: string;
+  credential_label?: string;
+  error_kind?: string;
+  error_detail?: string;
+  latency_ms: number;
+  request_sent: boolean;
 }
 
 interface OAuthStatus {
@@ -129,15 +139,28 @@ function profileHealth(
     };
   }
   if (result) {
-    return result.success
-      ? {
-          label: t("settings.ai.health.available"),
-          className: "bg-success/10 text-success-text",
-        }
-      : {
-          label: t("settings.ai.health.unavailable"),
-          className: "bg-danger-bg text-danger-text",
-        };
+    if (result.success) {
+      return {
+        label: t("settings.ai.health.available"),
+        className: "bg-success/10 text-success-text",
+      };
+    }
+    if (result.error_kind === "credential_invalid") {
+      return {
+        label: t("settings.ai.health.invalid"),
+        className: "bg-danger-bg text-danger-text",
+      };
+    }
+    if (result.error_kind === "not_configured") {
+      return {
+        label: t("settings.ai.health.notConfigured"),
+        className: "bg-danger-bg text-danger-text",
+      };
+    }
+    return {
+      label: `${t("settings.ai.health.unavailable")} · ${connectionErrorLabel(result.error_kind, t)}`,
+      className: "bg-danger-bg text-danger-text",
+    };
   }
   if (profile.last_used_at == null && profile.last_latency_ms == null) {
     return {
@@ -149,6 +172,18 @@ function profileHealth(
     return {
       label: t("settings.ai.health.available"),
       className: "bg-success/10 text-success-text",
+    };
+  }
+  if (profile.state === "invalid" || profile.last_error_kind === "credential_invalid") {
+    return {
+      label: t("settings.ai.health.invalid"),
+      className: "bg-danger-bg text-danger-text",
+    };
+  }
+  if (profile.last_error_kind === "not_configured") {
+    return {
+      label: t("settings.ai.health.notConfigured"),
+      className: "bg-danger-bg text-danger-text",
     };
   }
   if (profile.state === "cooldown" || profile.state === "quota") {
@@ -186,6 +221,7 @@ const CONNECTION_ERROR_KEYS: Record<string, string> = {
   protocol: "protocol",
   request: "request",
   not_configured: "notConfigured",
+  cancelled: "cancelled",
 };
 
 function connectionErrorLabel(
@@ -699,7 +735,7 @@ export default function AiServiceCard({
             <div className={`mt-3 rounded-md px-3 py-2 text-[11px] ${
               testResult.success ? "bg-success/10 text-success-text" : "bg-danger-bg text-danger-text"
             }`}>
-              {testResult.success
+              <p>{testResult.success
                 ? testResult.first_response_ms != null
                   ? t("settings.ai.testSuccessDetailed", {
                       firstResponse: testResult.first_response_ms,
@@ -713,7 +749,27 @@ export default function AiServiceCard({
                 : t("settings.ai.testFailed", {
                     reason: connectionErrorLabel(testResult.error_kind, t),
                     latency: testResult.total_ms,
-                  })}
+                  })}</p>
+              {testResult.attempts.length > 0 && (
+                <div className="mt-2 space-y-1 border-t border-current/15 pt-2">
+                  {testResult.attempts.map((attempt, index) => (
+                    <p key={attempt.credential_id ?? index} className="break-words leading-4">
+                      <span className="font-medium">
+                        {attempt.credential_label ?? t("settings.ai.testAttemptService")}
+                      </span>
+                      {` · ${attempt.error_kind
+                        ? connectionErrorLabel(attempt.error_kind, t)
+                        : t("settings.ai.testAttemptSuccess")} · ${attempt.latency_ms} ms`}
+                      {!attempt.request_sent && (
+                        <span className="block font-medium">{t("settings.ai.testRequestNotSent")}</span>
+                      )}
+                      {attempt.error_detail && (
+                        <span className="block opacity-80">{attempt.error_detail}</span>
+                      )}
+                    </p>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 

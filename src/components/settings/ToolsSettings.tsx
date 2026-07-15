@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Highlighter, LayoutPanelTop, MousePointer2, MousePointerClick, PanelRightOpen } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
@@ -11,13 +11,14 @@ import {
   type SelectionMenuKind,
   type CustomLearningId,
 } from "../learning-card";
-import type { CustomImportSource } from "./CustomActionEditor";
+import type { CustomImportSource, UnsavedEditorController } from "./CustomActionEditor";
 import Toggle from "../ui/Toggle";
 import CardDesignSettings from "./CardDesignSettings";
 import DensityHelpDialog from "./DensityHelpDialog";
 import SelectionMenuSettings from "./SelectionMenuSettings";
 import MarkerStyleSettings from "./MarkerStyleSettings";
 import ReaderBindingsSettings from "./ReaderBindingsSettings";
+import ConfirmDialog from "./ConfirmDialog";
 import type { SettingsProps } from "./types";
 import {
   MARKER_STYLE_SETTING_KEY,
@@ -39,7 +40,7 @@ export interface ToolsPreviewState {
   learnerLevel: string;
   explanationMode: string;
   showMenu: boolean;
-  lastTouchedId: string | null;
+  lastTouched: { id: string; nonce: number } | null;
   testText?: string;
   testNonce?: number;
   customActionTest?: { name: string; prompt: string; text: string; nonce: number };
@@ -48,6 +49,7 @@ export interface ToolsPreviewState {
 
 interface ToolsSettingsProps extends SettingsProps {
   onPreviewChange?: (preview: ToolsPreviewState | null) => void;
+  onNavigationGuardChange?: (guard: ((action: () => void) => void) | null) => void;
 }
 
 function SettingsRow({ title, subtitle, children }: { title: string; subtitle: string; children: ReactNode }) {
@@ -116,6 +118,7 @@ export default function ToolsSettings({
   saveBulk,
   showSavedToast,
   onPreviewChange,
+  onNavigationGuardChange,
 }: ToolsSettingsProps) {
   const { t } = useTranslation();
   const [view, setView] = useState<ToolsView>("interaction");
@@ -128,11 +131,46 @@ export default function ToolsSettings({
   const [markerStyle, setMarkerStyle] = useState<MarkerStyleConfigV1>(createDefaultMarkerStyleConfig);
   const [doubleClickQuickLookup, setDoubleClickQuickLookup] = useState(true);
   const [readerBindings, setReaderBindings] = useState<ReaderActionBinding[]>([]);
-  const [lastTouchedId, setLastTouchedId] = useState<string | null>(null);
+  const [lastTouched, setLastTouched] = useState<{ id: string; nonce: number } | null>(null);
   const [testPreview, setTestPreview] = useState<{ config: CardDesignConfigV1; text: string; id: string; nonce: number } | null>(null);
   const [customActionTest, setCustomActionTest] = useState<ToolsPreviewState["customActionTest"]>();
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
   const hydratedRef = useRef(false);
+  const editorControllerRef = useRef<UnsavedEditorController | null>(null);
+  const pendingNavigationRef = useRef<(() => void) | null>(null);
+  const [editorController, setEditorController] = useState<UnsavedEditorController | null>(null);
+  const [guardOpen, setGuardOpen] = useState(false);
+  const touch = (id: string) => {
+    setLastTouched((current) => ({ id, nonce: (current?.nonce ?? 0) + 1 }));
+  };
+  const handleEditorGuardChange = useCallback((controller: UnsavedEditorController | null) => {
+    editorControllerRef.current = controller;
+    setEditorController(controller);
+  }, []);
+  const requestNavigation = useCallback((action: () => void) => {
+    const controller = editorControllerRef.current;
+    if (!controller?.dirty) {
+      action();
+      return;
+    }
+    pendingNavigationRef.current = action;
+    setGuardOpen(true);
+  }, []);
+  const finishPendingNavigation = () => {
+    const action = pendingNavigationRef.current;
+    pendingNavigationRef.current = null;
+    setGuardOpen(false);
+    action?.();
+  };
+  const continueEditing = () => {
+    pendingNavigationRef.current = null;
+    setGuardOpen(false);
+  };
+
+  useEffect(() => {
+    onNavigationGuardChange?.(requestNavigation);
+    return () => onNavigationGuardChange?.(null);
+  }, [onNavigationGuardChange, requestNavigation]);
 
   useEffect(() => {
     if (loading || hydratedRef.current) return;
@@ -173,7 +211,9 @@ export default function ToolsSettings({
       learnerLevel: settings.cefr_level || "B1",
       explanationMode: previewExplanationMode,
       showMenu: isMenuPreview,
-      lastTouchedId: testPreview?.id ?? lastTouchedId,
+      lastTouched: testPreview
+        ? { id: testPreview.id, nonce: testPreview.nonce }
+        : lastTouched,
       testText: testPreview?.text,
       testNonce: testPreview?.nonce,
       customActionTest,
@@ -183,7 +223,7 @@ export default function ToolsSettings({
     cardKind,
     config,
     customActionTest,
-    lastTouchedId,
+    lastTouched,
     loading,
     menuKind,
     onPreviewChange,
@@ -287,10 +327,10 @@ export default function ToolsSettings({
               type="button"
               role="tab"
               aria-selected={view === item.id}
-              onClick={() => {
+              onClick={() => requestNavigation(() => {
                 setView(item.id);
                 setPreviewOpen(item.id === "cards" || item.id === "menu");
-              }}
+              })}
               className={`flex h-10 min-w-0 items-center gap-1.5 border-b-2 px-3 text-[12px] font-medium ${view === item.id ? "border-accent text-accent-text" : "border-transparent text-text-muted hover:text-text-primary"}`}
             >
               <Icon size={14} className="shrink-0" />
@@ -346,7 +386,7 @@ export default function ToolsSettings({
                   type="button"
                   role="tab"
                   aria-selected={cardKind === kind}
-                  onClick={() => setCardKind(kind)}
+                  onClick={() => requestNavigation(() => setCardKind(kind))}
                   className={`h-9 border-b-2 px-3 text-[12px] font-medium ${cardKind === kind ? "border-accent text-accent-text" : "border-transparent text-text-muted"}`}
                 >
                   {t(`settings.tools.cardKind.${kind}`)}
@@ -371,8 +411,10 @@ export default function ToolsSettings({
               value={config.cards[cardKind]}
               onChange={(card) => updateCard(cardKind, card)}
               onOpenDensityHelp={() => setDensityHelpOpen(true)}
-              onTouched={setLastTouchedId}
+              onTouched={touch}
               importSources={importSources(cardKind)}
+              requestNavigation={requestNavigation}
+              onEditorGuardChange={handleEditorGuardChange}
               onTest={(text, customId, draft, card) => {
                 const testCard = {
                   ...card,
@@ -401,7 +443,7 @@ export default function ToolsSettings({
                   type="button"
                   role="tab"
                   aria-selected={menuKind === kind}
-                  onClick={() => setMenuKind(kind)}
+                  onClick={() => requestNavigation(() => setMenuKind(kind))}
                   className={`h-9 border-b-2 px-3 text-[12px] font-medium ${menuKind === kind ? "border-accent text-accent-text" : "border-transparent text-text-muted"}`}
                 >
                   {t(`settings.tools.cardKind.${kind}`)}
@@ -428,8 +470,10 @@ export default function ToolsSettings({
                 ...config,
                 selectionMenus: { ...config.selectionMenus, [menuKind]: menu },
               })}
-              onTouched={setLastTouchedId}
+              onTouched={touch}
               importSources={menuImportSources(menuKind)}
+              requestNavigation={requestNavigation}
+              onEditorGuardChange={handleEditorGuardChange}
               onTest={(text, draft) => {
                 setCustomActionTest({ name: draft.name, prompt: draft.prompt, text, nonce: Date.now() });
                 setPreviewOpen(true);
@@ -463,6 +507,26 @@ export default function ToolsSettings({
       )}
 
       {densityHelpOpen && <DensityHelpDialog initialKind={cardKind} onClose={() => setDensityHelpOpen(false)} />}
+      {guardOpen && editorController && (
+        <ConfirmDialog
+          title={t("settings.tools.custom.unsavedTitle", {
+            name: editorController.name || t("settings.tools.custom.untitled"),
+          })}
+          description={t("settings.tools.custom.unsavedDescription")}
+          primaryLabel={t("common.save")}
+          primaryDisabled={!editorController.canSave}
+          onPrimary={() => {
+            if (editorControllerRef.current?.save()) finishPendingNavigation();
+          }}
+          secondaryLabel={t("settings.tools.custom.discard")}
+          onSecondary={() => {
+            editorControllerRef.current?.discard();
+            finishPendingNavigation();
+          }}
+          tertiaryLabel={t("settings.tools.custom.continueEditing")}
+          onTertiary={continueEditing}
+        />
+      )}
     </div>
   );
 }

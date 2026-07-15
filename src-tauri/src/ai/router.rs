@@ -71,6 +71,21 @@ pub struct AiConnectionTestResult {
     pub attempt_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
+    pub attempts: Vec<AiConnectionTestAttempt>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AiConnectionTestAttempt {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<String>,
+    pub latency_ms: u64,
+    pub request_sent: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -107,6 +122,7 @@ type NormalizedProfileConfig = (
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AiErrorKind {
+    Cancelled,
     CredentialInvalid,
     Auth,
     Permission,
@@ -122,6 +138,7 @@ enum AiErrorKind {
 impl AiErrorKind {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Cancelled => "cancelled",
             Self::CredentialInvalid => "credential_invalid",
             Self::Auth => "auth",
             Self::Permission => "permission",
@@ -152,7 +169,9 @@ impl AiErrorKind {
 
 fn classify_error(error: &AppError) -> AiErrorKind {
     let message = error.to_string().to_ascii_lowercase();
-    if [
+    if message.contains("ai_request_cancelled") {
+        AiErrorKind::Cancelled
+    } else if [
         "invalid_api_key",
         "invalid_api_key_error",
         "authentication_error",
@@ -217,6 +236,18 @@ fn classify_error(error: &AppError) -> AiErrorKind {
 
 fn is_cancelled(error: &AppError) -> bool {
     error.to_string().contains("AI_REQUEST_CANCELLED")
+}
+
+fn sanitized_error_detail(error: &AppError, secret: Option<&str>) -> String {
+    let mut detail = error
+        .to_string()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Some(secret) = secret.filter(|value| !value.is_empty()) {
+        detail = detail.replace(secret, "[redacted]");
+    }
+    detail.chars().take(300).collect()
 }
 
 fn now() -> i64 {
@@ -517,6 +548,9 @@ fn update_credential_health(
     error: Option<AiErrorKind>,
     retry_after: Option<i64>,
 ) {
+    if error == Some(AiErrorKind::Cancelled) {
+        return;
+    }
     let Ok(conn) = db.conn.lock() else {
         return;
     };
@@ -536,6 +570,7 @@ fn update_credential_health(
             ("cooldown", Some(timestamp + 30 * 1000))
         }
         Some(AiErrorKind::Request | AiErrorKind::NotConfigured) => ("active", None),
+        Some(AiErrorKind::Cancelled) => unreachable!("cancelled requests do not update health"),
     };
     let _ = conn.execute(
         "UPDATE ai_credentials SET state = ?1, cooldown_until = ?2, last_error_kind = ?3, last_used_at = ?4, updated_at = ?4 WHERE id = ?5",
@@ -550,13 +585,29 @@ fn update_profile_health(
     retry_after: Option<i64>,
     latency_ms: Option<u64>,
 ) {
+    let timestamp = now();
+    let Some((state, cooldown)) = profile_health_state(error, retry_after, timestamp) else {
+        return;
+    };
     let Ok(conn) = db.conn.lock() else {
         return;
     };
-    let timestamp = now();
-    let (state, cooldown) = match error {
+    let latency = latency_ms.map(|value| value.min(i64::MAX as u64) as i64);
+    let _ = conn.execute(
+        "UPDATE ai_profiles SET state = ?1, cooldown_until = ?2, last_error_kind = ?3, last_used_at = ?4, last_latency_ms = COALESCE(?5, last_latency_ms), updated_at = ?4 WHERE id = ?6",
+        params![state, cooldown, error.map(AiErrorKind::as_str), timestamp, latency, profile.view.id],
+    );
+}
+
+fn profile_health_state(
+    error: Option<AiErrorKind>,
+    retry_after: Option<i64>,
+    timestamp: i64,
+) -> Option<(&'static str, Option<i64>)> {
+    let state = match error {
         None => ("active", None),
-        Some(AiErrorKind::CredentialInvalid | AiErrorKind::Auth | AiErrorKind::Permission) => {
+        Some(AiErrorKind::CredentialInvalid) => ("invalid", None),
+        Some(AiErrorKind::Auth | AiErrorKind::Permission) => {
             ("cooldown", Some(timestamp + 5 * 60 * 1000))
         }
         Some(AiErrorKind::Quota) => ("quota", Some(timestamp + 60 * 60 * 1000)),
@@ -569,12 +620,15 @@ fn update_profile_health(
         }
         Some(AiErrorKind::Request) => ("active", None),
         Some(AiErrorKind::NotConfigured) => ("unavailable", None),
+        Some(AiErrorKind::Cancelled) => return None,
     };
-    let latency = latency_ms.map(|value| value.min(i64::MAX as u64) as i64);
-    let _ = conn.execute(
-        "UPDATE ai_profiles SET state = ?1, cooldown_until = ?2, last_error_kind = ?3, last_used_at = ?4, last_latency_ms = COALESCE(?5, last_latency_ms), updated_at = ?4 WHERE id = ?6",
-        params![state, cooldown, error.map(AiErrorKind::as_str), timestamp, latency, profile.view.id],
-    );
+    Some(state)
+}
+
+async fn wait_cancelled(cancel: &mut watch::Receiver<bool>) {
+    if cancel.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -636,8 +690,7 @@ async fn stream_once(
         };
     tokio::select! {
         result = stream => result,
-        changed = cancel.changed() => {
-            let _ = changed;
+        _ = wait_cancelled(cancel) => {
             Err(AppError::Other("AI_REQUEST_CANCELLED".to_string()))
         }
     }
@@ -1968,7 +2021,7 @@ async fn timed_stream_once(
 ) -> (AppResult<()>, Option<u64>, u64) {
     let started = Instant::now();
     let emitted = Arc::new(AtomicBool::new(false));
-    let mut cancel = watch::channel(false).1;
+    let (_cancel_guard, mut cancel) = watch::channel(false);
     let mut stream = Box::pin(stream_once(
         app,
         profile,
@@ -2005,9 +2058,10 @@ fn connection_test_result(
     credential_id: Option<String>,
     first_response_ms: Option<u64>,
     total_ms: u64,
-    attempt_count: usize,
     error_kind: Option<&str>,
+    attempts: Vec<AiConnectionTestAttempt>,
 ) -> AiConnectionTestResult {
+    let attempt_count = attempts.len();
     AiConnectionTestResult {
         success,
         profile_id: profile.view.id.clone(),
@@ -2019,6 +2073,25 @@ fn connection_test_result(
         tested_at: now(),
         attempt_count,
         error_kind: error_kind.map(str::to_string),
+        attempts,
+    }
+}
+
+fn connection_test_attempt(
+    credential: Option<&AiCredential>,
+    error: Option<&AppError>,
+    error_kind: Option<AiErrorKind>,
+    latency_ms: u64,
+    request_sent: bool,
+    secret: Option<&str>,
+) -> AiConnectionTestAttempt {
+    AiConnectionTestAttempt {
+        credential_id: credential.map(|value| value.view.id.clone()),
+        credential_label: credential.map(|value| value.view.label.clone()),
+        error_kind: error_kind.map(AiErrorKind::as_str).map(str::to_string),
+        error_detail: error.map(|value| sanitized_error_detail(value, secret)),
+        latency_ms,
+        request_sent,
     }
 }
 
@@ -2093,6 +2166,7 @@ pub async fn test_profile(
             Ok(token) => token,
             Err(error) => {
                 let kind = classify_error(&error);
+                let total_ms = overall_started.elapsed().as_millis() as u64;
                 if record_health {
                     update_profile_health(db, &profile, Some(kind), retry_after_ms(&error), None);
                 }
@@ -2101,9 +2175,16 @@ pub async fn test_profile(
                     false,
                     None,
                     None,
-                    overall_started.elapsed().as_millis() as u64,
-                    1,
+                    total_ms,
                     Some(kind.as_str()),
+                    vec![connection_test_attempt(
+                        None,
+                        Some(&error),
+                        Some(kind),
+                        total_ms,
+                        false,
+                        None,
+                    )],
                 ));
             }
         };
@@ -2120,6 +2201,14 @@ pub async fn test_profile(
         .await;
         let total_ms = overall_started.elapsed().as_millis() as u64;
         let kind = result.as_ref().err().map(classify_error);
+        let attempt = connection_test_attempt(
+            None,
+            result.as_ref().err(),
+            kind,
+            total_ms,
+            true,
+            Some(&token),
+        );
         if record_health {
             update_profile_health(
                 db,
@@ -2135,8 +2224,8 @@ pub async fn test_profile(
             None,
             first_response_ms,
             total_ms,
-            1,
             kind.map(AiErrorKind::as_str),
+            vec![attempt],
         ));
     }
 
@@ -2154,6 +2243,8 @@ pub async fn test_profile(
         .await;
         let total_ms = overall_started.elapsed().as_millis() as u64;
         let kind = result.as_ref().err().map(classify_error);
+        let attempt =
+            connection_test_attempt(None, result.as_ref().err(), kind, total_ms, true, None);
         if record_health {
             update_profile_health(
                 db,
@@ -2169,8 +2260,8 @@ pub async fn test_profile(
             None,
             first_response_ms,
             total_ms,
-            1,
             kind.map(AiErrorKind::as_str),
+            vec![attempt],
         ));
     }
 
@@ -2188,38 +2279,50 @@ pub async fn test_profile(
             None,
             None,
             overall_started.elapsed().as_millis() as u64,
-            0,
             Some("not_configured"),
+            Vec::new(),
         ));
     }
 
-    let mut attempt_count = 0;
+    let mut attempts = Vec::new();
     let mut last_credential_id = None;
     let mut last_first_response_ms = None;
     let mut last_error_kind = Some(AiErrorKind::CredentialInvalid);
     let mut last_retry_after = None;
     for credential in candidates {
-        attempt_count += 1;
+        let attempt_started = Instant::now();
         last_credential_id = Some(credential.view.id.clone());
         last_first_response_ms = None;
-        let Some(key) = secrets
-            .get(&credential.secret_ref)?
-            .filter(|value| !value.trim().is_empty())
-        else {
-            if record_health {
-                update_credential_health(
-                    db,
-                    &credential,
+        let key = match secrets.get(&credential.secret_ref) {
+            Ok(Some(key)) if !key.trim().is_empty() => key,
+            result => {
+                let error = match result {
+                    Err(error) => error,
+                    _ => AppError::Other("AI_CREDENTIAL_UNAVAILABLE".to_string()),
+                };
+                if record_health {
+                    update_credential_health(
+                        db,
+                        &credential,
+                        Some(AiErrorKind::CredentialInvalid),
+                        None,
+                    );
+                }
+                attempts.push(connection_test_attempt(
+                    Some(&credential),
+                    Some(&error),
                     Some(AiErrorKind::CredentialInvalid),
+                    attempt_started.elapsed().as_millis() as u64,
+                    false,
                     None,
-                );
+                ));
+                last_error_kind = Some(AiErrorKind::CredentialInvalid);
+                last_retry_after = None;
+                continue;
             }
-            last_error_kind = Some(AiErrorKind::CredentialInvalid);
-            last_retry_after = None;
-            continue;
         };
         let event_name = format!("ai-profile-test-{}", uuid::Uuid::new_v4());
-        let (result, first_response_ms, _) = timed_stream_once(
+        let (result, first_response_ms, attempt_ms) = timed_stream_once(
             app,
             &profile,
             &key,
@@ -2233,6 +2336,14 @@ pub async fn test_profile(
         match result {
             Ok(()) => {
                 let total_ms = overall_started.elapsed().as_millis() as u64;
+                attempts.push(connection_test_attempt(
+                    Some(&credential),
+                    None,
+                    None,
+                    attempt_ms,
+                    true,
+                    Some(&key),
+                ));
                 if record_health {
                     update_credential_health(db, &credential, None, None);
                     update_profile_health(db, &profile, None, None, Some(total_ms));
@@ -2243,8 +2354,8 @@ pub async fn test_profile(
                     Some(credential.view.id),
                     first_response_ms,
                     total_ms,
-                    attempt_count,
                     None,
+                    attempts,
                 ));
             }
             Err(error) => {
@@ -2253,6 +2364,14 @@ pub async fn test_profile(
                 if record_health {
                     update_credential_health(db, &credential, Some(kind), retry_after);
                 }
+                attempts.push(connection_test_attempt(
+                    Some(&credential),
+                    Some(&error),
+                    Some(kind),
+                    attempt_ms,
+                    true,
+                    Some(&key),
+                ));
                 last_error_kind = Some(kind);
                 last_retry_after = retry_after;
                 if !kind.retryable() {
@@ -2273,8 +2392,8 @@ pub async fn test_profile(
         last_credential_id,
         last_first_response_ms,
         total_ms,
-        attempt_count,
         last_error_kind.map(AiErrorKind::as_str),
+        attempts,
     ))
 }
 
@@ -2380,6 +2499,76 @@ pub async fn test_credential(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn dropped_cancel_sender_does_not_cancel_request() {
+        let receiver = watch::channel(false).1;
+        let mut receiver = receiver;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), wait_cancelled(&mut receiver),)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn live_cancel_sender_wakes_request() {
+        let (sender, mut receiver) = watch::channel(false);
+        sender.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_millis(20), wait_cancelled(&mut receiver))
+            .await
+            .expect("cancellation should wake the request");
+    }
+
+    #[test]
+    fn cancelled_errors_are_classified_separately_from_network_failures() {
+        let error = AppError::Other("AI_REQUEST_CANCELLED".to_string());
+
+        assert_eq!(classify_error(&error), AiErrorKind::Cancelled);
+        assert!(!classify_error(&error).retryable());
+    }
+
+    #[test]
+    fn profile_health_distinguishes_invalid_and_unconfigured_credentials() {
+        assert_eq!(
+            profile_health_state(Some(AiErrorKind::CredentialInvalid), None, 1_000),
+            Some(("invalid", None))
+        );
+        assert_eq!(
+            profile_health_state(Some(AiErrorKind::NotConfigured), None, 1_000),
+            Some(("unavailable", None))
+        );
+        assert_eq!(
+            profile_health_state(Some(AiErrorKind::Cancelled), None, 1_000),
+            None
+        );
+    }
+
+    #[test]
+    fn connection_attempt_serialization_is_diagnostic_and_redacted() {
+        let error = AppError::Other(format!(
+            "provider rejected secret-token {}",
+            "x".repeat(400)
+        ));
+        let attempt = connection_test_attempt(
+            None,
+            Some(&error),
+            Some(AiErrorKind::Auth),
+            42,
+            true,
+            Some("secret-token"),
+        );
+        let value = serde_json::to_value(&attempt).unwrap();
+
+        assert_eq!(value["error_kind"], "auth");
+        assert_eq!(value["latency_ms"], 42);
+        assert_eq!(value["request_sent"], true);
+        let detail = value["error_detail"].as_str().unwrap();
+        assert!(!detail.contains("secret-token"));
+        assert!(detail.chars().count() <= 300);
+    }
 
     async fn model_list_server(
         responses: Vec<(&'static str, &'static str)>,
