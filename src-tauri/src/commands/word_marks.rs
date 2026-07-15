@@ -52,6 +52,121 @@ pub struct LookupOccurrenceMark {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct WordFormsEntry {
+    pub normalized_word: String,
+    pub display_word: String,
+    pub forms: Vec<String>,
+    pub source: Option<String>,
+    pub created_at: i64,
+    pub updated_at: Option<i64>,
+}
+
+fn normalized_forms(word: &str, forms: Vec<String>) -> Vec<String> {
+    let normalized_word = normalize_learning_term(word);
+    let mut values = forms
+        .into_iter()
+        .map(|value| normalize_learning_term(&value))
+        .filter(|value| !value.is_empty() && value != &normalized_word)
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+#[tauri::command]
+pub fn list_word_forms(db: State<'_, Db>) -> AppResult<Vec<WordFormsEntry>> {
+    let conn = db.reader();
+    let mut statement = conn.prepare(
+        "SELECT r.normalized_word, MAX(r.display_word), f.forms, f.source,
+                MAX(r.created_at), f.updated_at
+         FROM word_mark_rules r
+         LEFT JOIN word_forms f ON f.normalized_word = r.normalized_word
+         WHERE r.enabled = 1
+         GROUP BY r.normalized_word
+         ORDER BY CASE WHEN f.normalized_word IS NULL THEN 0 ELSE 1 END,
+                  MAX(r.created_at) DESC",
+    )?;
+    let values = statement
+        .query_map([], |row| {
+            let forms_json: Option<String> = row.get(2)?;
+            Ok(WordFormsEntry {
+                normalized_word: row.get(0)?,
+                display_word: row.get(1)?,
+                forms: forms_json
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or_default(),
+                source: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(values)
+}
+
+#[tauri::command]
+pub fn set_word_forms(
+    word: String,
+    forms: Vec<String>,
+    source: Option<String>,
+    db: State<'_, Db>,
+) -> AppResult<Vec<String>> {
+    let normalized_word = normalize_learning_term(&word);
+    if normalized_word.is_empty() || normalized_word.chars().count() > 256 {
+        return Err(AppError::Other("WORD_FORMS_WORD_INVALID".to_string()));
+    }
+    let forms = normalized_forms(&normalized_word, forms);
+    let forms_json =
+        serde_json::to_string(&forms).map_err(|error| AppError::Other(error.to_string()))?;
+    let source = if source.as_deref() == Some("model") {
+        "model"
+    } else {
+        "user"
+    };
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    let conn = db
+        .conn
+        .lock()
+        .map_err(|error| AppError::Other(error.to_string()))?;
+    conn.execute(
+        "INSERT INTO word_forms(normalized_word, forms, source, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(normalized_word) DO UPDATE SET
+           forms=excluded.forms, source=excluded.source, updated_at=excluded.updated_at",
+        params![normalized_word, forms_json, source, timestamp],
+    )?;
+    Ok(forms)
+}
+
+#[tauri::command]
+pub fn get_word_forms(words: Vec<String>, db: State<'_, Db>) -> AppResult<Vec<WordFormsEntry>> {
+    let conn = db.reader();
+    let mut result = Vec::new();
+    for word in words.into_iter().map(|word| normalize_learning_term(&word)) {
+        let row = conn.query_row(
+            "SELECT normalized_word, normalized_word, forms, source, updated_at, updated_at
+             FROM word_forms WHERE normalized_word = ?1",
+            params![word],
+            |row| {
+                let forms_json: String = row.get(2)?;
+                Ok(WordFormsEntry {
+                    normalized_word: row.get(0)?,
+                    display_word: row.get(1)?,
+                    forms: serde_json::from_str(&forms_json).unwrap_or_default(),
+                    source: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            },
+        );
+        if let Ok(entry) = row {
+            result.push(entry);
+        }
+    }
+    Ok(result)
+}
+
 fn row_to_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<WordMarkRule> {
     Ok(WordMarkRule {
         id: row.get(0)?,
@@ -1092,5 +1207,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(active_occurrences, 0);
+    }
+
+    #[test]
+    fn word_forms_are_normalized_deduplicated_and_exclude_the_source_word() {
+        assert_eq!(
+            normalized_forms(
+                "Run",
+                vec![
+                    " Running ".to_string(),
+                    "runs".to_string(),
+                    "RUNS".to_string(),
+                    "run".to_string(),
+                    "".to_string(),
+                ],
+            ),
+            vec!["running".to_string(), "runs".to_string()],
+        );
     }
 }

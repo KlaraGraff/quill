@@ -23,6 +23,8 @@ import {
   wordRangeAtPoint,
   type ReaderInteraction,
 } from "./reader-interaction";
+import { bindingFromKeyboardEvent } from "./reader-bindings";
+import { expandWordForms } from "./word-forms";
 import {
   resolveTextLocation,
   textLocation,
@@ -48,6 +50,7 @@ interface TextBookReaderProps {
   onHighlightClick: (highlight: Highlight, rect: DOMRect, fallbackText?: string) => void;
   doubleClickQuickLookup?: boolean;
   markerStyle: MarkerStyleConfigV1;
+  onReaderBinding?: (trigger: string, interaction: ReaderInteraction | null) => boolean;
 }
 
 export interface TextBookPageNavigation {
@@ -532,12 +535,14 @@ function TextBookReader({
   onHighlightClick,
   doubleClickQuickLookup = true,
   markerStyle,
+  onReaderBinding,
 }: TextBookReaderProps) {
   const [document, setDocument] = useState<TextBookDocument | null>(null);
   const [highlights, setHighlights] = useState<Highlight[]>([]);
   const [wordMarks, setWordMarks] = useState<WordMarkRule[]>([]);
   const [wordMarkExceptions, setWordMarkExceptions] = useState<WordMarkException[]>([]);
   const [lookupOccurrenceMarks, setLookupOccurrenceMarks] = useState<LookupOccurrenceMark[]>([]);
+  const [wordFormWords, setWordFormWords] = useState<string[]>([]);
   const [preparationPending, setPreparationPending] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const articleRef = useRef<HTMLElement>(null);
@@ -559,6 +564,7 @@ function TextBookReader({
   const pointerCaptureTargetRef = useRef<HTMLElement | null>(null);
   const selectionNormalizationUntilRef = useRef(0);
   const forceClickSuppressedUntilRef = useRef(0);
+  const doubleClickSelectionRef = useRef<{ range: Range; rects: DOMRect[] } | null>(null);
   const [flashOffset, setFlashOffset] = useState<number | null>(null);
   const isPaginated = settings.readingMode === "paginated";
   const [effectivePageColumns, setEffectivePageColumns] = useState<PageColumns>(() => (
@@ -577,9 +583,12 @@ function TextBookReader({
   const readerFontFamily = getFontFamily(settings.font);
   const automaticWordSet = useMemo(
     () => new Set(settings.showLookupMarkers
-      ? wordMarks.map((rule) => normalizeInteractionText(rule.normalized_word))
+      ? [
+          ...wordMarks.map((rule) => normalizeInteractionText(rule.normalized_word)),
+          ...(markerStyle.wordMatchScope === "forms" ? wordFormWords : []),
+        ]
       : []),
-    [settings.showLookupMarkers, wordMarks],
+    [markerStyle.wordMatchScope, settings.showLookupMarkers, wordFormWords, wordMarks],
   );
   const automaticExceptionSet = useMemo(
     () => new Set(wordMarkExceptions.map((exception) => `${exception.normalized_word}\0${exception.location}`)),
@@ -626,9 +635,13 @@ function TextBookReader({
     ]);
     if (!loadActiveRef.current || generation !== loadGenerationRef.current) return;
     setWordMarks(rules.filter((rule) => rule.enabled));
+    setWordFormWords(await expandWordForms(
+      rules.filter((rule) => rule.enabled).map((rule) => rule.normalized_word),
+      markerStyle.wordMatchScope === "forms",
+    ));
     setWordMarkExceptions(exceptions.filter((exception) => exception.excluded));
     setLookupOccurrenceMarks(occurrences.filter((mark) => mark.enabled));
-  }, [bookId]);
+  }, [bookId, markerStyle.wordMatchScope]);
 
   const loadDocument = useCallback(() => {
     if (!loadActiveRef.current) return Promise.resolve();
@@ -710,11 +723,13 @@ function TextBookReader({
     window.addEventListener("highlight-changed", refresh);
     window.addEventListener("word-mark-changed", refreshMarks);
     window.addEventListener("lookup-mark-changed", refreshMarks);
+    window.addEventListener("word-forms-changed", refreshMarks);
     return () => {
       unlisten.then((stop) => stop());
       window.removeEventListener("highlight-changed", refresh);
       window.removeEventListener("word-mark-changed", refreshMarks);
       window.removeEventListener("lookup-mark-changed", refreshMarks);
+      window.removeEventListener("word-forms-changed", refreshMarks);
     };
   }, [bookId, loadDocument, onError, refreshHighlights, refreshWordMarks]);
 
@@ -1113,7 +1128,7 @@ function TextBookReader({
       const locale = window.document.documentElement.lang || undefined;
       return {
         trigger,
-        kind: trigger === "word-menu" || trigger === "word-quick-lookup"
+        kind: trigger === "word-menu"
           ? "word"
           : classifySelection(text, locale),
         text,
@@ -1162,15 +1177,45 @@ function TextBookReader({
   const handleTextDoubleClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     cancelWordClick();
     cancelSelectionMenu();
-    if (!doubleClickQuickLookup) return;
     if (event.button !== 0 || isInteractiveReaderTarget(event.target)) return;
-    const range = wordRangeAtPoint(window.document, event.clientX, event.clientY);
+    const snapshot = doubleClickSelectionRef.current;
+    const useSnapshot = snapshot?.rects.some((rect) => (
+      event.clientX >= rect.left && event.clientX <= rect.right
+      && event.clientY >= rect.top && event.clientY <= rect.bottom
+    ));
+    const range = useSnapshot
+      ? snapshot?.range.cloneRange() ?? null
+      : wordRangeAtPoint(window.document, event.clientX, event.clientY);
     if (!range || !containerRef.current?.contains(range.startContainer)) return;
     const interaction = interactionFromRange(range, "word-quick-lookup");
     if (!interaction?.normalizedText) return;
+    if (!doubleClickQuickLookup) {
+      if (onReaderBinding?.("mouse:double", interaction)) event.preventDefault();
+      return;
+    }
     event.preventDefault();
+    replaceDocumentSelection(window.document, range);
     onInteraction(interaction);
-  }, [cancelSelectionMenu, cancelWordClick, doubleClickQuickLookup, interactionFromRange, onInteraction]);
+    doubleClickSelectionRef.current = null;
+  }, [cancelSelectionMenu, cancelWordClick, doubleClickQuickLookup, interactionFromRange, onInteraction, onReaderBinding]);
+
+  useEffect(() => {
+    if (!onReaderBinding) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if ((event.target as Element | null)?.closest("input,textarea,select,[contenteditable='true']")) return;
+      const trigger = bindingFromKeyboardEvent(event);
+      if (!trigger) return;
+      const range = selectedRange(window.document);
+      const interaction = range && containerRef.current?.contains(range.commonAncestorContainer)
+        ? interactionFromRange(range, "selection-menu")
+        : null;
+      if (!onReaderBinding(trigger, interaction)) return;
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
+  }, [interactionFromRange, onReaderBinding]);
 
   const scheduleSelectionMenu = useCallback((delay = 150, includeWord = false) => {
     cancelSelectionMenu();
@@ -1292,8 +1337,8 @@ function TextBookReader({
   }, [finalizePointerSelection]);
 
   const typography = useMemo(() => ({
-    backgroundColor: getThemeStyles(settings.theme).body,
-    color: getThemeStyles(settings.theme).text,
+    backgroundColor: getThemeStyles(settings.theme, settings.customTheme).body,
+    color: getThemeStyles(settings.theme, settings.customTheme).text,
     fontFamily: getFontFamily(settings.font),
     fontSize: `${settings.fontSize}px`,
     lineHeight: settings.lineSpacing,
@@ -1373,6 +1418,13 @@ function TextBookReader({
       style={typography}
       onClick={handleTextClick}
       onDoubleClick={handleTextDoubleClick}
+      onMouseDownCapture={() => {
+        const range = selectedRange(window.document);
+        doubleClickSelectionRef.current = range ? {
+          range: range.cloneRange(),
+          rects: Array.from(range.getClientRects()),
+        } : null;
+      }}
       onContextMenu={handleTextContextMenu}
       onPointerDown={handleSelectionPointerDown}
       onPointerUp={handleSelectionPointerUp}

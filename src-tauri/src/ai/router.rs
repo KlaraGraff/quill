@@ -950,6 +950,7 @@ pub async fn complete_with_failover(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_with_profile_inner(
     app: &AppHandle,
     db: &Db,

@@ -36,8 +36,18 @@ struct MarkerVisualStyle {
 #[derive(Debug, Deserialize, Serialize)]
 struct MarkerStyleConfig {
     version: i64,
-    #[serde(rename = "markMatchingWords")]
-    mark_matching_words: bool,
+    #[serde(
+        rename = "markMatchingWords",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    mark_matching_words: Option<bool>,
+    #[serde(
+        rename = "wordMatchScope",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    word_match_scope: Option<String>,
     manual: MarkerVisualStyle,
     #[serde(rename = "automaticFollowsManual")]
     automatic_follows_manual: bool,

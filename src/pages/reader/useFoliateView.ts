@@ -18,6 +18,7 @@ import {
   type ReaderInteraction,
 } from "../../components/reader-interaction";
 import { installCustomFontFacesInDocument } from "../../components/custom-fonts";
+import { expandWordForms } from "../../components/word-forms";
 import type { Highlight } from "../../hooks/useBookmarks";
 import type { Book } from "../../hooks/useBooks";
 import { logIgnoredError } from "../../utils/logIgnoredError";
@@ -224,9 +225,13 @@ export function useFoliateView({
             return [];
           }),
         ]);
-        wordMarkWordsRef.current = rules
+        const ruleWords = rules
           .filter((rule) => rule.enabled)
           .map((rule) => rule.normalized_word);
+        wordMarkWordsRef.current = await expandWordForms(
+          ruleWords,
+          markerStyleRef.current.wordMatchScope === "forms",
+        );
         wordMarkExceptionsRef.current = new Set(exceptions
           .filter((exception) => exception.excluded)
           .map((exception) => `${exception.normalized_word}\0${exception.location}`));

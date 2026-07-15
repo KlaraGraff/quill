@@ -27,6 +27,7 @@ import {
 import ReaderContextMenu, { type ReaderMenuAction } from "../components/ReaderContextMenu";
 import DictionaryPanel from "../components/DictionaryPanel";
 import TranslationPopover from "../components/TranslationPopover";
+import ExplainPopover from "../components/ExplainPopover";
 import TableOfContents from "../components/TableOfContents";
 import TextBookReader from "../components/TextBookReader";
 import { textLocation, type TextBookDocument } from "../components/text-book-location";
@@ -65,6 +66,11 @@ import {
   listenForReadingAssistanceSettingsChanged,
   readingAssistanceSettingsChanged,
 } from "../components/reading-assistance-events";
+import {
+  parseReaderBindings,
+  type ReaderActionBinding,
+  type ReaderActionId,
+} from "../components/reader-bindings";
 import {
   runPageTurnTransition,
 } from "../components/page-turn-transition";
@@ -107,6 +113,10 @@ const readerMenuActionMap: Record<string, ReaderMenuAction> = {
   translate: "translate",
   copy: "copy",
 };
+
+function readerMenuAction(id: string): ReaderMenuAction {
+  return readerMenuActionMap[id] ?? id as `custom_${string}`;
+}
 
 const appWindow = getCurrentWebviewWindow();
 const isStandaloneWindow = appWindow.label.startsWith("reader-");
@@ -190,6 +200,10 @@ export default function Reader() {
     context?: string;
     cfi?: string;
   } | null>(null);
+  const [customAction, setCustomAction] = useState<{
+    interaction: ReaderInteraction;
+    action: { name: string; prompt: string };
+  } | null>(null);
   const {
     readerSettings,
     setReaderSettings,
@@ -200,9 +214,16 @@ export default function Reader() {
   const autoHighlightLookupsRef = useRef(true);
   const [markerStyle, setMarkerStyle] = useState<MarkerStyleConfigV1>(createDefaultMarkerStyleConfig);
   const markerStyleRef = useRef(markerStyle);
-  const markMatchingWordsRef = useRef(markerStyle.markMatchingWords);
+  const markMatchingWordsRef = useRef(markerStyle.wordMatchScope !== "current");
   const doubleClickQuickLookupRef = useRef(true);
   const [doubleClickQuickLookup, setDoubleClickQuickLookup] = useState(true);
+  const readerBindingsRef = useRef<ReaderActionBinding[]>([]);
+  const [bindingHud, setBindingHud] = useState<string | null>(null);
+  const bindingHudTimerRef = useRef<number | null>(null);
+  const lastBindingHudRef = useRef({ message: "", shownAt: 0 });
+  useEffect(() => () => {
+    if (bindingHudTimerRef.current !== null) window.clearTimeout(bindingHudTimerRef.current);
+  }, []);
 
   const applyReadingAssistanceSettings = useCallback((settings: Record<string, string>) => {
     const doubleClick = settings.double_click_quick_lookup !== "false";
@@ -210,8 +231,9 @@ export default function Reader() {
     doubleClickQuickLookupRef.current = doubleClick;
     autoHighlightLookupsRef.current = settings.auto_highlight_lookup_words !== "false";
     markerStyleRef.current = nextMarkerStyle;
-    markMatchingWordsRef.current = nextMarkerStyle.markMatchingWords;
+    markMatchingWordsRef.current = nextMarkerStyle.wordMatchScope !== "current";
     setDoubleClickQuickLookup(doubleClick);
+    readerBindingsRef.current = parseReaderBindings(settings.reader_bindings).bindings;
     setMarkerStyle(nextMarkerStyle);
     setLearningCardConfig(parseCardDesignConfig(settings.learning_card_config));
   }, []);
@@ -515,7 +537,7 @@ export default function Reader() {
 
   useEffect(() => {
     markerStyleRef.current = markerStyle;
-    markMatchingWordsRef.current = markerStyle.markMatchingWords;
+    markMatchingWordsRef.current = markerStyle.wordMatchScope !== "current";
   }, [markerStyle]);
 
   useEffect(() => {
@@ -566,7 +588,7 @@ export default function Reader() {
     settingsRef: readerSettingsRef,
     readerViewportRef,
     panelRef,
-    overlayOpen: Boolean(settingsOpen || contextMenu || learningInteraction || translation),
+    overlayOpen: Boolean(settingsOpen || contextMenu || learningInteraction || translation || customAction),
     sidePanelOpen: Boolean(sidePanel),
     turnPage: turnReaderPage,
     onPdfZoom: handleZoom,
@@ -744,6 +766,101 @@ export default function Reader() {
 
   useWindowSizePersistence(bookId, isStandaloneWindow);
   const { availabilityState, retryAvailability } = useBookAvailability(book, setBook);
+  const readerActionLabel = useCallback((actionId: ReaderActionId) => {
+    if (actionId.startsWith("custom_")) {
+      const item = Object.values(learningCardConfig.selectionMenus)
+        .flat()
+        .find((candidate) => candidate.id === actionId);
+      return item?.name ?? t("settings.tools.bindings.actions.custom");
+    }
+    return t(`settings.tools.bindings.actions.${actionId}`);
+  }, [learningCardConfig.selectionMenus, t]);
+
+  const handleReaderBinding = useCallback((trigger: string, interaction: ReaderInteraction | null) => {
+    const binding = readerBindingsRef.current.find((item) => item.trigger === trigger);
+    if (!binding) return false;
+    if (!interaction) {
+      const message = t("reader.bindingNeedsSelection", { action: readerActionLabel(binding.actionId) });
+      const now = Date.now();
+      if (lastBindingHudRef.current.message !== message || now - lastBindingHudRef.current.shownAt >= 3_000) {
+        lastBindingHudRef.current = { message, shownAt: now };
+        setBindingHud(message);
+        if (bindingHudTimerRef.current !== null) window.clearTimeout(bindingHudTimerRef.current);
+        bindingHudTimerRef.current = window.setTimeout(() => {
+          bindingHudTimerRef.current = null;
+          setBindingHud(null);
+        }, 1_500);
+      }
+      return true;
+    }
+    const actionId = binding.actionId;
+    if (actionId === "lookup" || actionId === "explain") {
+      setLearningInteraction({ ...interaction, trigger: "word-quick-lookup" });
+    } else if (actionId === "translate") {
+      setTranslation({
+        x: interaction.anchorRect.right,
+        y: interaction.anchorRect.top,
+        text: interaction.text,
+        context: interaction.context,
+        cfi: interaction.location,
+      });
+    } else if (actionId === "copy") {
+      void navigator.clipboard.writeText(interaction.text);
+    } else if (actionId === "ask_ai") {
+      setAiContext({ text: interaction.text, cfi: interaction.location });
+      setSidePanel("ai");
+    } else if (actionId === "collect" && bookId) {
+      void invoke("add_vocab_word", {
+        bookId,
+        word: interaction.text,
+        definition: "",
+        contextSentence: interaction.context || null,
+        contextExplanation: null,
+        cfi: interaction.location || null,
+      }).then(() => {
+        window.dispatchEvent(new CustomEvent("vocab-changed", { detail: { bookId, cfi: interaction.location } }));
+      });
+    } else if (actionId === "highlight" && bookId && interaction.location) {
+      void (async () => {
+        if (interaction.kind === "word" && supportsWordMarkers && markMatchingWordsRef.current) {
+          await invoke("set_word_mark_rule_enabled", {
+            bookId,
+            word: interaction.text,
+            enabled: true,
+            color: "lookup",
+          });
+          window.dispatchEvent(new CustomEvent("word-mark-changed", { detail: { bookId } }));
+        } else {
+          const highlights = await invoke<Highlight[]>("list_highlights", { bookId });
+          const plan = await getHighlightMutationPlan(interaction, highlights);
+          if (plan) await invoke("replace_highlights", {
+            bookId,
+            removeIds: plan.removeIds,
+            additions: plan.additions,
+          });
+          window.dispatchEvent(new CustomEvent("highlight-changed", { detail: { bookId } }));
+        }
+        await refreshAnnotations();
+      })().catch((error) => console.error("Failed to run bound highlight action:", error));
+    } else if (actionId.startsWith("custom_")) {
+      const item = Object.values(learningCardConfig.selectionMenus)
+        .flat()
+        .find((candidate) => candidate.id === actionId && candidate.name && candidate.prompt);
+      if (item?.name && item.prompt) {
+        setCustomAction({ interaction, action: { name: item.name, prompt: item.prompt } });
+      }
+    }
+    setContextMenu(null);
+    return true;
+  }, [
+    bookId,
+    getHighlightMutationPlan,
+    learningCardConfig.selectionMenus,
+    readerActionLabel,
+    refreshAnnotations,
+    supportsWordMarkers,
+    t,
+  ]);
   const installDocumentInteractions = useReaderInteractions({
     supportsSelection,
     pendingSelectionMenuRef,
@@ -763,6 +880,7 @@ export default function Reader() {
     handlePageTurnMouseDown,
     handlePageTurnContextMenu,
     handlePageTurnWheel,
+    handleReaderBinding,
   });
 
   useFoliateView({
@@ -992,7 +1110,7 @@ export default function Reader() {
   };
 
   return (
-    <div className="flex flex-col h-screen bg-bg-page" style={getReaderThemeVars(readerSettings.theme) as React.CSSProperties}>
+    <div className="flex flex-col h-screen bg-bg-page" style={getReaderThemeVars(readerSettings.theme, readerSettings.customTheme) as React.CSSProperties}>
       {/* Invisible overlay to close popovers when clicking anywhere */}
       {settingsOpen && (
         <div
@@ -1004,9 +1122,9 @@ export default function Reader() {
       <header
         className={`flex items-center justify-between px-section pt-8 pb-2 shrink-0 relative select-none ${isStandaloneWindow ? "" : "bg-bg-surface border-b border-border"}`}
         style={isStandaloneWindow ? {
-          backgroundColor: getThemeStyles(readerSettings.theme).body,
-          color: getThemeStyles(readerSettings.theme).text,
-          borderBottom: `1px solid ${getThemeStyles(readerSettings.theme).text}1a`,
+          backgroundColor: getThemeStyles(readerSettings.theme, readerSettings.customTheme).body,
+          color: getThemeStyles(readerSettings.theme, readerSettings.customTheme).text,
+          borderBottom: `1px solid ${getThemeStyles(readerSettings.theme, readerSettings.customTheme).text}1a`,
         } : undefined}
       >
         <div data-tauri-drag-region className="absolute top-0 left-0 right-0 h-8" />
@@ -1163,7 +1281,7 @@ export default function Reader() {
       {/* Body */}
       <div
         className="flex flex-1 overflow-hidden"
-        style={{ backgroundColor: getThemeStyles(readerSettings.theme).body }}
+        style={{ backgroundColor: getThemeStyles(readerSettings.theme, readerSettings.customTheme).body }}
       >
         <TableOfContents
           open={tocOpen}
@@ -1171,11 +1289,11 @@ export default function Reader() {
           currentPage={currentChapterIndex + 1}
           onNavigate={handleTocNavigate}
         />
-        <div className="flex-1 flex flex-col min-w-0" style={{ backgroundColor: getThemeStyles(readerSettings.theme).body }}>
+        <div className="flex-1 flex flex-col min-w-0" style={{ backgroundColor: getThemeStyles(readerSettings.theme, readerSettings.customTheme).body }}>
           <main
             ref={readerViewportRef}
             className="reader-page-viewport flex-1 relative overflow-hidden"
-            style={{ backgroundColor: getThemeStyles(readerSettings.theme).body }}
+            style={{ backgroundColor: getThemeStyles(readerSettings.theme, readerSettings.customTheme).body }}
             onClick={() => {
               setSettingsOpen(false);
               // Clicks inside the iframe (text content) don't bubble out
@@ -1201,6 +1319,7 @@ export default function Reader() {
                 onHighlightClick={handleTextHighlightClick}
                 doubleClickQuickLookup={doubleClickQuickLookup}
                 markerStyle={markerStyle}
+                onReaderBinding={handleReaderBinding}
               />
             ) : (
               <div
@@ -1210,7 +1329,7 @@ export default function Reader() {
               />
             )}
             {book.format === "pdf" && (() => {
-              const overlay = getPdfOverlays(readerSettings.theme);
+              const overlay = getPdfOverlays(readerSettings.theme, readerSettings.customTheme);
               if (!overlay) return null;
               return overlay.layers.map((style, i) => (
                 <div
@@ -1226,6 +1345,14 @@ export default function Reader() {
                 className="pointer-events-none absolute bottom-5 left-1/2 z-30 max-w-[min(420px,calc(100%_-_24px))] -translate-x-1/2 rounded-md border border-border bg-bg-surface px-3 py-2 text-center text-[12px] leading-5 text-text-secondary shadow-popover"
               >
                 {t("reader.pdfNoTextLayer")}
+              </div>
+            )}
+            {bindingHud && (
+              <div
+                role="status"
+                className="pointer-events-none absolute bottom-5 left-1/2 z-40 max-w-[min(520px,calc(100%_-_24px))] -translate-x-1/2 rounded-md bg-[#18181B]/90 px-3 py-2 text-center text-[12px] leading-5 text-white shadow-popover"
+              >
+                {bindingHud}
               </div>
             )}
             {!bookReady && (
@@ -1251,8 +1378,8 @@ export default function Reader() {
           <footer
             className={`px-page pb-2 pt-0 shrink-0 ${isStandaloneWindow ? "" : "bg-bg-surface"}`}
             style={isStandaloneWindow ? {
-              backgroundColor: getThemeStyles(readerSettings.theme).body,
-              color: getThemeStyles(readerSettings.theme).text,
+              backgroundColor: getThemeStyles(readerSettings.theme, readerSettings.customTheme).body,
+              color: getThemeStyles(readerSettings.theme, readerSettings.customTheme).text,
             } : undefined}
           >
             <div className="flex flex-col gap-2">
@@ -1381,7 +1508,16 @@ export default function Reader() {
           markStateLoading={contextMarkStateLoading}
           order={learningCardConfig.selectionMenus[contextMenu.kind]
             .filter((item) => item.enabled)
-            .map((item) => readerMenuActionMap[item.id])}
+            .map((item) => readerMenuAction(item.id))}
+          customActions={learningCardConfig.selectionMenus[contextMenu.kind]
+            .filter((item) => item.enabled && item.id.startsWith("custom_") && item.name && item.prompt)
+            .map((item) => ({ id: item.id as `custom_${string}`, name: item.name! }))}
+          onCustomAction={(id) => {
+            const item = learningCardConfig.selectionMenus[contextMenu.kind].find((entry) => entry.id === id);
+            if (!item?.name || !item.prompt) return;
+            setCustomAction({ interaction: contextMenu, action: { name: item.name, prompt: item.prompt } });
+            setContextMenu(null);
+          }}
           onClose={() => {
             contextMenuRequestRef.current += 1;
             setContextMenu(null);
@@ -1546,6 +1682,24 @@ export default function Reader() {
             invoke("open_library_on_main", { filter: "notes" }).catch(() => {});
           }}
           onLookupSuccess={handleLookupSuccess}
+        />
+      )}
+
+      {customAction && bookId && (
+        <ExplainPopover
+          key={`${customAction.interaction.location}:${customAction.action.name}`}
+          x={customAction.interaction.anchorRect.right}
+          y={customAction.interaction.anchorRect.top}
+          text={customAction.interaction.text}
+          sentence={customAction.interaction.context}
+          bookTitle={book?.title}
+          chapter={currentChapterIndex >= 0 && currentChapterIndex < chapters.length
+            ? chapters[currentChapterIndex].title
+            : undefined}
+          bookId={bookId}
+          cfi={customAction.interaction.location}
+          customAction={customAction.action}
+          onClose={() => setCustomAction(null)}
         />
       )}
 

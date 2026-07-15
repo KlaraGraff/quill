@@ -19,6 +19,7 @@ interface ExplainPopoverProps {
   bookId: string;
   cfi?: string;
   onClose: () => void;
+  customAction?: { name: string; prompt: string };
 }
 
 interface AiStreamChunk {
@@ -32,7 +33,8 @@ function useExplainStream(
   surrounding: string | undefined,
   bookTitle: string | undefined,
   bookAuthor: string | undefined,
-  chapter: string | undefined
+  chapter: string | undefined,
+  customAction?: { name: string; prompt: string },
 ) {
   const contentRef = useRef("");
   const [content, setContent] = useState("");
@@ -55,7 +57,7 @@ function useExplainStream(
       requestIdRef.current = requestId;
 
       unlistenRef.current = await listen<AiStreamChunk>(
-        `ai-lookup-chunk-${requestId}`,
+        `${customAction ? "ai-custom-action-chunk" : "ai-lookup-chunk"}-${requestId}`,
         (event) => {
           if (cancelled) return;
           if (event.payload.done) {
@@ -76,7 +78,15 @@ function useExplainStream(
       );
 
       try {
-        await invoke("ai_explain", {
+        await invoke(customAction ? "ai_custom_action" : "ai_explain", customAction ? {
+          name: customAction.name,
+          prompt: customAction.prompt,
+          text: passage,
+          context: surrounding || null,
+          bookTitle: bookTitle || null,
+          chapter: chapter || null,
+          requestId,
+        } : {
           passage,
           surrounding: surrounding || null,
           bookTitle: bookTitle || null,
@@ -112,7 +122,7 @@ function useExplainStream(
       unlistenRef.current?.();
       unlistenRef.current = null;
     };
-  }, [passage, surrounding, bookAuthor, bookTitle, chapter]);
+  }, [passage, surrounding, bookAuthor, bookTitle, chapter, customAction]);
 
   return { content, contentRef, streaming, aiError, streamError };
 }
@@ -126,6 +136,7 @@ export default function ExplainPopover({
   bookAuthor,
   chapter,
   onClose,
+  customAction,
 }: ExplainPopoverProps) {
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
@@ -136,7 +147,8 @@ export default function ExplainPopover({
     sentence,
     bookTitle,
     bookAuthor,
-    chapter
+    chapter,
+    customAction,
   );
 
   // Position clamping — re-run whenever the popover resizes (e.g. as content streams in)
@@ -208,7 +220,7 @@ export default function ExplainPopover({
         <div className="flex items-center gap-2">
           <WandSparkles size={16} className="text-accent-text" />
           <span className="text-[14px] font-medium text-accent-text tracking-[-0.15px]">
-            {t("explain.title")}
+            {customAction?.name ?? t("explain.title")}
           </span>
         </div>
         <button

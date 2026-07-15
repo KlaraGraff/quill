@@ -16,6 +16,7 @@ interface LearningCardModulesProps {
   kind: "word" | "phrase" | "passage";
   content: Partial<Record<LearningModuleId, LearningModuleContent>>;
   loading?: boolean;
+  highlightedModuleId?: string | null;
 }
 
 function hasContent(content: LearningModuleContent | undefined) {
@@ -122,12 +123,14 @@ function ModuleSection({
   labelKey,
   content,
   loading,
+  highlighted,
 }: {
   config: CardModuleConfig;
   card: CardKindConfig;
   labelKey: string;
   content?: LearningModuleContent;
   loading: boolean;
+  highlighted: boolean;
 }) {
   const { t } = useTranslation();
   const panelId = useId();
@@ -141,7 +144,10 @@ function ModuleSection({
   const density = getEffectiveDensity(config, card);
 
   return (
-    <section className="px-4 py-3">
+    <section
+      data-module-id={config.id}
+      className={`px-4 py-3 transition-colors duration-300 ${highlighted ? "bg-accent-bg ring-2 ring-inset ring-accent/50" : ""}`}
+    >
       <button
         type="button"
         aria-expanded={expanded}
@@ -153,7 +159,7 @@ function ModuleSection({
           ? <ChevronDown size={14} className="mt-0.5 shrink-0 text-text-muted" />
           : <ChevronRight size={14} className="mt-0.5 shrink-0 text-text-muted" />}
         <span className="min-w-0 flex-1 break-words text-[12px] font-semibold text-text-primary">
-          {t(labelKey)}
+          {config.id.startsWith("custom_") ? labelKey : t(labelKey)}
         </span>
         <span className="shrink-0 text-[10px] text-text-muted">{t(`settings.tools.density.${density}`)}</span>
       </button>
@@ -173,7 +179,7 @@ function ModuleSection({
   );
 }
 
-export default function LearningCardModules({ card, kind, content, loading = false }: LearningCardModulesProps) {
+export default function LearningCardModules({ card, kind, content, loading = false, highlightedModuleId }: LearningCardModulesProps) {
   const definitions = new Map(MODULE_DEFINITIONS[kind].map((item) => [item.id, item]));
   const enabledModules = card.modules.filter((module) => module.enabled);
   const lastCompletedIndex = enabledModules.reduce(
@@ -187,16 +193,23 @@ export default function LearningCardModules({ card, kind, content, loading = fal
   return (
     <div className="divide-y divide-border/60" aria-busy={loading || undefined}>
       {visibleModules.map((module) => {
-        const definition = definitions.get(module.id);
+        const custom = module.id.startsWith("custom_") ? card.customModules[module.id as `custom_${string}`] : undefined;
+        const definition = definitions.get(module.id) ?? (custom ? {
+          id: module.id,
+          labelKey: custom.name,
+          descriptionKey: "",
+          custom: true,
+        } : undefined);
         if (!definition) return null;
         return (
           <ModuleSection
             key={module.id}
             config={module}
             card={card}
-            labelKey={definition.labelKey}
+            labelKey={definition.custom ? definition.labelKey : definition.labelKey}
             content={content[module.id]}
             loading={loading}
+            highlighted={highlightedModuleId === module.id}
           />
         );
       })}

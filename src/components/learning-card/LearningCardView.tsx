@@ -43,6 +43,7 @@ interface LearningCardViewProps {
   onNoteDelete?: (note: LearningCardNote) => void;
   onViewAllNotes?: () => void;
   noteScope?: "book" | "global";
+  highlightedModuleId?: string | null;
   onNoteScopeChange?: (scope: "book" | "global") => void;
 }
 
@@ -72,6 +73,7 @@ export default function LearningCardView({
   onNoteDelete,
   onViewAllNotes,
   noteScope,
+  highlightedModuleId,
   onNoteScopeChange,
 }: LearningCardViewProps) {
   const { t } = useTranslation();
@@ -143,7 +145,7 @@ export default function LearningCardView({
           </div>
         ) : (
           <>
-            <LearningCardModules card={card} kind={result.kind} content={result.modules} loading={loading} />
+            <LearningCardModules card={card} kind={result.kind} content={result.modules} loading={loading} highlightedModuleId={highlightedModuleId} />
             <LearningCardNotes
               notes={notes}
               editorOpen={noteEditorOpen}

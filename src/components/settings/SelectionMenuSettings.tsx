@@ -1,38 +1,36 @@
-import { useState, type DragEvent } from "react";
-import { ArrowDown, ArrowUp, GripVertical } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronDown, ChevronRight, GripVertical, Plus } from "lucide-react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import Toggle from "../ui/Toggle";
+import SortableList from "../ui/SortableList";
 import {
   MENU_ACTION_DEFINITIONS,
+  MAX_CUSTOM_MENU_ACTIONS,
   reorderArray,
   type SelectionMenuItemConfig,
   type SelectionMenuKind,
+  type CustomLearningDefinition,
+  type CustomLearningId,
 } from "../learning-card";
+import CustomActionEditor, { type CustomImportSource } from "./CustomActionEditor";
 
 interface SelectionMenuSettingsProps {
   kind: SelectionMenuKind;
   value: SelectionMenuItemConfig[];
   onChange: (value: SelectionMenuItemConfig[]) => void;
+  onTouched?: (id: string) => void;
+  importSources: CustomImportSource[];
+  onTest: (text: string, draft: CustomLearningDefinition, id: CustomLearningId) => void;
 }
 
-export default function SelectionMenuSettings({ kind, value, onChange }: SelectionMenuSettingsProps) {
+export default function SelectionMenuSettings({ kind, value, onChange, onTouched, importSources, onTest }: SelectionMenuSettingsProps) {
   const { t } = useTranslation();
-  const [dragIndex, setDragIndex] = useState<number | null>(null);
+  const [openId, setOpenId] = useState<string | null>(null);
   const definitions = new Map(MENU_ACTION_DEFINITIONS[kind].map((item) => [item.id, item]));
   const move = (from: number, to: number) => {
     const next = reorderArray(value, from, to);
     if (next !== value) onChange(next);
-  };
-  const handleDragStart = (index: number, event: DragEvent<HTMLButtonElement>) => {
-    setDragIndex(index);
-    event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData("text/plain", String(index));
-  };
-  const handleDrop = (index: number, event: DragEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    const from = dragIndex ?? Number(event.dataTransfer.getData("text/plain"));
-    setDragIndex(null);
-    if (Number.isSafeInteger(from)) move(from, index);
+    if (next !== value && value[from]) onTouched?.(value[from].id);
   };
 
   return (
@@ -41,28 +39,48 @@ export default function SelectionMenuSettings({ kind, value, onChange }: Selecti
         <h4 className="text-[12px] font-medium text-text-primary">{t(`settings.tools.menu.${kind}`)}</h4>
         <p className="text-[10px] leading-[1.5] text-text-muted">{t("settings.tools.menu.hint")}</p>
       </div>
-      <div className="border-y border-border-light">
-        {value.map((item, index) => {
+      <SortableList
+        items={value}
+        getId={(item) => item.id}
+        onReorder={(items) => {
+          const moved = items.find((item, index) => value[index]?.id !== item.id);
+          onChange(items);
+          if (moved) onTouched?.(moved.id);
+        }}
+        className="border-y border-border-light"
+        renderItem={(item, index) => {
+          const custom = item.id.startsWith("custom_") && item.name && item.prompt ? {
+            name: item.name,
+            prompt: item.prompt,
+            sourceRef: item.sourceRef,
+            follow: item.follow,
+            dirtySinceImport: item.dirtySinceImport,
+            createdAt: item.createdAt ?? 0,
+            updatedAt: item.updatedAt ?? item.createdAt ?? 0,
+          } satisfies CustomLearningDefinition : null;
           const definition = definitions.get(item.id);
-          if (!definition) return null;
-          const label = t(definition.labelKey);
+          if (!definition && !custom) return null;
+          const label = custom?.name ?? t(definition!.labelKey);
           return (
-            <div
-              key={item.id}
-              onDragOver={(event) => event.preventDefault()}
-              onDrop={(event) => handleDrop(index, event)}
-              className="flex min-h-12 items-center gap-1 border-t border-border-light py-1 first:border-t-0"
-            >
-              <button
-                type="button"
-                draggable
-                onDragStart={(event) => handleDragStart(index, event)}
+            <div className="border-t border-border-light first:border-t-0">
+            <div className="flex min-h-12 items-center gap-1 py-1">
+              <span
                 title={t("settings.tools.reorder")}
                 aria-label={t("settings.tools.reorderMenuAction", { name: label })}
-                className="flex size-8 shrink-0 cursor-grab items-center justify-center rounded-md text-text-muted hover:bg-bg-input active:cursor-grabbing"
+                className="flex size-8 shrink-0 items-center justify-center text-text-muted"
               >
                 <GripVertical size={14} />
-              </button>
+              </span>
+              {custom && (
+                <button
+                  type="button"
+                  aria-expanded={openId === item.id}
+                  onClick={() => setOpenId((current) => current === item.id ? null : item.id)}
+                  className="flex size-7 items-center justify-center rounded-md text-text-muted hover:bg-bg-input"
+                >
+                  {openId === item.id ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                </button>
+              )}
               <span className="min-w-0 flex-1 break-words text-[12px] font-medium text-text-primary">{label}</span>
               <button
                 type="button"
@@ -87,12 +105,48 @@ export default function SelectionMenuSettings({ kind, value, onChange }: Selecti
               <Toggle
                 checked={item.enabled}
                 label={t("settings.tools.toggleMenuAction", { name: label })}
-                onChange={(enabled) => onChange(value.map((current, itemIndex) => itemIndex === index ? { ...current, enabled } : current))}
+                onChange={(enabled) => {
+                  onChange(value.map((current, itemIndex) => itemIndex === index ? { ...current, enabled } : current));
+                  onTouched?.(item.id);
+                }}
               />
             </div>
+            {custom && openId === item.id && (
+              <div className="pb-3 pl-9">
+                <CustomActionEditor
+                  value={custom}
+                  importSources={importSources}
+                  testPlaceholder={kind === "word" ? "serendipity" : kind === "phrase" ? "by and large" : "New ideas often emerge where established fields meet."}
+                  onSave={(draft) => onChange(value.map((current) => current.id === item.id ? { ...current, ...draft } : current))}
+                  onDelete={() => onChange(value.filter((current) => current.id !== item.id))}
+                  onTest={(text, draft) => onTest(text, draft, item.id as CustomLearningId)}
+                />
+              </div>
+            )}
+            </div>
           );
-        })}
-      </div>
+        }}
+      />
+      {value.filter((item) => item.id.startsWith("custom_")).length < MAX_CUSTOM_MENU_ACTIONS && (
+        <button
+          type="button"
+          onClick={() => {
+            const id = `custom_${crypto.randomUUID().replace(/-/g, "")}` as CustomLearningId;
+            const now = Date.now();
+            onChange([...value, {
+              id,
+              enabled: true,
+              name: t("settings.tools.custom.defaultActionName"),
+              prompt: t("settings.tools.custom.defaultPrompt"),
+              createdAt: now,
+              updatedAt: now,
+            }]);
+            setOpenId(id);
+            onTouched?.(id);
+          }}
+          className="mt-2 flex h-8 items-center gap-1.5 rounded-md px-2 text-[11px] font-medium text-accent-text hover:bg-accent-bg"
+        ><Plus size={13} />{t("settings.tools.custom.addAction")}</button>
+      )}
     </div>
   );
 }

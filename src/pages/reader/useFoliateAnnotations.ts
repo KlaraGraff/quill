@@ -26,6 +26,7 @@ import {
   type CustomFontRecord,
 } from "../../components/custom-fonts";
 import { getReaderCSS } from "./reader-theme";
+import { expandWordForms } from "../../components/word-forms";
 import type { AnnotationStyleKind, FoliateView } from "./foliate-types";
 
 export interface VocabMarker {
@@ -357,7 +358,7 @@ export function useFoliateAnnotations({
       }).catch(() => null);
       const nextMarkerStyle = parseMarkerStyleConfig(storedMarkerStyle);
       markerStyleRef.current = nextMarkerStyle;
-      markMatchingWordsRef.current = nextMarkerStyle.markMatchingWords;
+      markMatchingWordsRef.current = nextMarkerStyle.wordMatchScope !== "current";
       setMarkerStyle(nextMarkerStyle);
       const view = viewRef.current;
       if (!view) return;
@@ -399,8 +400,11 @@ export function useFoliateAnnotations({
       Promise.all([
         invoke<WordMarkRule[]>("list_word_marks", { bookId }),
         invoke<WordMarkException[]>("list_word_mark_exceptions", { bookId }),
-      ]).then(([rules, exceptions]) => {
-        wordMarkWordsRef.current = rules.filter((rule) => rule.enabled).map((rule) => rule.normalized_word);
+      ]).then(async ([rules, exceptions]) => {
+        wordMarkWordsRef.current = await expandWordForms(
+          rules.filter((rule) => rule.enabled).map((rule) => rule.normalized_word),
+          markerStyleRef.current.wordMatchScope === "forms",
+        );
         wordMarkExceptionsRef.current = new Set(exceptions
           .filter((exception) => exception.excluded)
           .map((exception) => `${exception.normalized_word}\0${exception.location}`));
@@ -409,7 +413,29 @@ export function useFoliateAnnotations({
     };
     window.addEventListener("word-mark-changed", refresh);
     return () => window.removeEventListener("word-mark-changed", refresh);
-  }, [applyFoliateMarkerStyles, bookId, isTextBook, supportsWordMarkers]);
+  }, [applyFoliateMarkerStyles, bookId, isTextBook, markerStyleRef, supportsWordMarkers]);
+
+  useEffect(() => {
+    if (!bookId || isTextBook || !supportsWordMarkers) return;
+    const refresh = async () => {
+      const rules = await invoke<WordMarkRule[]>("list_word_marks", { bookId });
+      wordMarkWordsRef.current = await expandWordForms(
+        rules.filter((rule) => rule.enabled).map((rule) => rule.normalized_word),
+        markerStyleRef.current.wordMatchScope === "forms",
+      );
+      applyFoliateMarkerStyles();
+    };
+    void refresh();
+    window.addEventListener("word-forms-changed", refresh);
+    return () => window.removeEventListener("word-forms-changed", refresh);
+  }, [
+    applyFoliateMarkerStyles,
+    bookId,
+    isTextBook,
+    markerStyle.wordMatchScope,
+    markerStyleRef,
+    supportsWordMarkers,
+  ]);
 
   useEffect(() => {
     if (!bookId || isTextBook) return;

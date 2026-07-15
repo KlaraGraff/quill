@@ -18,14 +18,13 @@ import {
 import {
   useEffect,
   useState,
-  type DragEvent,
-  type KeyboardEvent,
 } from "react";
 import { useTranslation } from "react-i18next";
 import Button from "../ui/Button";
 import Input from "../ui/Input";
 import Select from "../ui/Select";
 import Slider from "../ui/Slider";
+import SortableList from "../ui/SortableList";
 import Toggle from "../ui/Toggle";
 
 export interface AiProfile {
@@ -90,8 +89,6 @@ interface AiServiceCardProps {
   healthStale: boolean;
   oauthStatus: OAuthStatus;
   oauthLoading: boolean;
-  dragging: boolean;
-  dropTarget: boolean;
   onToggleExpanded: () => void;
   onChange: (patch: Partial<AiProfile>) => void;
   onToggleEnabled: (enabled: boolean) => Promise<void>;
@@ -100,10 +97,6 @@ interface AiServiceCardProps {
   onDuplicate: () => Promise<void>;
   onDelete: () => Promise<void>;
   onMove: (direction: -1 | 1) => Promise<void>;
-  onDragStart: (event: DragEvent<HTMLElement>) => void;
-  onDragOver: (event: DragEvent<HTMLElement>) => void;
-  onDrop: (event: DragEvent<HTMLElement>) => void;
-  onDragEnd: () => void;
   onAddCredential: (label: string, value: string) => Promise<void>;
   onReplaceCredential: (id: string, value: string) => Promise<void>;
   onToggleCredential: (id: string, enabled: boolean) => Promise<void>;
@@ -216,8 +209,6 @@ export default function AiServiceCard({
   healthStale,
   oauthStatus,
   oauthLoading,
-  dragging,
-  dropTarget,
   onToggleExpanded,
   onChange,
   onToggleEnabled,
@@ -225,11 +216,6 @@ export default function AiServiceCard({
   onFetchModels,
   onDuplicate,
   onDelete,
-  onMove,
-  onDragStart,
-  onDragOver,
-  onDrop,
-  onDragEnd,
   onAddCredential,
   onReplaceCredential,
   onToggleCredential,
@@ -330,35 +316,16 @@ export default function AiServiceCard({
     await runCredential("order", () => onReorderCredentials(next.map((item) => item.id)));
   };
 
-  const handleOrderKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
-    if (profileBusy || expanded) return;
-    if (!event.altKey || (event.key !== "ArrowUp" && event.key !== "ArrowDown")) return;
-    event.preventDefault();
-    void onMove(event.key === "ArrowUp" ? -1 : 1);
-  };
-
   return (
-    <section
-      onDragOver={onDragOver}
-      onDrop={onDrop}
-      className={`overflow-hidden rounded-lg border bg-bg-surface transition-[border-color,opacity,box-shadow] ${
-        dropTarget ? "border-accent shadow-sm" : "border-border"
-      } ${dragging ? "opacity-45" : "opacity-100"}`}
-    >
+    <section className="overflow-hidden rounded-lg border border-border bg-bg-surface transition-[border-color,opacity,box-shadow]">
       <div className="flex min-h-[68px] items-center gap-2 px-2.5 py-2">
-        <button
-          type="button"
-          draggable={!profileBusy && !expanded}
-          disabled={profileBusy || expanded}
-          onDragStart={onDragStart}
-          onDragEnd={onDragEnd}
-          onKeyDown={handleOrderKeyDown}
+        <span
           title={t("settings.ai.reorderHint")}
           aria-label={t("settings.ai.reorderService", { name: profile.label })}
-          className="flex size-8 shrink-0 cursor-grab items-center justify-center rounded-md text-text-muted hover:bg-bg-input active:cursor-grabbing disabled:cursor-default"
+          className={`flex size-8 shrink-0 items-center justify-center text-text-muted ${profileBusy || expanded ? "opacity-35" : ""}`}
         >
           <GripVertical size={15} />
-        </button>
+        </span>
 
         <button
           type="button"
@@ -597,9 +564,14 @@ export default function AiServiceCard({
               </div>
 
               {credentials.length > 0 && (
-                <div className="divide-y divide-border-light border-y border-border-light">
-                  {credentials.map((credential, credentialIndex) => (
-                    <div key={credential.id} className="py-2">
+                <SortableList
+                  items={credentials}
+                  getId={(credential) => credential.id}
+                  disabled={credentialBusyId != null}
+                  onReorder={(items) => runCredential("order", () => onReorderCredentials(items.map((item) => item.id)))}
+                  className="divide-y divide-border-light border-y border-border-light"
+                  renderItem={(credential, credentialIndex) => (
+                    <div className="py-2">
                       <div className="flex items-center gap-2">
                         <Toggle
                           checked={credential.enabled}
@@ -689,8 +661,8 @@ export default function AiServiceCard({
                         </div>
                       )}
                     </div>
-                  ))}
-                </div>
+                  )}
+                />
               )}
 
               <div className="mt-3 space-y-2">

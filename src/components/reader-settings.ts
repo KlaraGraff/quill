@@ -24,9 +24,11 @@ const themes = [
   { id: "paper", label: "Reading Paper", color: "bg-reader-paper-bg border border-reader-original-border", pdf: true },
   { id: "quiet", label: "Gray", color: "bg-reader-quiet-bg", pdf: true },
   { id: "dark", label: "Dark", color: "bg-reader-dark-bg border border-reader-dark-border", pdf: true },
+  { id: "custom", label: "Custom", color: "border border-reader-original-border", pdf: true },
 ] as const;
 
 export type ReaderTheme = (typeof themes)[number]["id"];
+export interface ReaderCustomTheme { color: string; opacity: number }
 export type ReaderFont = string;
 
 export interface ReaderCapabilities {
@@ -158,7 +160,65 @@ export function setCustomReaderFonts(customFonts: Array<{ id: string; family_nam
   fonts.splice(0, fonts.length, ...next);
 }
 
-export function getThemeStyles(themeId: ReaderTheme) {
+export const DEFAULT_READER_CUSTOM_THEME: ReaderCustomTheme = { color: "#DDE8D8", opacity: 70 };
+
+export function parseReaderCustomTheme(value: unknown): ReaderCustomTheme {
+  let source = value;
+  if (typeof source === "string") {
+    try { source = JSON.parse(source); } catch { source = null; }
+  }
+  const record = source && typeof source === "object" ? source as Partial<ReaderCustomTheme> : {};
+  return {
+    color: typeof record.color === "string" && /^#[0-9a-f]{6}$/i.test(record.color)
+      ? record.color.toUpperCase()
+      : DEFAULT_READER_CUSTOM_THEME.color,
+    opacity: Number.isFinite(record.opacity)
+      ? Math.min(100, Math.max(0, Number(record.opacity)))
+      : DEFAULT_READER_CUSTOM_THEME.opacity,
+  };
+}
+
+function rgb(color: string) {
+  return [1, 3, 5].map((start) => parseInt(color.slice(start, start + 2), 16));
+}
+
+function hex(channels: number[]) {
+  return `#${channels.map((channel) => Math.round(channel).toString(16).padStart(2, "0")).join("")}`.toUpperCase();
+}
+
+function luminance(color: string) {
+  const channels = rgb(color).map((channel) => {
+    const value = channel / 255;
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  });
+  return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+}
+
+function contrast(left: string, right: string) {
+  const values = [luminance(left), luminance(right)].sort((a, b) => b - a);
+  return (values[0] + 0.05) / (values[1] + 0.05);
+}
+
+function mix(foreground: string, background: string, opacity: number) {
+  const fg = rgb(foreground);
+  const bg = rgb(background);
+  const alpha = opacity / 100;
+  return hex(fg.map((channel, index) => channel * alpha + bg[index] * (1 - alpha)));
+}
+
+export function getCustomThemeStyles(customTheme: ReaderCustomTheme) {
+  const normalized = parseReaderCustomTheme(customTheme);
+  const body = mix(normalized.color, "#FFFFFF", normalized.opacity);
+  const lightBackground = luminance(body) >= 0.42;
+  let text = lightBackground ? "#2A2620" : "#E7E7EA";
+  const target = lightBackground ? "#000000" : "#FFFFFF";
+  for (let step = 1; contrast(body, text) < 4.5 && step <= 10; step += 1) {
+    text = mix(target, text, step * 10);
+  }
+  return { body, text };
+}
+
+export function getThemeStyles(themeId: ReaderTheme, customTheme = DEFAULT_READER_CUSTOM_THEME) {
   switch (themeId) {
     case "paper":
       return { body: "#FAF7F0", text: "#29251E" };
@@ -166,6 +226,8 @@ export function getThemeStyles(themeId: ReaderTheme) {
       return { body: "#71717b", text: "#fafafa" };
     case "dark":
       return { body: "#1b1b1f", text: "#d8d8de" };
+    case "custom":
+      return getCustomThemeStyles(customTheme);
     default:
       return { body: "#ffffff", text: "#0a0a0a" };
   }

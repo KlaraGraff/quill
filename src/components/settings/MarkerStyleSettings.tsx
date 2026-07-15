@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Check } from "lucide-react";
+import { ChevronDown, ChevronRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
   MARKER_COLOR_PRESETS,
@@ -13,7 +13,9 @@ import { fonts } from "../reader-settings";
 import { installCustomFontFaces, type CustomFontRecord } from "../custom-fonts";
 import Select from "../ui/Select";
 import Toggle from "../ui/Toggle";
+import ColorControl from "../ui/ColorControl";
 import { ROW_CONTROL_WIDTH } from "./types";
+import WordFormsManager from "./WordFormsManager";
 
 interface MarkerStyleSettingsProps {
   value: MarkerStyleConfigV1;
@@ -51,36 +53,19 @@ function TreatmentToggle({
 }
 
 function StyleEditor({
-  id,
   title,
   value,
   onChange,
 }: {
-  id: "manual" | "automatic";
   title: string;
   value: MarkerVisualStyleV1;
   onChange: (value: MarkerVisualStyleV1) => void;
 }) {
   const { t } = useTranslation();
-  const [colorDraft, setColorDraft] = useState(value.color);
-  useEffect(() => {
-    setColorDraft(value.color);
-  }, [value.color]);
-
   const update = <K extends keyof MarkerVisualStyleV1>(key: K, next: MarkerVisualStyleV1[K]) => {
     const candidate = { ...value, [key]: next };
     if (!candidate.background && !candidate.underline && !candidate.bold) return;
     onChange(candidate);
-  };
-  const commitColorDraft = () => {
-    const trimmed = colorDraft.trim();
-    const normalized = (trimmed.startsWith("#") ? trimmed : `#${trimmed}`).toUpperCase();
-    if (/^#[0-9A-F]{6}$/.test(normalized)) {
-      setColorDraft(normalized);
-      update("color", normalized);
-    } else {
-      setColorDraft(value.color);
-    }
   };
   const fontOptions = [
     { value: "inherit", label: t("settings.tools.markers.followOriginal") },
@@ -92,62 +77,16 @@ function StyleEditor({
     <section className="border-t border-border-light py-4 first:border-t-0 first:pt-0">
       <h4 className="mb-3 text-[12px] font-semibold text-text-primary">{title}</h4>
       <div className="space-y-3">
-        <div>
-          <p className="mb-2 text-[11px] text-text-muted">{t("settings.tools.markers.color")}</p>
-          <div className="flex flex-wrap items-center gap-2">
-            {MARKER_COLOR_PRESETS.map((color) => (
-              <button
-                key={color}
-                type="button"
-                aria-label={color}
-                title={color}
-                onClick={() => update("color", color)}
-                className={`flex size-7 items-center justify-center rounded-full border border-black/10 ${value.color === color ? "ring-2 ring-accent ring-offset-2 ring-offset-bg-surface" : ""}`}
-                style={{ backgroundColor: color }}
-              >
-                {value.color === color && <Check size={13} className="text-white drop-shadow" />}
-              </button>
-            ))}
-            <label className="relative size-7 shrink-0 overflow-hidden rounded-full border border-border" title={t("settings.tools.markers.colorPicker")}>
-              <input
-                type="color"
-                value={value.color}
-                onChange={(event) => update("color", event.target.value.toUpperCase())}
-                className="absolute -inset-2 size-12 cursor-pointer border-0 bg-transparent p-0"
-              />
-            </label>
-            <input
-              value={colorDraft}
-              maxLength={7}
-              aria-label={t("settings.tools.markers.hexColor")}
-              onChange={(event) => setColorDraft(event.target.value.toUpperCase())}
-              onBlur={commitColorDraft}
-              onKeyDown={(event) => {
-                if (event.key !== "Enter") return;
-                event.preventDefault();
-                commitColorDraft();
-              }}
-              className="h-8 w-[88px] rounded-md border border-border bg-bg-input px-2 font-mono text-[11px] uppercase text-text-primary outline-none focus:border-accent"
-            />
-          </div>
-        </div>
-
-        <div className="flex items-center gap-3">
-          <label className="w-[72px] shrink-0 text-[11px] text-text-muted" htmlFor={`${id}-marker-opacity`}>
-            {t("settings.tools.markers.opacity")}
-          </label>
-          <input
-            id={`${id}-marker-opacity`}
-            type="range"
-            min={5}
-            max={100}
-            step={1}
-            value={value.opacity}
-            onChange={(event) => update("opacity", Number(event.target.value))}
-            className="h-1 flex-1 cursor-pointer accent-accent"
-          />
-          <span className="w-10 text-right text-[11px] tabular-nums text-text-secondary">{value.opacity}%</span>
-        </div>
+        <ColorControl
+          color={value.color}
+          opacity={value.opacity}
+          presets={MARKER_COLOR_PRESETS}
+          colorLabel={t("settings.tools.markers.color")}
+          pickerLabel={t("settings.tools.markers.colorPicker")}
+          hexLabel={t("settings.tools.markers.hexColor")}
+          opacityLabel={t("settings.tools.markers.opacity")}
+          onChange={(next) => onChange({ ...value, ...next })}
+        />
 
         <div>
           <p className="mb-2 text-[11px] text-text-muted">{t("settings.tools.markers.treatments")}</p>
@@ -179,6 +118,7 @@ function StyleEditor({
 export default function MarkerStyleSettings({ value, onChange }: MarkerStyleSettingsProps) {
   const { t } = useTranslation();
   const [customFonts, setCustomFonts] = useState<CustomFontRecord[]>([]);
+  const [wordFormsOpen, setWordFormsOpen] = useState(true);
 
   useEffect(() => {
     invoke<CustomFontRecord[]>("list_custom_fonts").then((records) => {
@@ -206,22 +146,40 @@ export default function MarkerStyleSettings({ value, onChange }: MarkerStyleSett
       </div>
 
       <div className="mb-4 flex min-h-[52px] items-center justify-between gap-4 border-b border-border-light pb-3">
-        <div>
+        <div className="flex min-w-0 items-start gap-1.5">
+          {value.wordMatchScope === "forms" && (
+            <button
+              type="button"
+              aria-expanded={wordFormsOpen}
+              onClick={() => setWordFormsOpen((open) => !open)}
+              className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-md text-text-muted hover:bg-bg-input"
+            >
+              {wordFormsOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+            </button>
+          )}
+          <div>
           <p className="text-[13px] font-medium text-text-primary">{t("settings.tools.markers.wordScope")}</p>
           <p className="text-[11px] leading-[17px] text-text-muted">{t("settings.tools.markers.wordScopeHint")}</p>
+          </div>
         </div>
         <Select
           className={ROW_CONTROL_WIDTH}
-          value={value.markMatchingWords ? "book" : "current"}
-          onChange={(scope) => onChange({ ...value, markMatchingWords: scope === "book" })}
+          value={value.wordMatchScope}
+          onChange={(scope) => {
+            if (scope === "forms") setWordFormsOpen(true);
+            onChange({ ...value, wordMatchScope: scope as MarkerStyleConfigV1["wordMatchScope"] });
+          }}
           options={[
             { value: "current", label: t("settings.tools.markers.currentOnly") },
             { value: "book", label: t("settings.tools.markers.sameWordsInBook") },
+            { value: "forms", label: t("settings.tools.markers.sameWordForms") },
           ]}
         />
       </div>
 
-      <StyleEditor id="manual" title={t("settings.tools.markers.manualStyle")} value={value.manual} onChange={(manual) => onChange({ ...value, manual })} />
+      {value.wordMatchScope === "forms" && wordFormsOpen && <WordFormsManager />}
+
+      <StyleEditor title={t("settings.tools.markers.manualStyle")} value={value.manual} onChange={(manual) => onChange({ ...value, manual })} />
 
       <div className="flex min-h-[52px] items-center justify-between gap-4 border-t border-border-light py-3">
         <div>
@@ -236,7 +194,7 @@ export default function MarkerStyleSettings({ value, onChange }: MarkerStyleSett
       </div>
 
       {!value.automaticFollowsManual && (
-        <StyleEditor id="automatic" title={t("settings.tools.markers.automaticStyle")} value={value.automatic} onChange={(automatic) => onChange({ ...value, automatic })} />
+        <StyleEditor title={t("settings.tools.markers.automaticStyle")} value={value.automatic} onChange={(automatic) => onChange({ ...value, automatic })} />
       )}
 
       {customFonts.length === 0 && (
