@@ -87,6 +87,7 @@ export function usePageTurnInput({
     if (!direction) return;
     event.preventDefault();
     event.stopPropagation();
+    if (event.repeat) return;
     turnPage(direction);
   }, [bookFormat, onPdfZoom, panelRef, settingsRef, turnPage]);
 
