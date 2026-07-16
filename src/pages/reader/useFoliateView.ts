@@ -507,11 +507,30 @@ export function useFoliateView({
           view.book?.sections?.length ?? book.pages,
         );
       }
-      await withTimeout(
-        view.init({ lastLocation: startLocation, showTextStart: !startLocation }),
-        45_000,
-        "READER_INIT_TIMEOUT",
-      );
+      try {
+        await withTimeout(
+          view.init({ lastLocation: startLocation, showTextStart: !startLocation }),
+          45_000,
+          "READER_INIT_TIMEOUT",
+        );
+      } catch (error) {
+        // A stale or unresolvable saved location (e.g. a CFI synced from a
+        // different device or an earlier format) can make foliate's `goTo`
+        // hang on the restore navigation, which surfaces as READER_INIT_TIMEOUT
+        // and leaves the book permanently unopenable. When we started from a
+        // saved location, fall back once to opening at the text start so the
+        // book still opens; the reader then relocates and overwrites the bad
+        // CFI on the next progress save.
+        const isTimeout = error instanceof Error && error.message === "READER_INIT_TIMEOUT";
+        if (cancelled || !isTimeout || !startLocation) throw error;
+        logIgnoredError("reader.init-timeout-retry", error);
+        currentCfiRef.current = null;
+        await withTimeout(
+          view.init({ lastLocation: undefined, showTextStart: true }),
+          45_000,
+          "READER_INIT_TIMEOUT",
+        );
+      }
       if (cancelled) return;
       if (viewerRef.current) {
         viewerRef.current.style.filter = `brightness(${readerSettings.brightness / 100})`;
