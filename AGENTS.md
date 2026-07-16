@@ -42,6 +42,13 @@ Core vocabulary:
 - `docs/impls/`: implementation plans; shipped plans live in `docs/impls/archive/`.
 - `docs/guide/` and `docs/roadmap/`: user-facing guides and product planning notes.
 
+## Working Copy
+
+- The canonical local clone is `~/vibecoding/Lantern`. Work there.
+- Do not create additional clones of this repo. Parallel clones drift — each keeps its own `main`, and agents working in different clones act on different worlds. If you are running in a clone other than the canonical one, say so and stop rather than working around it.
+- Start every session with `git fetch origin && git status`. Another agent or session may have moved `main` since your context was built.
+- More than one assistant works in this repo. If the working tree holds changes you did not make, they are probably another agent's in-flight work: inspect and preserve them. Do not revert, stash, or commit them as your own.
+
 ## Development Commands
 
 - Install deps: `npm ci`.
@@ -73,6 +80,10 @@ Prefer the smallest check that covers the change. For frontend changes, run type
 
 ## Commit And PR Conventions
 
+- **Default: commit straight to `main`.** This is a single-maintainer repo with no branch protection and no reviewers, so a PR adds a round trip without adding a reader. Run the checks that cover your change (see Development Commands), commit, push. CI runs on pushes to `main` and catches what you missed.
+- Open a branch and PR only when the change is large or risky enough that you want CI to gate it *before* it lands, or when the user asks for one.
+- **If you open a PR, carry it to done in the same turn:** wait for CI, merge when green, delete the branch, update local `main`. A green PR left open is an unfinished task, not a delivered one.
+- Do not end a turn on "should I push?". If the checks pass and the change is what was asked for, push it. Stop and ask only when a check fails, the diff grew beyond what was asked, or the change is genuinely irreversible.
 - Use focused commits with an imperative subject.
 - Common scopes: `sync`, `commands`, `reader`, `library`, `settings`, `ai`, `mcp`, `ui`, `docs`, `release`.
 - Example: `fix(sync): keep status reads off the webview thread`.
