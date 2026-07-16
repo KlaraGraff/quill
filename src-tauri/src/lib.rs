@@ -376,6 +376,7 @@ fn boot_sync_engine(
             // Their source blobs are now reconciled, so build local reader
             // caches without holding the sync worker or UI thread.
             commands::books::schedule_pending_text_book_preparations(bg_handle.clone());
+            commands::books::schedule_pending_book_conversions(bg_handle.clone());
             let _ = bg_handle.emit("sync-initial-tick-done", ());
         })
         .ok();
@@ -631,6 +632,7 @@ pub fn run() {
             // Resume any interrupted work after managed state is available;
             // this deliberately runs away from setup's UI-critical path.
             commands::books::resume_interrupted_text_book_preparations(app.handle().clone());
+            commands::books::resume_interrupted_book_conversions(app.handle().clone());
 
             // Boot the sync engine on a background thread. Everything
             // that touches iCloud paths (EventLog::open, watcher::spawn,
@@ -701,6 +703,8 @@ pub fn run() {
             commands::books::update_book_metadata,
             commands::books::get_text_book_document,
             commands::books::retry_text_book_preparation,
+            commands::books::get_converted_book_path,
+            commands::books::retry_book_conversion,
             commands::ai::ai_reindex_book,
             commands::ai::ai_update_book_index,
             commands::ai::ai_index_details,

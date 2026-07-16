@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { AlertCircle, Loader2 } from "lucide-react";
 import type { Book } from "../hooks/useBooks";
 import { openReaderWindow } from "../utils/openReaderWindow";
-import { deleteBook, markFinished, retryTextBookPreparation, updateBookStatus } from "../hooks/useBooks";
+import { deleteBook, markFinished, isPendingPreparation, needsPreparation, retryPreparation, updateBookStatus } from "../hooks/useBooks";
 import BookContextMenu from "./BookContextMenu";
 import EditMetadataModal from "./EditMetadataModal";
 import { useTranslation } from "react-i18next";
@@ -54,16 +54,14 @@ export default function BookGrid({ books, hasMore, loadMore, loadingMore, active
     setContextMenu({ x: e.clientX, y: e.clientY, book });
   };
 
-  const isPendingTextBook = (book: Book) => book.render_format === "text" && book.preparation_state !== "ready";
-
   const openBook = async (book: Book) => {
     if (book.available === false) return;
-    if (book.render_format === "text" && book.preparation_state === "failed") {
-      await retryTextBookPreparation(book.id);
+    if (needsPreparation(book) && book.preparation_state === "failed") {
+      await retryPreparation(book);
       onBooksChanged?.();
       return;
     }
-    if (!isPendingTextBook(book)) openReaderWindow(book.id);
+    if (!isPendingPreparation(book)) openReaderWindow(book.id);
   };
 
   return (
@@ -74,7 +72,7 @@ export default function BookGrid({ books, hasMore, loadMore, loadingMore, active
             key={book.id}
             onClick={() => { openBook(book).catch(() => {}); }}
             onContextMenu={(e) => handleContextMenu(e, book)}
-            className={`text-left cursor-pointer group ${book.available === false ? "opacity-60" : ""} ${isPendingTextBook(book) ? "cursor-wait" : ""}`}
+            className={`text-left cursor-pointer group ${book.available === false ? "opacity-60" : ""} ${isPendingPreparation(book) ? "cursor-wait" : ""}`}
           >
             <div className="relative bg-border rounded-lg overflow-hidden shadow-card aspect-[3/4]">
               {book.cover_data ? (
@@ -91,7 +89,7 @@ export default function BookGrid({ books, hasMore, loadMore, loadingMore, active
                   <CloudDownload size={32} className="text-white" />
                 </div>
               )}
-              {isPendingTextBook(book) && (
+              {isPendingPreparation(book) && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/45 px-3 text-center">
                   {book.preparation_state === "failed" ? <AlertCircle size={26} className="text-white" /> : <Loader2 size={26} className="animate-spin text-white" />}
                   <span className="text-[12px] font-medium text-white leading-4">

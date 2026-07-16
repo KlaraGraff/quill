@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { openReaderWindow } from "../utils/openReaderWindow";
 import { AlertCircle, Check, CloudDownload, Loader2 } from "lucide-react";
 import type { Book } from "../hooks/useBooks";
-import { deleteBook, markFinished, retryTextBookPreparation, updateBookStatus } from "../hooks/useBooks";
+import { deleteBook, markFinished, isPendingPreparation, needsPreparation, retryPreparation, updateBookStatus } from "../hooks/useBooks";
 import BookContextMenu from "./BookContextMenu";
 import EditMetadataModal from "./EditMetadataModal";
 import { useTranslation } from "react-i18next";
@@ -53,16 +53,14 @@ export default function BookList({ books, hasMore, loadMore, loadingMore, active
     setContextMenu({ x: e.clientX, y: e.clientY, book });
   };
 
-  const isPendingTextBook = (book: Book) => book.render_format === "text" && book.preparation_state !== "ready";
-
   const openBook = async (book: Book) => {
     if (book.available === false) return;
-    if (book.render_format === "text" && book.preparation_state === "failed") {
-      await retryTextBookPreparation(book.id);
+    if (needsPreparation(book) && book.preparation_state === "failed") {
+      await retryPreparation(book);
       onBooksChanged?.();
       return;
     }
-    if (!isPendingTextBook(book)) openReaderWindow(book.id);
+    if (!isPendingPreparation(book)) openReaderWindow(book.id);
   };
 
   return (
@@ -73,7 +71,7 @@ export default function BookList({ books, hasMore, loadMore, loadingMore, active
             key={book.id}
             onClick={() => { openBook(book).catch(() => {}); }}
             onContextMenu={(e) => handleContextMenu(e, book)}
-            className={`flex items-start gap-4 p-4 border border-border rounded-lg text-left cursor-pointer hover:bg-bg-muted transition-colors ${book.available === false ? "opacity-60" : ""} ${isPendingTextBook(book) ? "cursor-wait" : ""}`}
+            className={`flex items-start gap-4 p-4 border border-border rounded-lg text-left cursor-pointer hover:bg-bg-muted transition-colors ${book.available === false ? "opacity-60" : ""} ${isPendingPreparation(book) ? "cursor-wait" : ""}`}
           >
             {/* Cover */}
             <div className="relative w-[96px] h-[144px] shrink-0 rounded-lg overflow-hidden bg-border shadow-card">
@@ -91,7 +89,7 @@ export default function BookList({ books, hasMore, loadMore, loadingMore, active
                   <CloudDownload size={24} className="text-white" />
                 </div>
               )}
-              {isPendingTextBook(book) && (
+              {isPendingPreparation(book) && (
                 <div className="absolute inset-0 flex items-center justify-center bg-black/45">
                   {book.preparation_state === "failed" ? <AlertCircle size={24} className="text-white" /> : <Loader2 size={24} className="animate-spin text-white" />}
                 </div>
@@ -116,7 +114,7 @@ export default function BookList({ books, hasMore, loadMore, loadingMore, active
                   {book.description}
                 </p>
               )}
-              {isPendingTextBook(book) && (
+              {isPendingPreparation(book) && (
                 <p className="mt-1 text-[12px] text-text-muted">
                   {book.preparation_state === "failed" ? t("book.preparationFailed") : t("book.preparing")}
                 </p>

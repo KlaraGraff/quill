@@ -27,6 +27,7 @@ use crate::sync::merge::{self, entity};
 use crate::sync::writer::SyncWriter;
 use crate::LocalDir;
 
+mod convert_prepare;
 mod format;
 mod import;
 mod mutate;
@@ -71,8 +72,21 @@ pub use text_prepare::{
     get_text_book_document, resume_interrupted_text_book_preparations, retry_text_book_preparation,
     schedule_pending_text_book_preparations, schedule_text_book_preparation,
 };
+#[doc(hidden)]
+pub use convert_prepare::{__cmd__get_converted_book_path, __cmd__retry_book_conversion};
+pub(crate) use convert_prepare::{
+    conversion_backend_available, is_conversion_book, schedule_book_conversion,
+};
+pub use convert_prepare::{
+    get_converted_book_path, resume_interrupted_book_conversions, retry_book_conversion,
+    schedule_pending_book_conversions,
+};
 
 pub(super) const TEXT_DOCUMENT_VERSION: i32 = 3;
+/// Bumped whenever the source-format → EPUB conversion output changes in a
+/// way that invalidates previously converted artifacts, forcing a per-device
+/// re-conversion (the converted EPUB is a local, non-synced derivative).
+pub(super) const CONVERSION_VERSION: i32 = 1;
 pub(super) const MAX_TEXT_IMPORT_BYTES: u64 = 25 * 1024 * 1024;
 pub(super) const TXT_CHAPTER_TARGET_CHARS: usize = 24_000;
 pub(super) const IMPORTABLE_BOOK_EXTENSIONS: &[&str] = &[

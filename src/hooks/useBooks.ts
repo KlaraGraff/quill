@@ -149,3 +149,34 @@ export async function checkBookAvailable(id: string): Promise<BookAvailability> 
 export async function retryTextBookPreparation(id: string): Promise<void> {
   return invoke("retry_text_book_preparation", { bookId: id });
 }
+
+export async function retryBookConversion(id: string): Promise<void> {
+  return invoke("retry_book_conversion", { bookId: id });
+}
+
+/** A book whose reader format is EPUB but whose source is a different format
+ * (MOBI/AZW3, later scanned PDF) — it is served from a locally converted EPUB. */
+export function isConversionBook(book: Book): boolean {
+  return (
+    book.render_format === "epub" &&
+    book.source_format !== null &&
+    book.source_format !== "epub"
+  );
+}
+
+/** Books that must finish background preparation (text conversion or
+ * source→EPUB conversion) before the reader can open them. */
+export function needsPreparation(book: Book): boolean {
+  return book.render_format === "text" || isConversionBook(book);
+}
+
+/** True while such a book is not yet ready to open. */
+export function isPendingPreparation(book: Book): boolean {
+  return needsPreparation(book) && book.preparation_state !== "ready";
+}
+
+/** Dispatch a preparation retry to the right backend command by book kind. */
+export async function retryPreparation(book: Book): Promise<void> {
+  if (isConversionBook(book)) return retryBookConversion(book.id);
+  return retryTextBookPreparation(book.id);
+}

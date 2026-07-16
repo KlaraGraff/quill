@@ -1129,6 +1129,102 @@ fn test_get_book_returns_format() {
     assert_eq!(book.id, "b1");
 }
 
+fn converted_book(id: &str, state: &str) -> Book {
+    Book {
+        id: id.to_string(),
+        title: "Book".into(),
+        author: "Author".into(),
+        description: None,
+        cover_path: None,
+        file_path: format!("books/{id}.azw3"),
+        format: "mobi".into(),
+        source_format: Some("mobi".into()),
+        render_format: Some("epub".into()),
+        source_file_path: Some(format!("books/{id}.azw3")),
+        source_sha256: Some("hash".into()),
+        conversion_version: super::CONVERSION_VERSION,
+        preparation_state: state.into(),
+        preparation_error: None,
+        genre: None,
+        pages: None,
+        status: "reading".into(),
+        progress: 0,
+        current_cfi: None,
+        created_at: 1,
+        updated_at: 1,
+        available: false,
+        cover_data: None,
+    }
+}
+
+#[test]
+fn resolve_paths_redirects_ready_converted_book_to_local_artifact() {
+    let (_dir, db) = setup();
+    // Write the local converted artifact where the machine would place it.
+    let local_dir = db.local_data_dir().unwrap();
+    let artifact = super::convert_prepare::converted_document_path(&local_dir, "cv1");
+    std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    std::fs::write(&artifact, b"PK\x03\x04epub").unwrap();
+
+    let mut book = converted_book("cv1", "ready");
+    super::query::resolve_book_paths(&mut book, &db, None).unwrap();
+
+    assert_eq!(book.file_path, artifact.to_string_lossy());
+    assert!(book.available, "local converted artifact is always available");
+}
+
+#[test]
+fn resolve_paths_repends_ready_converted_book_with_missing_artifact() {
+    let (_dir, db) = setup();
+    // DB row says ready, but no artifact exists on disk (cache cleared or a
+    // CONVERSION_VERSION bump moved the expected path).
+    {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO books
+             (id, title, author, file_path, format, source_format, render_format,
+              source_file_path, source_sha256, conversion_version, preparation_state,
+              status, progress, created_at, updated_at)
+             VALUES ('cv3', 'B', 'A', 'books/cv3.azw3', 'mobi', 'mobi', 'epub',
+                     'books/cv3.azw3', 'hash', ?1, 'ready', 'reading', 0, 1, 1)",
+            params![super::CONVERSION_VERSION],
+        )
+        .unwrap();
+    }
+
+    let mut book = converted_book("cv3", "ready");
+    super::query::resolve_book_paths(&mut book, &db, None).unwrap();
+
+    // Reported and persisted state both self-heal to pending; the reader is
+    // never pointed at raw source bytes labelled as EPUB.
+    assert_eq!(book.preparation_state, "pending");
+    let persisted: String = db
+        .reader()
+        .query_row(
+            "SELECT preparation_state FROM books WHERE id = 'cv3'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted, "pending");
+}
+
+#[test]
+fn resolve_paths_does_not_redirect_before_ready() {
+    let (_dir, db) = setup();
+    let local_dir = db.local_data_dir().unwrap();
+    let artifact = super::convert_prepare::converted_document_path(&local_dir, "cv2");
+    std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    std::fs::write(&artifact, b"PK\x03\x04epub").unwrap();
+
+    // Still preparing: reader must not point at the artifact yet; it resolves
+    // to the (source) blob path instead.
+    let mut book = converted_book("cv2", "preparing");
+    super::query::resolve_book_paths(&mut book, &db, None).unwrap();
+    assert_ne!(book.file_path, artifact.to_string_lossy());
+    assert!(book.file_path.ends_with("cv2.azw3"));
+}
+
 // -----------------------------------------------------------------------
 // Pagination
 // -----------------------------------------------------------------------

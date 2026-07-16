@@ -413,12 +413,18 @@ fn apply_book_import(tx: &Transaction, event: &Event, p: &BookImportPayload) -> 
     if is_tombstoned(tx, entity::BOOK, &p.id)? {
         return Ok(());
     }
+    // preparation_state is derived, not synced: text documents and converted
+    // EPUBs (render epub from a non-epub source) are per-device local
+    // artifacts, so a book arriving over sync must start 'pending' here and
+    // re-derive them on this machine.
     tx.execute(
         "INSERT OR IGNORE INTO books
          (id, title, author, description, cover_path, file_path, genre, pages,
           format, source_format, render_format, source_file_path, source_sha256, conversion_version, preparation_state, preparation_error, status, progress, current_cfi, created_at, updated_at, updated_by_device)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                 CASE WHEN ?11 = 'text' THEN 'pending' ELSE 'ready' END, NULL,
+                 CASE WHEN ?11 = 'text' THEN 'pending'
+                      WHEN ?11 = 'epub' AND ?10 <> 'epub' THEN 'pending'
+                      ELSE 'ready' END, NULL,
                  'unread', 0, NULL, ?15, ?15, ?16)",
         params![
             p.id,

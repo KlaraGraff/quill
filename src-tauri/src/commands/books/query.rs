@@ -18,7 +18,46 @@ pub(super) fn cover_blob_to_data_uri(bytes: &[u8]) -> String {
 
 /// Resolve relative paths in a Book to absolute using data_dir,
 /// and check whether the book file is locally available.
-pub(super) fn resolve_book_paths(book: &mut Book, db: &Db) -> AppResult<()> {
+///
+/// `app` powers self-healing for converted books (re-scheduling a conversion
+/// whose artifact vanished); pass `None` where no `AppHandle` exists and the
+/// repair will wait for the next startup resume instead.
+pub(super) fn resolve_book_paths(book: &mut Book, db: &Db, app: Option<&AppHandle>) -> AppResult<()> {
+    // A converted book (EPUB render format from a non-EPUB source) reads from
+    // the local, non-synced converted artifact once preparation is `ready`.
+    // The synced `file_path` still points at the source blob and is used by
+    // the conversion job; the reader must fetch the local EPUB instead.
+    let converted_ready = book.preparation_state == "ready"
+        && convert_prepare::is_conversion_book(
+            book.render_format.as_deref(),
+            book.source_format.as_deref(),
+        );
+    if converted_ready {
+        let local_dir = db.local_data_dir()?;
+        let artifact = convert_prepare::converted_document_path(&local_dir, &book.id);
+        if artifact.is_file() {
+            book.file_path = artifact.to_string_lossy().to_string();
+            if let Some(ref cover) = book.cover_path {
+                if cover != "none" {
+                    book.cover_path = Some(db.resolve_path(cover)?.to_string_lossy().to_string());
+                }
+            }
+            // The converted EPUB lives locally, so it is always available.
+            book.available = true;
+            return Ok(());
+        }
+        // Artifact missing despite a `ready` row (cache cleared, or a
+        // CONVERSION_VERSION bump moved the expected path): self-heal by
+        // re-pending the job so the UI shows the preparing overlay instead of
+        // handing foliate the raw source bytes labelled as EPUB.
+        if convert_prepare::transition_conversion_state(db, &book.id, "ready", "pending", None)? {
+            if let Some(app) = app {
+                convert_prepare::schedule_book_conversion(app.clone(), book.id.clone());
+            }
+        }
+        book.preparation_state = "pending".to_string();
+        book.preparation_error = None;
+    }
     book.file_path = db
         .resolve_path(&book.file_path)?
         .to_string_lossy()
@@ -371,6 +410,7 @@ pub fn list_books(
     cursor: Option<String>,
     limit: Option<usize>,
     db: State<'_, Db>,
+    app: AppHandle,
 ) -> AppResult<BookPage> {
     let page_size = limit.unwrap_or(DEFAULT_PAGE_SIZE);
     let mut page = query_books(
@@ -382,7 +422,7 @@ pub fn list_books(
         page_size,
     )?;
     for book in &mut page.books {
-        resolve_book_paths(book, &db)?;
+        resolve_book_paths(book, &db, Some(&app))?;
     }
     Ok(page)
 }
@@ -409,9 +449,9 @@ pub fn get_book_counts(db: State<'_, Db>) -> AppResult<BookCounts> {
 }
 
 #[tauri::command]
-pub fn get_book(id: String, db: State<'_, Db>) -> AppResult<Book> {
+pub fn get_book(id: String, db: State<'_, Db>, app: AppHandle) -> AppResult<Book> {
     let mut book = query_book(&db, &id)?;
-    resolve_book_paths(&mut book, &db)?;
+    resolve_book_paths(&mut book, &db, Some(&app))?;
     Ok(book)
 }
 

@@ -46,7 +46,7 @@ import {
   planTextHighlightMutation,
   type HighlightMutationPlan,
 } from "../components/highlight-ranges";
-import { getBook, type Book } from "../hooks/useBooks";
+import { getBook, needsPreparation, retryPreparation, type Book } from "../hooks/useBooks";
 import { getAllSettings } from "../hooks/useSettings";
 import type { Highlight } from "../hooks/useBookmarks";
 import {
@@ -1053,8 +1053,8 @@ export default function Reader() {
             variant="secondary"
             size="sm"
             onClick={() => {
-              if (isTextBook && bookId) {
-                invoke("retry_text_book_preparation", { bookId })
+              if (needsPreparation(book) && bookId) {
+                retryPreparation(book)
                   .then(() => getBook(bookId))
                   .then((updated) => {
                     setBook(updated);

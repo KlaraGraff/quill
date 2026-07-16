@@ -239,6 +239,12 @@ fn do_import_native(
     } else {
         format.source_name().to_string()
     };
+    // MOBI-family sources are normalized to EPUB in the background when a
+    // conversion backend is present, unlocking selection and the AI tools on
+    // top of it. Without a backend they keep today's native (read-only)
+    // foliate path unchanged — graceful degradation, no regression.
+    let convert_to_epub =
+        format == ImportFormat::Mobi && conversion_backend_available(&source_format);
     let title = source
         .file_stem()
         .and_then(|value| value.to_str())
@@ -267,11 +273,19 @@ fn do_import_native(
         file_path: format!("books/{filename}"),
         format: source_format.clone(),
         source_format: Some(source_format.clone()),
-        render_format: Some(source_format),
+        render_format: Some(if convert_to_epub {
+            "epub".to_string()
+        } else {
+            source_format
+        }),
         source_file_path: Some(format!("books/{filename}")),
         source_sha256: Some(source_sha256),
-        conversion_version: 0,
-        preparation_state: default_preparation_state(),
+        conversion_version: if convert_to_epub { CONVERSION_VERSION } else { 0 },
+        preparation_state: if convert_to_epub {
+            "pending".to_string()
+        } else {
+            default_preparation_state()
+        },
         preparation_error: None,
         genre: None,
         pages: None,
@@ -439,10 +453,14 @@ fn import_user_selected_path(
     let mut book = do_import_from_path(file_path, db, sync)?;
     if book.render_format.as_deref() == Some("text") {
         schedule_text_book_preparation(app.clone(), book.id.clone());
+    } else if is_conversion_book(book.render_format.as_deref(), book.source_format.as_deref()) {
+        // Grounding indexing for these runs when the conversion publishes,
+        // reading the converted EPUB rather than the raw source.
+        schedule_book_conversion(app.clone(), book.id.clone());
     } else {
         crate::ai::grounding::index::schedule_index(app.clone(), book.id.clone());
     }
-    resolve_book_paths(&mut book, db)?;
+    resolve_book_paths(&mut book, db, Some(app))?;
     Ok(book)
 }
 

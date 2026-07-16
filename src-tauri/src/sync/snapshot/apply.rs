@@ -417,7 +417,10 @@ pub(super) fn upsert_book(tx: &Transaction, id: &str, r: &BookRow) -> AppResult<
          (id, title, author, description, cover_path, file_path, genre, pages,
           format, source_format, render_format, source_file_path, source_sha256, conversion_version, preparation_state, preparation_error, status, progress, current_cfi, created_at, updated_at, updated_by_device)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                 CASE WHEN COALESCE(?11, ?9) = 'text' THEN 'pending' ELSE 'ready' END, NULL,
+                 CASE WHEN COALESCE(?11, ?9) = 'text' THEN 'pending'
+                      WHEN COALESCE(?11, ?9) = 'epub' AND ?10 IS NOT NULL AND ?10 <> 'epub'
+                      THEN 'pending'
+                      ELSE 'ready' END, NULL,
                  ?15, ?16, ?17, ?18, ?19, ?20)
          ON CONFLICT(id) DO UPDATE SET
            title=excluded.title,
@@ -434,7 +437,11 @@ pub(super) fn upsert_book(tx: &Transaction, id: &str, r: &BookRow) -> AppResult<
            source_sha256=excluded.source_sha256,
            conversion_version=excluded.conversion_version,
            preparation_state=CASE
-             WHEN excluded.render_format IS NOT 'text' THEN 'ready'
+             WHEN excluded.render_format IS NOT 'text'
+              AND NOT (excluded.render_format IS 'epub'
+                       AND excluded.source_format IS NOT NULL
+                       AND excluded.source_format IS NOT 'epub')
+             THEN 'ready'
              WHEN excluded.source_format IS NOT books.source_format
                OR excluded.render_format IS NOT books.render_format
                OR excluded.source_file_path IS NOT books.source_file_path
@@ -444,7 +451,11 @@ pub(super) fn upsert_book(tx: &Transaction, id: &str, r: &BookRow) -> AppResult<
              ELSE books.preparation_state
            END,
            preparation_error=CASE
-             WHEN excluded.render_format IS NOT 'text' THEN NULL
+             WHEN excluded.render_format IS NOT 'text'
+              AND NOT (excluded.render_format IS 'epub'
+                       AND excluded.source_format IS NOT NULL
+                       AND excluded.source_format IS NOT 'epub')
+             THEN NULL
              WHEN excluded.source_format IS NOT books.source_format
                OR excluded.render_format IS NOT books.render_format
                OR excluded.source_file_path IS NOT books.source_file_path
