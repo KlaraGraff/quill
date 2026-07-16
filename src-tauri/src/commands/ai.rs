@@ -1225,8 +1225,15 @@ fn bounded_chat_history(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
             continue;
         }
         let content = truncate_utf8(&message.content, CHAT_MAX_MESSAGE_BYTES);
-        if content.is_empty() || total_bytes + content.len() > CHAT_MAX_TOTAL_BYTES {
+        if content.is_empty() {
             continue;
+        }
+        // Stop once a message would exceed the budget rather than skipping it
+        // and keeping older, smaller ones — that would punch a hole in the
+        // user/assistant alternation and some strict endpoints 4xx on it. We
+        // want the most recent *contiguous* window that fits.
+        if total_bytes + content.len() > CHAT_MAX_TOTAL_BYTES {
+            break;
         }
         message.content = content.to_string();
         total_bytes += message.content.len();

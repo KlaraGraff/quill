@@ -259,8 +259,55 @@ fn cancellation_registry() -> &'static Mutex<HashMap<String, watch::Sender<bool>
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Request ids cancelled while no sender was registered. A multi-step job
+/// (per-section summary generation) unregisters its id for a brief window
+/// between steps — `complete_with_failover` calls `finish_request` when each
+/// section completes, and the next section re-registers. A Stop click landing
+/// in that gap would otherwise find no sender and be dropped, so the remaining
+/// sections keep generating. Recorded here and honored by the next
+/// `register_request` / `request_is_cancelled`. Pruned by TTL so a cancel that
+/// never gets a matching registration (e.g. a Stop that races completion)
+/// can't accumulate. Request ids are UUIDs, so a stale entry can never cancel
+/// an unrelated future request.
+fn pending_cancellations() -> &'static Mutex<HashMap<String, i64>> {
+    static PENDING: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+const PENDING_CANCEL_TTL_MS: i64 = 5 * 60 * 1000;
+
+fn record_pending_cancellation(request_id: &str) {
+    if let Ok(mut pending) = pending_cancellations().lock() {
+        let now = now();
+        pending.retain(|_, recorded| now - *recorded < PENDING_CANCEL_TTL_MS);
+        pending.insert(request_id.to_string(), now);
+    }
+}
+
+fn has_pending_cancellation(request_id: &str) -> bool {
+    if let Ok(mut pending) = pending_cancellations().lock() {
+        let now = now();
+        pending.retain(|_, recorded| now - *recorded < PENDING_CANCEL_TTL_MS);
+        return pending.contains_key(request_id);
+    }
+    false
+}
+
+fn take_pending_cancellation(request_id: &str) -> bool {
+    if let Ok(mut pending) = pending_cancellations().lock() {
+        let now = now();
+        pending.retain(|_, recorded| now - *recorded < PENDING_CANCEL_TTL_MS);
+        return pending.remove(request_id).is_some();
+    }
+    false
+}
+
 pub fn register_request(request_id: &str) -> watch::Receiver<bool> {
     let (sender, receiver) = watch::channel(false);
+    // Honor a cancel that arrived while this id was between registrations.
+    if take_pending_cancellation(request_id) {
+        let _ = sender.send(true);
+    }
     if let Ok(mut registry) = cancellation_registry().lock() {
         registry.insert(request_id.to_string(), sender);
     }
@@ -274,19 +321,29 @@ pub fn finish_request(request_id: &str) {
 }
 
 pub fn cancel_request(request_id: &str) -> bool {
-    cancellation_registry()
+    let sender = cancellation_registry()
         .lock()
         .ok()
-        .and_then(|registry| registry.get(request_id).cloned())
-        .is_some_and(|sender| sender.send(true).is_ok())
+        .and_then(|registry| registry.get(request_id).cloned());
+    match sender {
+        Some(sender) => sender.send(true).is_ok(),
+        // No live request right now. Remember the cancel so a multi-step job
+        // that re-registers this id in its next step (or checks before it
+        // registers) still stops instead of running to completion.
+        None => {
+            record_pending_cancellation(request_id);
+            true
+        }
+    }
 }
 
 pub fn request_is_cancelled(request_id: &str) -> bool {
-    cancellation_registry()
+    let signalled = cancellation_registry()
         .lock()
         .ok()
         .and_then(|registry| registry.get(request_id).cloned())
-        .is_some_and(|sender| *sender.borrow())
+        .is_some_and(|sender| *sender.borrow());
+    signalled || has_pending_cancellation(request_id)
 }
 
 fn suffix(value: &str) -> String {
@@ -741,7 +798,13 @@ async fn read_json_limited(response: reqwest::Response) -> AppResult<serde_json:
     }
     let mut bytes = Vec::new();
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    // Bound each read so a stalled endpoint can't hang "list models" (and the
+    // settings UI spinner) indefinitely — the first-byte timeout only covers
+    // the initial response, not a body that trickles or stops mid-stream.
+    while let Some(chunk) = tokio::time::timeout(crate::ai::STREAM_IDLE_TIMEOUT, stream.next())
+        .await
+        .map_err(|_| AppError::Other("AI_MODEL_LIST_TIMEOUT".to_string()))?
+    {
         let chunk = chunk.map_err(|error| AppError::Ai(error.to_string()))?;
         if bytes.len().saturating_add(chunk.len()) > MAX_BYTES {
             return Err(AppError::Other("AI_MODEL_LIST_TOO_LARGE".to_string()));

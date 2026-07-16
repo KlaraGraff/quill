@@ -511,7 +511,14 @@ pub fn run() {
                     base
                 }
             };
-            migrate_legacy_app_data(&local_dir).expect("failed to migrate legacy app data");
+            // A failed legacy-data adoption must not white-screen the app: the
+            // worst case is starting without the old build's library (which the
+            // user can re-import), not a crash on launch. The steps below —
+            // creating the data dir and opening the DB — genuinely cannot be
+            // recovered from, so those stay fatal.
+            if let Err(error) = migrate_legacy_app_data(&local_dir) {
+                log::warn!("migration: failed to adopt legacy application data: {error}");
+            }
             std::fs::create_dir_all(&local_dir).expect("failed to create app data dir");
             std::fs::create_dir_all(local_dir.join("prepared"))
                 .expect("failed to create text preparation cache");

@@ -97,6 +97,74 @@ pub async fn stream_chat(
     Err(AppError::Ai("AI_STREAM_INCOMPLETE".to_string()))
 }
 
+fn process_data(
+    app: &AppHandle,
+    event_name: &str,
+    data: &str,
+    emitted: &AtomicBool,
+) -> AppResult<bool> {
+    let parsed: serde_json::Value = serde_json::from_str(data)
+        .map_err(|_| AppError::Ai("AI_STREAM_PROTOCOL_ERROR: invalid JSON event".to_string()))?;
+    match parsed["type"].as_str().unwrap_or("") {
+        "response.output_text.delta" => {
+            // Skip empty deltas so a leading blank chunk doesn't block failover
+            // to another credential (see the `emitted` gate in the router).
+            if let Some(delta) = parsed["delta"].as_str().filter(|value| !value.is_empty()) {
+                emitted.store(true, Ordering::Relaxed);
+                let _ = app.emit(
+                    event_name,
+                    AiStreamChunk {
+                        delta: delta.to_string(),
+                        reasoning_delta: None,
+                        done: false,
+                        error: None,
+                    },
+                );
+            }
+        }
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+            if let Some(delta) = parsed["delta"].as_str().filter(|value| !value.is_empty()) {
+                emitted.store(true, Ordering::Relaxed);
+                let _ = app.emit(
+                    event_name,
+                    AiStreamChunk {
+                        delta: String::new(),
+                        reasoning_delta: Some(delta.to_string()),
+                        done: false,
+                        error: None,
+                    },
+                );
+            }
+        }
+        // The Responses API reports mid-stream failures as a top-level `error`
+        // event or a `response.failed` event carrying `response.error`. Surface
+        // the real code instead of ending as a generic AI_STREAM_INCOMPLETE.
+        "error" => {
+            return Err(crate::ai::stream_event_error("OpenAI", &parsed));
+        }
+        "response.failed" => {
+            return Err(crate::ai::stream_event_error(
+                "OpenAI",
+                &parsed["response"]["error"],
+            ));
+        }
+        "response.completed" => {
+            let _ = app.emit(
+                event_name,
+                AiStreamChunk {
+                    delta: String::new(),
+                    reasoning_delta: None,
+                    done: true,
+                    error: None,
+                },
+            );
+            return Ok(true);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,58 +194,13 @@ mod tests {
             serde_json::json!({ "role": "user", "content": "Question" })
         );
     }
-}
 
-fn process_data(
-    app: &AppHandle,
-    event_name: &str,
-    data: &str,
-    emitted: &AtomicBool,
-) -> AppResult<bool> {
-    let parsed: serde_json::Value = serde_json::from_str(data)
-        .map_err(|_| AppError::Ai("AI_STREAM_PROTOCOL_ERROR: invalid JSON event".to_string()))?;
-    match parsed["type"].as_str().unwrap_or("") {
-        "response.output_text.delta" => {
-            if let Some(delta) = parsed["delta"].as_str() {
-                emitted.store(true, Ordering::Relaxed);
-                let _ = app.emit(
-                    event_name,
-                    AiStreamChunk {
-                        delta: delta.to_string(),
-                        reasoning_delta: None,
-                        done: false,
-                        error: None,
-                    },
-                );
-            }
-        }
-        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-            if let Some(delta) = parsed["delta"].as_str().filter(|value| !value.is_empty()) {
-                emitted.store(true, Ordering::Relaxed);
-                let _ = app.emit(
-                    event_name,
-                    AiStreamChunk {
-                        delta: String::new(),
-                        reasoning_delta: Some(delta.to_string()),
-                        done: false,
-                        error: None,
-                    },
-                );
-            }
-        }
-        "response.completed" => {
-            let _ = app.emit(
-                event_name,
-                AiStreamChunk {
-                    delta: String::new(),
-                    reasoning_delta: None,
-                    done: true,
-                    error: None,
-                },
-            );
-            return Ok(true);
-        }
-        _ => {}
+    #[test]
+    fn failed_response_event_surfaces_provider_code() {
+        let error = crate::ai::stream_event_error(
+            "OpenAI",
+            &serde_json::json!({ "type": "rate_limit_exceeded", "code": "rate_limit_exceeded" }),
+        );
+        assert!(error.to_string().contains("code=rate_limit_exceeded"));
     }
-    Ok(false)
 }

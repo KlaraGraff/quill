@@ -720,8 +720,19 @@ export default function Reader() {
 
     Promise.all([getAllSettings(), loadCustomFonts()]).then(([globalSettings]) => {
       if (cancelled) return;
+      // A corrupted value must not abort the load: without the try/catch the
+      // throw is swallowed by the outer .catch, `dbSettingsLoadedRef` never
+      // gets set, and the persistence effect (gated on that ref) then never
+      // overwrites the bad key — the book's settings break permanently.
       const saved = localStorage.getItem(`reader-settings-${bookId}`);
-      const bookSettings = saved ? JSON.parse(saved) as Partial<ReaderSettingsState> : {};
+      let bookSettings: Partial<ReaderSettingsState> = {};
+      if (saved) {
+        try {
+          bookSettings = JSON.parse(saved) as Partial<ReaderSettingsState>;
+        } catch {
+          localStorage.removeItem(`reader-settings-${bookId}`);
+        }
+      }
       const g = globalSettings;
       readingAssistanceSettingsRef.current = g;
       applyReadingAssistanceSettings(g);

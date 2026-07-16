@@ -941,7 +941,15 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
       stopActiveStream();
     }
 
-    await invoke("delete_chat", { chatId: id });
+    // Call sites fire-and-forget this. Contain a backend failure here so it
+    // can't surface as an unhandled rejection, and skip the post-delete
+    // navigation so the chat that's still present stays selected.
+    try {
+      await invoke("delete_chat", { chatId: id });
+    } catch (err) {
+      console.error("Failed to delete chat:", err);
+      return;
+    }
     const updatedChats = await refreshChats(currentBookId);
 
     if (id === chatIdRef.current) {
