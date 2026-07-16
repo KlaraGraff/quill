@@ -83,7 +83,7 @@
     ],
     "macOS": {
       "signingIdentity": "-",
-      "entitlements": null
+      "entitlements": "Entitlements.adhoc.plist"
     },
     "windows": {
       "certificateThumbprint": null,
