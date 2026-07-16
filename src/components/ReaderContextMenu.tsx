@@ -8,7 +8,14 @@ import {
   Sparkles,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import type { InteractionKind, SerializableRect } from "./reader-interaction";
+import {
+  READER_CONTEXT_MENU_KEY_EVENT,
+  readerMenuActivationIndex,
+  readerMenuFocusIndex,
+  type ReaderContextMenuKeyDetail,
+  type InteractionKind,
+  type SerializableRect,
+} from "./reader-interaction";
 
 export type ReaderMenuAction = "primary" | "ask-ai" | "save" | "highlight" | "translate" | "copy" | `custom_${string}`;
 
@@ -64,33 +71,46 @@ export default function ReaderContextMenu({
   }, [onToggleMark, order, showTranslate]);
 
   useEffect(() => {
-    const buttons = menuRef.current?.querySelectorAll<HTMLButtonElement>("[role='menuitem']:not(:disabled)");
-    buttons?.[0]?.focus();
+    // Moving focus on mount hides WebKit's native reader selection.
     const handleClickOutside = (event: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(event.target as Node)) onClose();
     };
-    const handleKeyDown = (event: KeyboardEvent) => {
+    const handleMenuKey = (key: string, shiftKey = false, modified = false) => {
       const items = Array.from(menuRef.current?.querySelectorAll<HTMLButtonElement>("[role='menuitem']:not(:disabled)") ?? []);
-      if (event.key === "Escape") {
-        event.preventDefault();
+      if (key === "Escape") {
         onClose();
-        return;
+        return true;
       }
-      if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key) || items.length === 0) return;
-      event.preventDefault();
-      const current = Math.max(0, items.indexOf(document.activeElement as HTMLButtonElement));
-      const next = event.key === "Home"
-        ? 0
-        : event.key === "End"
-          ? items.length - 1
-          : (current + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+      const current = items.indexOf(document.activeElement as HTMLButtonElement);
+      const activation = readerMenuActivationIndex(key, current, items.length, modified);
+      if (activation !== null) {
+        items[activation]?.click();
+        return true;
+      }
+      const next = readerMenuFocusIndex(key, current, items.length, shiftKey, modified);
+      if (next === null) return false;
       items[next]?.focus();
+      return true;
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!handleMenuKey(
+        event.key,
+        event.shiftKey,
+        event.altKey || event.ctrlKey || event.metaKey,
+      )) return;
+      event.preventDefault();
+    };
+    const handleReaderKey = (event: Event) => {
+      const detail = (event as CustomEvent<ReaderContextMenuKeyDetail>).detail;
+      if (handleMenuKey(detail.key, detail.shiftKey, detail.modified)) detail.handled = true;
     };
     document.addEventListener("mousedown", handleClickOutside);
     document.addEventListener("keydown", handleKeyDown);
+    window.addEventListener(READER_CONTEXT_MENU_KEY_EVENT, handleReaderKey);
     return () => {
       document.removeEventListener("mousedown", handleClickOutside);
       document.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener(READER_CONTEXT_MENU_KEY_EVENT, handleReaderKey);
     };
   }, [onClose]);
 

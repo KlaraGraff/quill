@@ -29,6 +29,16 @@ use tauri::Manager;
 /// The resolved local app data directory, accounting for dev-mode isolation.
 pub struct LocalDir(pub PathBuf);
 
+/// Load and bind the bundled PDFium library without starting Tauri.
+///
+/// The release workflow invokes this through the signed app executable so
+/// macOS applies the exact hardened-runtime library-validation policy that
+/// users get. A static `codesign --verify --deep` cannot catch Team ID
+/// mismatches discovered only when `dlopen()` maps a nested dylib.
+pub fn pdfium_smoke_test() -> Result<(), String> {
+    pdfium::pdfium().map(|_| ()).map_err(str::to_owned)
+}
+
 /// Resolve the plugin's level filter, honoring `RUST_LOG` over the cfg
 /// default. Plain `LevelFilter` only — no `env_logger`-style
 /// `target=level` syntax. The spec asks devs be able to "crank it up

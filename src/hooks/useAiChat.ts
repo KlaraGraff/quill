@@ -308,7 +308,10 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
     activeRequestIdRef.current = null;
     activeAssistantIdRef.current = null;
     streamingRef.current = false;
-    if (mountedRef.current) setStreaming(false);
+    if (mountedRef.current) {
+      setStreaming(false);
+      setGroundingStatus(null);
+    }
     if (cancelBackend && requestId) {
       invoke("ai_cancel", { requestId }).catch(() => {});
     }
@@ -706,7 +709,10 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
         activeRequestIdRef.current = null;
         if (activeAssistantIdRef.current === assistantId) activeAssistantIdRef.current = null;
         streamingRef.current = false;
-        if (mountedRef.current) setStreaming(false);
+        if (mountedRef.current) {
+          setStreaming(false);
+          setGroundingStatus(null);
+        }
         return true;
       };
 

@@ -98,7 +98,7 @@ jobs:
           prerelease: false
           args: >-
             --target aarch64-apple-darwin
-            --config '{"bundle":{"macOS":{"signingIdentity":"${{ steps.certificate.outputs.identity }}"}}}'
+            --config '{"bundle":{"macOS":{"signingIdentity":"${{ steps.certificate.outputs.identity }}","entitlements":null}}}'
 
       - name: Build ad-hoc signed Tauri app
         id: build-adhoc
@@ -126,9 +126,34 @@ jobs:
           (steps.build-signed.outcome == 'success' || steps.build-adhoc.outcome == 'success')
         run: |
           APP_PATH="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Lantern.app"
+          INFO_PLIST="$APP_PATH/Contents/Info.plist"
           test -d "$APP_PATH"
+          test -f "$INFO_PLIST"
+          EXECUTABLE_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$INFO_PLIST")
+          APP_EXECUTABLE="$APP_PATH/Contents/MacOS/$EXECUTABLE_NAME"
+          PDFIUM_DYLIB="$APP_PATH/Contents/Frameworks/libpdfium.dylib"
+          test -x "$APP_EXECUTABLE"
+          test -f "$PDFIUM_DYLIB"
           codesign --verify --deep --strict --verbose=4 "$APP_PATH"
-          codesign -dv --verbose=4 "$APP_PATH" 2>&1
+          codesign --verify --strict --verbose=4 "$PDFIUM_DYLIB"
+
+          ENTITLEMENTS=$(mktemp)
+          codesign -d --entitlements "$ENTITLEMENTS" --xml "$APP_EXECUTABLE"
+          if [ "${{ steps.signing.outputs.enabled }}" = "true" ]; then
+            APP_TEAM=$(codesign -dv --verbose=4 "$APP_EXECUTABLE" 2>&1 | awk -F= '$1 == "TeamIdentifier" { print $2 }')
+            PDFIUM_TEAM=$(codesign -dv --verbose=4 "$PDFIUM_DYLIB" 2>&1 | awk -F= '$1 == "TeamIdentifier" { print $2 }')
+            test -n "$APP_TEAM"
+            test "$APP_TEAM" != "not set"
+            test "$APP_TEAM" = "$PDFIUM_TEAM"
+            if /usr/libexec/PlistBuddy -c "Print :com.apple.security.cs.disable-library-validation" "$ENTITLEMENTS" 2>/dev/null; then
+              echo "Developer ID build must keep library validation enabled" >&2
+              exit 1
+            fi
+          else
+            test "$(/usr/libexec/PlistBuddy -c "Print :com.apple.security.cs.disable-library-validation" "$ENTITLEMENTS")" = "true"
+          fi
+
+          "$APP_EXECUTABLE" pdfium-smoke
 
   build-windows:
     runs-on: windows-latest

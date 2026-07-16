@@ -8,13 +8,17 @@ import {
   classifySelection,
   contextForRange,
   expandRangeToWordBoundaries,
+  forwardReaderContextMenuKey,
   isInteractiveReaderTarget,
   normalizeInteractionText,
+  rangeFromSelectionSnapshotAtPoint,
   replaceDocumentSelection,
   selectedRange,
+  snapshotSelectionRange,
   viewportRectForRange,
   wordRangeAtPoint,
   type ReaderInteraction,
+  type ReaderSelectionSnapshot,
 } from "../../components/reader-interaction";
 import { bindingFromKeyboardEvent } from "../../components/reader-bindings";
 
@@ -35,17 +39,6 @@ interface InstallDocumentInteractionsOptions {
   view: InteractionView;
   bookFormat: string;
   interactionGeneration: number;
-}
-
-interface SelectionSnapshot {
-  range: Range;
-  rects: DOMRect[];
-}
-
-function pointInsideSnapshot(snapshot: SelectionSnapshot | null, x: number, y: number) {
-  return Boolean(snapshot?.rects.some((rect) => (
-    x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
-  )));
 }
 
 interface ReaderInteractionsOptions {
@@ -149,7 +142,7 @@ export function useReaderInteractions({
     };
 
     let activePointerId: number | null = null;
-    let selectionSnapshot: SelectionSnapshot | null = null;
+    let selectionSnapshot: ReaderSelectionSnapshot | null = null;
     let pointerCaptureTarget: Element | null = null;
     let selectionNormalizationUntil = 0;
     const scheduleSelectionMenu = (delay = 150, includeWord = false) => {
@@ -166,6 +159,8 @@ export function useReaderInteractions({
 
     doc.addEventListener("selectionchange", () => {
       if (activePointerId === null && Date.now() >= selectionNormalizationUntil) {
+        const range = selectedRange(doc);
+        selectionSnapshot = snapshotSelectionRange(range);
         scheduleSelectionMenu();
       }
     });
@@ -197,6 +192,7 @@ export function useReaderInteractions({
       if (expanded) {
         selectionNormalizationUntil = Date.now() + 80;
         replaceDocumentSelection(doc, expanded);
+        selectionSnapshot = snapshotSelectionRange(expanded);
       }
       if (expanded) scheduleSelectionMenu(30, true);
       else cancelPendingSelectionMenu();
@@ -266,6 +262,11 @@ export function useReaderInteractions({
 
     doc.addEventListener("keydown", (event: KeyboardEvent) => {
       if ((event.target as Element | null)?.closest("input,textarea,select,[contenteditable='true']")) return;
+      if (forwardReaderContextMenuKey(event)) {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
       const trigger = bindingFromKeyboardEvent(event);
       if (trigger && handleReaderBinding(trigger, interactionForSelection("selection-menu"))) {
         event.preventDefault();
@@ -288,10 +289,7 @@ export function useReaderInteractions({
     });
     doc.addEventListener("mousedown", (event: MouseEvent) => {
       const range = selectedRange(doc);
-      selectionSnapshot = range ? {
-        range: range.cloneRange(),
-        rects: Array.from(range.getClientRects()),
-      } : null;
+      if (range) selectionSnapshot = snapshotSelectionRange(range);
       handlePageTurnMouseDown(event);
     }, true);
     doc.addEventListener("contextmenu", handlePageTurnContextMenu, true);
@@ -313,23 +311,32 @@ export function useReaderInteractions({
       if (isInteractiveReaderTarget(event.target)) return;
       const selection = doc.getSelection?.();
       if (selection && !selection.isCollapsed) return;
-      const range = pointInsideSnapshot(selectionSnapshot, event.clientX, event.clientY)
-        ? selectionSnapshot?.range.cloneRange() ?? null
-        : wordRangeAtPoint(
-            doc,
-            event.clientX,
-            event.clientY,
-            doc.documentElement.lang || undefined,
-          );
-      if (!range) return;
+      const selectionRange = rangeFromSelectionSnapshotAtPoint(
+        selectionSnapshot,
+        event.clientX,
+        event.clientY,
+      );
+      const range = selectionRange ?? wordRangeAtPoint(
+        doc,
+        event.clientX,
+        event.clientY,
+        doc.documentElement.lang || undefined,
+      );
+      if (!range) {
+        selectionSnapshot = null;
+        return;
+      }
       replaceDocumentSelection(doc, range);
+      selectionSnapshot = snapshotSelectionRange(range);
       const text = range.toString().trim();
       const location = view.getCFI(index, range);
       const normalizedText = normalizeInteractionText(text);
       if (!text || !normalizedText || !location) return;
       const interaction: ReaderInteraction = {
-        trigger: "word-menu",
-        kind: "word",
+        trigger: selectionRange ? "selection-menu" : "word-menu",
+        kind: selectionRange
+          ? classifySelection(text, doc.documentElement.lang || undefined)
+          : "word",
         text,
         normalizedText,
         context: contextForRange(range, text),
@@ -348,7 +355,11 @@ export function useReaderInteractions({
       cancelPendingWordClick();
       cancelPendingSelectionMenu();
       if (!supportsSelection || isInteractiveReaderTarget(event.target)) return;
-      const range = wordRangeAtPoint(
+      const range = rangeFromSelectionSnapshotAtPoint(
+        selectionSnapshot,
+        event.clientX,
+        event.clientY,
+      ) ?? wordRangeAtPoint(
         doc,
         event.clientX,
         event.clientY,
@@ -377,8 +388,8 @@ export function useReaderInteractions({
       }
       event.preventDefault();
       replaceDocumentSelection(doc, range);
+      selectionSnapshot = snapshotSelectionRange(range);
       openLearningInteraction(interaction);
-      selectionSnapshot = null;
     });
 
     doc.addEventListener("mousedown", () => {

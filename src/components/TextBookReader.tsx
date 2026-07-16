@@ -17,11 +17,14 @@ import {
   expandRangeToWordBoundaries,
   isInteractiveReaderTarget,
   normalizeInteractionText,
+  rangeFromSelectionSnapshotAtPoint,
   replaceDocumentSelection,
   selectedRange,
+  snapshotSelectionRange,
   viewportRectForRange,
   wordRangeAtPoint,
   type ReaderInteraction,
+  type ReaderSelectionSnapshot,
 } from "./reader-interaction";
 import { bindingFromKeyboardEvent } from "./reader-bindings";
 import { expandWordForms } from "./word-forms";
@@ -564,7 +567,7 @@ function TextBookReader({
   const pointerCaptureTargetRef = useRef<HTMLElement | null>(null);
   const selectionNormalizationUntilRef = useRef(0);
   const forceClickSuppressedUntilRef = useRef(0);
-  const doubleClickSelectionRef = useRef<{ range: Range; rects: DOMRect[] } | null>(null);
+  const doubleClickSelectionRef = useRef<ReaderSelectionSnapshot | null>(null);
   const [flashOffset, setFlashOffset] = useState<number | null>(null);
   const isPaginated = settings.readingMode === "paginated";
   const [effectivePageColumns, setEffectivePageColumns] = useState<PageColumns>(() => (
@@ -1163,10 +1166,22 @@ function TextBookReader({
     if (isInteractiveReaderTarget(event.target) || (event.target as Element | null)?.closest?.("mark")) return;
     const selection = window.getSelection();
     if (selection && !selection.isCollapsed) return;
-    const range = wordRangeAtPoint(window.document, event.clientX, event.clientY);
-    if (!range || !containerRef.current?.contains(range.startContainer)) return;
+    const selectionRange = rangeFromSelectionSnapshotAtPoint(
+      doubleClickSelectionRef.current,
+      event.clientX,
+      event.clientY,
+    );
+    const range = selectionRange ?? wordRangeAtPoint(window.document, event.clientX, event.clientY);
+    if (!range || !containerRef.current?.contains(range.startContainer)) {
+      doubleClickSelectionRef.current = null;
+      return;
+    }
     replaceDocumentSelection(window.document, range);
-    const interaction = interactionFromRange(range, "word-menu");
+    doubleClickSelectionRef.current = snapshotSelectionRange(range);
+    const interaction = interactionFromRange(
+      range,
+      selectionRange ? "selection-menu" : "word-menu",
+    );
     if (!interaction?.normalizedText) return;
     wordClickTimerRef.current = window.setTimeout(() => {
       wordClickTimerRef.current = null;
@@ -1178,14 +1193,11 @@ function TextBookReader({
     cancelWordClick();
     cancelSelectionMenu();
     if (event.button !== 0 || isInteractiveReaderTarget(event.target)) return;
-    const snapshot = doubleClickSelectionRef.current;
-    const useSnapshot = snapshot?.rects.some((rect) => (
-      event.clientX >= rect.left && event.clientX <= rect.right
-      && event.clientY >= rect.top && event.clientY <= rect.bottom
-    ));
-    const range = useSnapshot
-      ? snapshot?.range.cloneRange() ?? null
-      : wordRangeAtPoint(window.document, event.clientX, event.clientY);
+    const range = rangeFromSelectionSnapshotAtPoint(
+      doubleClickSelectionRef.current,
+      event.clientX,
+      event.clientY,
+    ) ?? wordRangeAtPoint(window.document, event.clientX, event.clientY);
     if (!range || !containerRef.current?.contains(range.startContainer)) return;
     const interaction = interactionFromRange(range, "word-quick-lookup");
     if (!interaction?.normalizedText) return;
@@ -1195,8 +1207,8 @@ function TextBookReader({
     }
     event.preventDefault();
     replaceDocumentSelection(window.document, range);
+    doubleClickSelectionRef.current = snapshotSelectionRange(range);
     onInteraction(interaction);
-    doubleClickSelectionRef.current = null;
   }, [cancelSelectionMenu, cancelWordClick, doubleClickQuickLookup, interactionFromRange, onInteraction, onReaderBinding]);
 
   useEffect(() => {
@@ -1244,7 +1256,14 @@ function TextBookReader({
       if (
         activePointerIdRef.current === null
         && Date.now() >= selectionNormalizationUntilRef.current
-      ) scheduleSelectionMenu();
+      ) {
+        const range = selectedRange(window.document);
+        doubleClickSelectionRef.current = range
+          && containerRef.current?.contains(range.commonAncestorContainer)
+          ? snapshotSelectionRange(range)
+          : null;
+        scheduleSelectionMenu();
+      }
     };
     window.document.addEventListener("selectionchange", handleSelectionChange);
     return () => {
@@ -1291,6 +1310,7 @@ function TextBookReader({
     if (expanded) {
       selectionNormalizationUntilRef.current = Date.now() + 80;
       replaceDocumentSelection(window.document, expanded);
+      doubleClickSelectionRef.current = snapshotSelectionRange(expanded);
     }
     if (expanded) scheduleSelectionMenu(30, true);
     else cancelSelectionMenu();
@@ -1420,10 +1440,7 @@ function TextBookReader({
       onDoubleClick={handleTextDoubleClick}
       onMouseDownCapture={() => {
         const range = selectedRange(window.document);
-        doubleClickSelectionRef.current = range ? {
-          range: range.cloneRange(),
-          rects: Array.from(range.getClientRects()),
-        } : null;
+        if (range) doubleClickSelectionRef.current = snapshotSelectionRange(range);
       }}
       onContextMenu={handleTextContextMenu}
       onPointerDown={handleSelectionPointerDown}

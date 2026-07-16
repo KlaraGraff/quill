@@ -1362,6 +1362,25 @@ fn do_import_pdf_populates_cover_data() {
 }
 
 #[test]
+fn pdf_with_reported_long_cjk_name_finishes_import_and_indexing() {
+    let (dir, db) = setup();
+    let title = "被讨厌的勇气：“自我启发之父”阿德勒的哲学课 = 嫌われる勇気：自己啓発の源流「アドラー」の教え ([曰] 岸见一郎，[日] 古贺史健 著；渠海霞 译) (z-library.sk, 1lib.sk, z-lib.sk)(1)";
+    let pdf = dir.path().join(format!("{title}.pdf"));
+    write_fixture_pdf(&pdf);
+
+    let sync = SyncWriter::new("dev-A".into());
+    let book = do_import_from_path(pdf.to_str().unwrap(), &db, &sync).unwrap();
+
+    assert_eq!(book.title, title);
+    assert_eq!(book.pages, Some(1));
+    assert!(db.resolve_path(&book.file_path).unwrap().is_file());
+    assert_eq!(
+        crate::ai::grounding::index::ensure_index(&db, &book.id).unwrap(),
+        crate::ai::grounding::index::IndexStatus::Ready,
+    );
+}
+
+#[test]
 fn delete_book_removes_book_notes_and_markers_but_detaches_global_notes() {
     let (_dir, db) = setup();
     insert_book(&db, "b1", "epub");

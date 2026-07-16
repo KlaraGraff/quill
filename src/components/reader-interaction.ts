@@ -9,6 +9,10 @@ export interface SerializableRect {
   height: number;
 }
 
+export interface ReaderSelectionSnapshot {
+  range: Range;
+}
+
 export interface ReaderInteraction {
   trigger: "word-menu" | "word-quick-lookup" | "selection-menu";
   kind: InteractionKind;
@@ -288,6 +292,74 @@ export function selectedRange(doc: Document): Range | null {
   if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null;
   const range = selection.getRangeAt(0);
   return range.toString().trim() ? range.cloneRange() : null;
+}
+
+export function snapshotSelectionRange(range: Range | null): ReaderSelectionSnapshot | null {
+  if (!range) return null;
+  return {
+    range: range.cloneRange(),
+  };
+}
+
+export function rangeFromSelectionSnapshotAtPoint(
+  snapshot: ReaderSelectionSnapshot | null,
+  x: number,
+  y: number,
+): Range | null {
+  const containsPoint = Array.from(snapshot?.range.getClientRects() ?? []).some((rect) => (
+    x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
+  ));
+  return containsPoint ? snapshot?.range.cloneRange() ?? null : null;
+}
+
+export function readerMenuActivationIndex(
+  key: string,
+  currentIndex: number,
+  itemCount: number,
+  modified = false,
+): number | null {
+  if (modified || currentIndex >= 0 || itemCount <= 0) return null;
+  return key === "Enter" || key === " " ? 0 : null;
+}
+
+export function readerMenuFocusIndex(
+  key: string,
+  currentIndex: number,
+  itemCount: number,
+  shiftKey = false,
+  modified = false,
+): number | null {
+  if (itemCount <= 0) return null;
+  if (modified || (shiftKey && key !== "Tab")) return null;
+  if (key === "Home") return 0;
+  if (key === "End") return itemCount - 1;
+  if (key === "Tab" && currentIndex < 0) return shiftKey ? itemCount - 1 : 0;
+  if (key !== "ArrowDown" && key !== "ArrowUp") return null;
+  if (currentIndex < 0) return key === "ArrowDown" ? 0 : itemCount - 1;
+  return (currentIndex + (key === "ArrowDown" ? 1 : -1) + itemCount) % itemCount;
+}
+
+export const READER_CONTEXT_MENU_KEY_EVENT = "quill-reader-context-menu-key";
+
+export interface ReaderContextMenuKeyDetail {
+  key: string;
+  shiftKey: boolean;
+  modified: boolean;
+  handled: boolean;
+}
+
+export function forwardReaderContextMenuKey(event: KeyboardEvent): boolean {
+  const detail: ReaderContextMenuKeyDetail = {
+    key: event.key,
+    shiftKey: event.shiftKey,
+    modified: event.altKey || event.ctrlKey || event.metaKey,
+    handled: false,
+  };
+  window.dispatchEvent(new CustomEvent<ReaderContextMenuKeyDetail>(
+    READER_CONTEXT_MENU_KEY_EVENT,
+    { detail },
+  ));
+  return detail.handled;
 }
 
 export function replaceDocumentSelection(doc: Document, range: Range): void {
