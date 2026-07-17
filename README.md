@@ -121,19 +121,13 @@ macOS 是主要平台。基于用户选择的 iCloud Drive 文件夹的多设备
 
 ## 开发
 
-要求：Node.js 22、npm、Rust，以及目标平台所需的 Tauri 前置依赖。克隆仓库时请一并获取阅读器引擎子模块：
+要求：Node.js 22、npm、Rust，以及目标平台所需的 Tauri 前置依赖。阅读器引擎源码已随仓库一并提交：
 
 ```bash
-git clone --recurse-submodules https://github.com/KlaraGraff/lantern.git
+git clone https://github.com/KlaraGraff/lantern.git
 cd lantern
 npm ci
 npm run tauri dev
-```
-
-如果已经克隆仓库，请执行一次：
-
-```bash
-git submodule update --init --recursive
 ```
 
 常用静态检查：

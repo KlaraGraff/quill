@@ -7,8 +7,8 @@
 
 - **基线分支**:`codex/grounded-book-chat`(grounded book chat 尚未合入 main,本工作依赖它)。
   新建功能分支,如 `feat/reader-ai-optimizations`。
-- **子模块**:`public/foliate-js` 是 git submodule(fork:`yicheng47/foliate-js`)。开发前必须
-  `git submodule update --init`。**本方案不需要修改子模块本身**。
+- **阅读器引擎**:`public/foliate-js` 是随 Lantern 提交的 vendored source，无需初始化
+  子模块。**本方案不需要修改该目录本身**。
 - **验证命令**:`npm run lint`、`tsc`(经 `npm run build` 前半)、
   `node --experimental-strip-types --test tests/*.test.ts`、`src-tauri` 下 `cargo test`。
 - **i18n**:所有新增用户可见文案必须同时加 `src/i18n/zh.json` 与 `src/i18n/en.json`,组件内禁止硬编码。

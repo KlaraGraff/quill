@@ -1,0 +1,2 @@
+# Preserve the upstream formatting of the vendored reader engine.
+public/foliate-js/** -whitespace

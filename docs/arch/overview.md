@@ -70,7 +70,7 @@ The binary name, MCP registration key, database filename, and storage schemas re
 | Backend | **Rust** | Owns SQLite, sync engine, AI streaming, EPUB/PDF parsing. One language for all backend concerns. |
 | Frontend | **React 19 + TypeScript** | Familiar, fast, no SSR concerns inside Tauri. |
 | Styling | **Tailwind CSS 4** | Utility-first; theme tokens via CSS variables. |
-| EPUB rendering | **Foliate.js** (git submodule) | Best open-source EPUB renderer. Handles CFI positions, pagination, search, annotations. |
+| EPUB rendering | **Foliate.js** (vendored source) | Best open-source EPUB renderer. Handles CFI positions, pagination, search, annotations. |
 | PDF rendering | **PDF.js** | Standard. Loaded from CDN in the webview. |
 | Persistence | **SQLite via `rusqlite`** (WAL mode, dual connections) | All app state — library, highlights, chats, settings, sync metadata. WAL gives concurrent readers + one writer without blocking. |
 | Secrets | **Separate SQLite** (`secrets.db`) | API keys, OAuth tokens. Never synced, never exposed through bulk settings queries. |

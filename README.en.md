@@ -121,19 +121,13 @@ Current builds and release notes are published at [KlaraGraff/lantern Releases](
 
 ## Development
 
-Requirements: Node.js 22, npm, Rust, and the Tauri prerequisites for the target platform. Clone with the reader engine submodule:
+Requirements: Node.js 22, npm, Rust, and the Tauri prerequisites for the target platform. The reader engine source is committed with the repository:
 
 ```bash
-git clone --recurse-submodules https://github.com/KlaraGraff/lantern.git
+git clone https://github.com/KlaraGraff/lantern.git
 cd lantern
 npm ci
 npm run tauri dev
-```
-
-For an existing checkout, initialize it once with:
-
-```bash
-git submodule update --init --recursive
 ```
 
 Useful static checks:

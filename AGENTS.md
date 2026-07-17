@@ -35,7 +35,7 @@ Core vocabulary:
 - `src-tauri/src/sync/`: iCloud sync engine, event log, peer manifests, replay, snapshots, and writer.
 - `src-tauri/src/mcp/`: MCP server and tools.
 - `src-tauri/src/ai/`: AI provider integrations.
-- `public/foliate-js/`: vendored reader engine submodule.
+- `public/foliate-js/`: vendored reader engine source, maintained with Lantern.
 - `design/`: Pencil source files, including `design/quill-desktop.pen`.
 - `docs/arch/`: architecture references.
 - `docs/features/`: in-progress feature specs; shipped specs live in `docs/features/archive/`.
