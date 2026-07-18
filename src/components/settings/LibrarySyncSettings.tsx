@@ -13,6 +13,7 @@ interface PeerInfo {
   name: string;
   platform: string;
   app_version: string;
+  max_event_schema: number;
   last_seen: number;
   pending_events: number;
 }

@@ -99,6 +99,8 @@ pub struct PeerInfo {
     pub name: String,
     pub platform: String,
     pub app_version: String,
+    /// Highest event envelope schema this peer advertises as replayable.
+    pub max_event_schema: u32,
     pub last_seen: i64,
     /// Number of events from this peer that haven't been applied to
     /// our local DB yet (peer log line count − our `_replay_state`
@@ -192,6 +194,7 @@ pub async fn sync_status(
                     name: p.name,
                     platform: p.platform,
                     app_version: p.app_version,
+                    max_event_schema: p.max_event_schema,
                     last_seen: p.last_seen,
                     pending_events: 0,
                 })

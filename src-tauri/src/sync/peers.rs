@@ -3,9 +3,9 @@
 //!
 //! Each device publishes a single JSON file at
 //! `<shared>/devices/<device-uuid>.json` with `{ device_uuid, name,
-//! platform, app_version, last_seen }`. The file is rewritten atomically
-//! (temp + rename) on every `replay_engine.tick()` so peers see fresh
-//! `last_seen` heartbeats without any event traffic.
+//! platform, app_version, max_event_schema, last_seen }`. The file is
+//! rewritten atomically (temp + rename) on every `replay_engine.tick()`
+//! so peers see fresh `last_seen` heartbeats without any event traffic.
 //!
 //! Why a separate file (and not a sync event or snapshot field):
 //! - Peer discovery has to work for a brand-new device that hasn't
@@ -29,8 +29,19 @@ use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 
+use super::events::EVENT_SCHEMA_VERSION;
+
 /// Subdirectory under `<shared>/` where peer manifests live.
 const DEVICES_SUBDIR: &str = "devices";
+
+/// Manifests written before capability announcements existed supported
+/// event schema v6. Keep this separate from `EVENT_SCHEMA_VERSION`: once
+/// writers advance to v7, an absent field must still mean v6.
+const LEGACY_MAX_EVENT_SCHEMA: u32 = 6;
+
+fn default_max_event_schema() -> u32 {
+    LEGACY_MAX_EVENT_SCHEMA
+}
 
 /// Returned by `list_peers` to power the settings UI's "Other devices"
 /// section. Mirrors the JSON file shape on disk.
@@ -40,6 +51,9 @@ pub struct Peer {
     pub name: String,
     pub platform: String,
     pub app_version: String,
+    /// Highest event envelope schema this peer can safely replay.
+    #[serde(default = "default_max_event_schema")]
+    pub max_event_schema: u32,
     /// Unix millis when the peer last successfully ran a sync tick.
     pub last_seen: i64,
 }
@@ -103,6 +117,7 @@ pub fn write_own_manifest(
         name: name.to_string(),
         platform: platform.to_string(),
         app_version: app_version.to_string(),
+        max_event_schema: EVENT_SCHEMA_VERSION,
         last_seen: now_ms,
     };
 
@@ -330,6 +345,45 @@ mod tests {
     }
 
     #[test]
+    fn own_manifest_announces_current_event_schema() {
+        let tmp = TempDir::new().unwrap();
+        let shared = tmp.path();
+        write_own_manifest(shared, PEER_A_UUID, "Mac A", "macos", "0.10.0", 1_000).unwrap();
+
+        let bytes = fs::read(manifest_path(shared, PEER_A_UUID)).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["max_event_schema"], EVENT_SCHEMA_VERSION);
+
+        let peer: Peer = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(peer.max_event_schema, EVENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn legacy_manifest_without_capability_defaults_to_v6() {
+        let tmp = TempDir::new().unwrap();
+        let shared = tmp.path();
+        let dir = shared.join(DEVICES_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let legacy = serde_json::json!({
+            "device_uuid": PEER_A_UUID,
+            "name": "Legacy Mac",
+            "platform": "macos",
+            "app_version": "2.0.0",
+            "last_seen": 1_000,
+        });
+        fs::write(
+            dir.join(format!("{PEER_A_UUID}.json")),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let peers = list_peers(shared, SELF_UUID).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].max_event_schema, LEGACY_MAX_EVENT_SCHEMA);
+        assert_eq!(peers[0].max_event_schema, 6);
+    }
+
+    #[test]
     fn list_orders_by_last_seen_descending() {
         let tmp = TempDir::new().unwrap();
         let shared = tmp.path();
@@ -393,6 +447,7 @@ mod tests {
             name: "Impersonator".into(),
             platform: "macos".into(),
             app_version: "0.10.0".into(),
+            max_event_schema: EVENT_SCHEMA_VERSION,
             last_seen: 1_000,
         };
         let dir = shared.join(DEVICES_SUBDIR);
@@ -426,6 +481,7 @@ mod tests {
             name: "Looks legit".into(),
             platform: "macos".into(),
             app_version: "0.10.0".into(),
+            max_event_schema: EVENT_SCHEMA_VERSION,
             last_seen: 1_000,
         };
         fs::write(
@@ -561,6 +617,7 @@ mod tests {
             name: "Maybe me, maybe not".into(),
             platform: "macos".into(),
             app_version: "1.0.0".into(),
+            max_event_schema: EVENT_SCHEMA_VERSION,
             last_seen: 1_000,
         };
         fs::write(&upper_path, serde_json::to_vec(&manifest).unwrap()).unwrap();

@@ -1440,6 +1440,10 @@ mod tests {
         let bytes = fs::read(&manifest).unwrap();
         let parsed: peers::Peer = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed.device_uuid, "self");
+        assert_eq!(
+            parsed.max_event_schema,
+            crate::sync::events::EVENT_SCHEMA_VERSION,
+        );
         assert!(
             parsed.last_seen >= before,
             "last_seen ({}) should be >= pre-tick ts ({before})",
