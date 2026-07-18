@@ -78,6 +78,16 @@ Prefer the smallest check that covers the change. For frontend changes, run type
 - Treat sync and file-copy changes as data-safety sensitive. Preserve the invariant that the app must not repoint storage or disable sync until required local files are actually reachable.
 - Do not add repo conventions only to an agent-specific file. Update this file and leave tool-specific files as compatibility entrypoints if needed.
 
+## Response Style
+
+- Default to conclusion-first responses with the minimum sufficient information.
+- For design alignment, retain only the conclusion, key rules, exceptions, and next step.
+- Prefer compact Markdown tables for multiple rules or comparisons. Use short headers and one point per cell.
+- Answer simple questions directly; do not force a table where prose is clearer.
+- Use bold only to emphasize conclusions, conditions, and thresholds.
+- By default, keep a response to one conclusion paragraph and one table. Add detail only when needed to preserve implementation-relevant boundary conditions, risks, or open questions.
+- Do not repeat background, restate a point, or expand self-evident reasoning.
+
 ## Commit And PR Conventions
 
 - **Default: commit straight to `main`.** This is a single-maintainer repo with no branch protection and no reviewers, so a PR adds a round trip without adding a reader. Run the checks that cover your change (see Development Commands), commit, push. CI runs on pushes to `main` and catches what you missed.
