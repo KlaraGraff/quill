@@ -77,7 +77,7 @@ Prefer the smallest check that covers the change. For frontend changes, run type
 - Use `ROW_CONTROL_WIDTH` or `ROW_CONTROL_WIDTH_COMPACT` for row controls in settings instead of local width literals.
 - Treat sync and file-copy changes as data-safety sensitive. Preserve the invariant that the app must not repoint storage or disable sync until required local files are actually reachable.
 - Do not add repo conventions only to an agent-specific file. Update this file and leave tool-specific files as compatibility entrypoints if needed.
-- **Testing-stage compatibility:** do not add compatibility, migration, or rollback code for old app versions, old data, or historical schemas. After a data-model change, re-importing or resetting local test data is acceptable. Make an exception only when the user explicitly requires compatibility.
+- **Testing-stage compatibility:** do not add compatibility, migration, or rollback code for old app versions, old data, or historical schemas. After a data-model change, re-importing or resetting local test data is acceptable. Make an exception only when the user explicitly requires compatibility. This testing-stage policy ceases to apply once the user reports that the app has entered large-scale distribution; then assess compatibility, migration, and rollback needs based on data safety and upgrade experience.
 - **Implementation judgment:** optimize for the requested capability rather than mechanically following a proposed implementation path. When an alternative achieves the same goal with materially better complexity, reliability, maintenance cost, or user experience, propose it briefly with its key tradeoff, and prefer it unless the user has explicitly required a particular path.
 
 ## Response Style
