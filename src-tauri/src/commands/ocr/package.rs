@@ -1571,7 +1571,7 @@ mod tests {
             "safe/../../escape",
             "safe\\..\\escape",
         ] {
-            let entries = vec![(
+            let entries = [(
                 path.to_string(),
                 ArchiveEntryMetadata {
                     kind: ArchiveEntryKind::File,
@@ -1580,7 +1580,7 @@ mod tests {
             )];
             assert!(validate_archive_entries(entries.iter().map(|(p, k)| (p, *k))).is_err());
         }
-        let link = vec![(
+        let link = [(
             "safe/link".to_string(),
             ArchiveEntryMetadata {
                 kind: ArchiveEntryKind::LinkOrSpecial,
@@ -1589,7 +1589,7 @@ mod tests {
         )];
         assert!(validate_archive_entries(link.iter().map(|(p, k)| (p, *k))).is_err());
 
-        let safe = vec![
+        let safe = [
             (
                 "bin/lantern-ocr".to_string(),
                 ArchiveEntryMetadata {
