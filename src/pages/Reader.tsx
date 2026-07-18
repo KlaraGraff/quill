@@ -419,12 +419,13 @@ export default function Reader() {
     void ocrJob.retry().catch(() => {});
   }, [ocrJob]);
 
+  const refreshOcrJob = ocrJob.refresh;
   useEffect(() => {
     if (!bookId || book?.format !== "pdf") return;
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void listen("book-assets-changed", async () => {
-      await ocrJob.refresh();
+      await refreshOcrJob();
       if (disposed || !locallyRequestedOcrRef.current || !book || !pageInfo) return;
       const updated = await getBook(bookId).catch(() => null);
       if (disposed || !updated || updated.file_path === book.file_path) return;
@@ -448,19 +449,31 @@ export default function Reader() {
       disposed = true;
       unlisten?.();
     };
-  }, [book, bookId, ocrJob, pageInfo]);
+  }, [book, bookId, pageInfo, refreshOcrJob]);
 
   useEffect(() => {
-    const pending = pendingOcrReloadRef.current;
-    if (!pending || !bookReady || !book || book.file_path === pending.sourcePath) return;
-    const contents = viewRef.current?.renderer?.getContents?.() ?? [];
-    const target = contents.find((content: { index?: number; doc?: Document }) => content.index === pending.page)
-      ?? contents[0];
-    const textLayer = target?.doc?.querySelector?.(".textLayer") as HTMLElement | null;
-    if (!textLayer?.querySelector(".endOfContent") || !textLayer.textContent?.trim()) return;
-    pendingOcrReloadRef.current = null;
-    locallyRequestedOcrRef.current = false;
-    setReaderToast(t("ocr.reader.completedToast"));
+    if (!bookReady || !book) return;
+    let timer: number | null = null;
+    const deadline = Date.now() + 5_000;
+    const showWhenTextLayerReady = () => {
+      const pending = pendingOcrReloadRef.current;
+      if (!pending || book.file_path === pending.sourcePath) return;
+      const contents = viewRef.current?.renderer?.getContents?.() ?? [];
+      const target = contents.find((content: { index?: number; doc?: Document }) => content.index === pending.page)
+        ?? contents[0];
+      const textLayer = target?.doc?.querySelector?.(".textLayer") as HTMLElement | null;
+      if (textLayer?.querySelector(".endOfContent") && textLayer.textContent?.trim()) {
+        pendingOcrReloadRef.current = null;
+        locallyRequestedOcrRef.current = false;
+        setReaderToast(t("ocr.reader.completedToast"));
+      } else if (Date.now() < deadline) {
+        timer = window.setTimeout(showWhenTextLayerReady, 100);
+      }
+    };
+    showWhenTextLayerReady();
+    return () => {
+      if (timer !== null) window.clearTimeout(timer);
+    };
   }, [book, bookReady, pageInfo, t]);
 
   const openLearningCard = useCallback((interaction: ReaderInteraction) => {
