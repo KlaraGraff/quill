@@ -90,7 +90,7 @@ Lantern 提供语境含义、词性、常见义项、搭配、语法分析、指
 
 | 平台 | 支持范围 |
 | --- | --- |
-| macOS | **macOS 11 Big Sur 或更高版本**，仅支持 **Apple Silicon（M 系列）** Mac |
+| macOS | **macOS 12 Monterey 或更高版本**，仅支持 **Apple Silicon（M 系列）** Mac |
 | Windows | 提供 **Windows 11 x64** 安装包 |
 | Intel Mac | 当前不提供 Intel macOS 安装包 |
 | Linux | 当前未提供发布版本 |

@@ -52,8 +52,8 @@
 
 1. **阶段重排**：`source_file_path` 修复（Phase A）与同步能力通告字段（Phase B）拆为独立交付，不与 OCR 绑定。旧客户端兼容窗口的长短取决于所有设备升级到「会通告能力」版本的时间——越早上车越短。
 2. **旧客户端策略选型**（评审稿 §15.5 列了三个候选）：**不改解析器**。现有「信封完整但不支持 → 拒整份日志」是正确的数据安全设计（防 watermark 越过丢行），保持不动。选择 **peer manifest 能力通告 + 发送端 gating**：设备只在全部活跃 peer 通告支持 ≥ v7 后才开始发送资产事件（§7.3）。
-3. **macOS 基线先行决策**：捆绑 libpdfium 实测 `minos 12.0`，macOS 11 支持在 OCR 之前就已名存实亡（该库在 Big Sur 上无法加载）。先把 README/产品基线修正为 macOS 12+（或决定重建 pdfium），OCR 扩展按修正后的基线打包。不为已失效的 macOS 11 目标付出 Phase C 打包验证成本。
-4. **PoC 增加 OS 原生 OCR 对比**：评审稿未评估 Apple Vision（`VNRecognizeTextRequest`）与 Windows.Media.Ocr。若 Vision 中英质量达标，macOS 端可做到**零下载、零 Python runtime、零第三方 SBOM**——评审稿 §9 整个扩展下载子系统（约占总工程量三分之一）在 macOS 上可以消失。代价是自建文字层写回（hOCR/坐标 → PDF grafting，即评审稿 §19.4 的中间路线），且两平台引擎不一致。因为派生资产是同步的（一台设备识别、其余设备直接用），引擎跨平台不一致可接受。用 2–3 天 timebox spike 回答（§4.2），防止建一个本不需要的 150 MB 下载器。注意：Vision 中文识别需要 RequestRevision3（macOS 13+），需实测确认与基线决策联动。
+3. **macOS 基线先行决策**：捆绑 libpdfium 实测 `minos 12.0`，macOS 11 支持在 OCR 之前就已失效（该库在 Big Sur 上无法加载）。README/产品基线已修正为 macOS 12+；OCR 扩展和 Vision 后端按该基线打包。若未来要恢复 macOS 11，必须先重建并在真实 Big Sur 设备验证 PDFium。
+4. **PoC 增加 OS 原生 OCR 对比**：评审稿未评估 Apple Vision（`VNRecognizeTextRequest`）与 Windows.Media.Ocr。若 Vision 中英质量达标，macOS 端可做到零 Python runtime 和零 OCR 引擎下载；代价是自建文字层写回（Vision 坐标 → PDFium grafting），且两平台引擎不一致。因为派生资产会同步，引擎跨平台不一致可接受。Phase C 已证明 Vision + 现有 PDFium 的单页闭环可行，但真实扫描、签名 app 和复杂 PDF 结构仍未验收。SDK 证据同时修正了最低版本判断：Revision 2 在 macOS 11+ 的 `accurate` 模式支持中文；Revision 3 是 macOS 13+ 的质量/旋转改进，不是中文支持的硬前提。
 5. **v1 数据模型裁剪**：不建 `book_asset_positions` 表。v1 唯一新增资产是页数与源一致的 searchable PDF，现有 `books.progress/current_cfi` 在源 ⇄ OCR 资产之间可直接复用；扫描页本无文字层，也就不存在会漂移的既有文本锚点。该表推迟到 EPUB 派生资产进入范围时再建（评审稿 §14.5 保留为未来设计）。
 6. **扩展签名依赖既有 Gatekeeper 工作**：主程序当前仍是 ad-hoc 签名（见 [macOS 分发计划](macos-distribution-gatekeeper-fix.md)），评审稿 §9.4 安装第 5 步「验证签名/公证」在主程序签名方案落地前无从谈起。OCR runtime 的签名与主程序签名同批解决；Phase E 排期以此为前置。
 
@@ -61,9 +61,9 @@
 
 | # | 问题 | 裁决 |
 |---|---|---|
-| 1 | 无 Ghostscript 能否跑通 | Phase C 实测。机制已获官方文档证实（pypdfium rasterizer + 显式 `--output-type pdf`）；干净 PATH 环境验证仍必做 |
-| 2 | 真实最低系统/体积 | Phase C 实测；先按 §0.3.3 修正 macOS 基线再打包 |
-| 3 | OCR 输出能否被 PDF.js 稳定选择 | Phase C 样本矩阵验证（中文跨行、双栏为重点） |
+| 1 | 无 Ghostscript 能否跑通 | 已在 Phase C 的空环境、无 `gs`/veraPDF/unpaper/pngquant/jbig2enc 条件下跑通单页 OCRmyPDF；完整合法语料仍待补 |
+| 2 | 真实最低系统/体积 | README 已修正为 macOS 12+；Vision Rev2 可作为 macOS 12 基线，signed app、Windows 和最终包体仍待验证 |
+| 3 | OCR 输出能否被 PDF.js 稳定选择 | Vision+PDFium 单页已通过 PDF.js 文本提取和 DOM 跨行 Range；真实鼠标选择、复杂版面和 Reader 全链路仍待验证 |
 | 4 | 是否默认 `--rotate-pages` + OSD | v1 不做，不装 `osd.traineddata`（省 10 MiB 与处理时间）；Phase H 依样本收益再议 |
 | 5 | 结构化进度走哪条路 | 扩展内置薄 wrapper，用 OCRmyPDF plugin API 输出 JSON Lines（评审稿 §11.4 格式）；拿不到就退化为不确定进度条 |
 | 6 | 未知事件前向兼容 | peer manifest 能力通告 + 发送端 gating（§7.3），解析器语义不变 |
@@ -115,12 +115,15 @@
 - macOS arm64（按 §0.3.3 修正后的基线）与 Windows 11 x64 自包含打包，实测下载/安装体积、真实最低 OS。
 - 输出 SBOM、原生库清单、许可证清单。
 - fast/best 准确率、耗时、峰值内存对比；`chi_sim+eng` vs `eng+chi_sim` vs 纯英文。
+- Phase C 已完成单页空环境 smoke：OCRmyPDF 17.8.1 + Tesseract 5.5.2 + pypdfium2 在没有 Ghostscript 等可选工具时成功输出 searchable PDF。当前样本只能作为数字/混合 PDF 的控制性 raster smoke，不足以替代合法扫描语料。
+- 当前实测中，`tessdata_best/chi_sim` 会加载 `chi_sim_vert`；高精度模型包必须把该依赖和其许可证/体积纳入 manifest。
 
 ### 4.2 OS 原生 OCR spike（timebox 2–3 天）
 
-- Apple Vision `VNRecognizeTextRequest`（accurate, zh-Hans+en）跑同一样本，对比字符错误率与词级坐标质量；确认中文所需最低 macOS 版本。
+- Apple Vision `VNRecognizeTextRequest`（accurate, zh-Hans+en）跑同一样本，对比字符错误率与词级坐标质量；已证明 Rev2/Rev3 都能识别当前中英控制页，Rev2 的中文 accurate 支持 macOS 11+，Rev3 作为 macOS 13+ 改进版本。
 - Windows.Media.Ocr 同样本快测（预期中文质量不足，需数据证实）。
-- 评估文字层写回（word box → 不可见文字 + ToUnicode）实现成本：候选为 Rust `pdf-writer`/`pikepdf` 增量写入。
+- 评估文字层写回（word box → 不可见文字 + ToUnicode）实现成本：首选 Rust `pdfium-render` + 当前 Lantern PDFium；`pdf-writer`/`pikepdf` 作为回退候选。
+- Vision + 现有 PDFium 已完成单页写回 PoC：30 行文字、PDF.js 可提取、渲染像素差异为 0；复杂版面、签名 app 和全 Reader 交互仍待验收。
 - **决策规则**：若 Vision 质量达标且写回成本 < 扩展管理器（Phase E）成本，macOS 主路线切换为 OS 原生、Windows 保留 OCRmyPDF 扩展；否则双平台统一 OCRmyPDF。`OcrBackend` trait（§6.2）两种结局都兼容。
 
 ### 4.3 输出可用性验证
@@ -130,6 +133,8 @@
 
 **退出条件**：给出 go/no-go 报告、最终后端选型、固定参数与依赖清单。不通过则按评审稿 §8.2 次优先级评估 PDFium + native Tesseract + grafting，不转向实时覆盖层。
 
+Phase C 当前仍为 **IN PROGRESS**。完整证据和未通过的门槛见 [PoC 报告](../reviews/scanned-pdf-ocr-phase-c-poc-2026-07-18.md)；在合法样本、signed `.app`、Windows 和 Reader 交互验证前，不得把 Vision 路线标记为最终 go。
+
 ## 5. 数据模型（migration `028_book_assets.sql`）
 
 ```sql
@@ -138,15 +143,16 @@ CREATE TABLE book_assets (
   book_id             TEXT NOT NULL REFERENCES books(id),
   role                TEXT NOT NULL,             -- source | ocr_pdf （EPUB 后续再加）
   format              TEXT NOT NULL,             -- pdf | epub
-  relative_path       TEXT NOT NULL,             -- books/ 下平铺
-  content_sha256      TEXT NOT NULL,
-  byte_size           INTEGER NOT NULL,
+  relative_path       TEXT NOT NULL,             -- source: books/ or sources/; derived: books/
+  content_sha256      TEXT,                     -- source bridge may be unknown until materialized
+  byte_size           INTEGER,                  -- source bridge may be unknown until materialized
   source_asset_id     TEXT,
   source_sha256       TEXT,
   pipeline            TEXT,                      -- ocrmypdf | apple_vision | ...
   pipeline_version    TEXT,
   language_profile    TEXT,                      -- chi_sim+eng
   quality_profile     TEXT,                      -- fast | best
+  conversion_version  INTEGER NOT NULL DEFAULT 1,
   page_count          INTEGER,
   supersedes_asset_id TEXT,
   created_at          INTEGER NOT NULL,
@@ -154,27 +160,60 @@ CREATE TABLE book_assets (
   updated_by_device   TEXT NOT NULL
 );
 
+CREATE UNIQUE INDEX book_assets_relative_path_idx ON book_assets(relative_path);
+CREATE UNIQUE INDEX book_assets_one_source_idx
+  ON book_assets(book_id) WHERE role = 'source';
+CREATE INDEX book_assets_book_updated_idx
+  ON book_assets(book_id, updated_at DESC);
+
+CREATE TABLE book_asset_local_state ( -- 本机状态，永不进入事件日志或快照
+  asset_id TEXT PRIMARY KEY REFERENCES book_assets(id),
+  book_id TEXT NOT NULL,
+  availability TEXT NOT NULL,        -- remote_only|downloading|available_verified|corrupt|missing
+  observed_size INTEGER,
+  observed_mtime INTEGER,
+  verified_at INTEGER,
+  error_code TEXT,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX book_asset_local_state_book_idx ON book_asset_local_state(book_id);
+
 ALTER TABLE books ADD COLUMN preferred_asset_id TEXT;  -- 可空，同步偏好
 
 CREATE TABLE ocr_jobs (        -- 本机执行状态，永不进入事件日志
   id TEXT PRIMARY KEY, book_id TEXT NOT NULL,
   source_asset_id TEXT, source_sha256 TEXT NOT NULL,
-  state TEXT NOT NULL,         -- queued|waiting_source|preparing|recognizing|validating|publishing|failed|cancelled
+  state TEXT NOT NULL,         -- queued|waiting_source|preparing|recognizing|validating|publishing|ready|failed|cancelled
   phase TEXT, pages_done INTEGER, pages_total INTEGER,
   backend TEXT, backend_version TEXT,
   language_profile TEXT, quality_profile TEXT, jobs INTEGER,
+  conversion_version INTEGER NOT NULL DEFAULT 1,
+  result_asset_id TEXT, recognized_pages INTEGER, skipped_pages INTEGER,
+  timed_out_pages INTEGER, failed_pages INTEGER,
   temporary_path TEXT, error_code TEXT, error_detail TEXT,
   created_at INTEGER, started_at INTEGER, updated_at INTEGER
 );
+CREATE INDEX ocr_jobs_book_updated_idx ON ocr_jobs(book_id, updated_at DESC);
+CREATE UNIQUE INDEX ocr_jobs_one_active_idx ON ocr_jobs(book_id)
+  WHERE state IN ('queued','waiting_source','preparing','recognizing','validating','publishing');
+
+-- Derived assets must be immutable and complete; source rows are a legacy bridge.
+CREATE TRIGGER book_assets_validate_insert BEFORE INSERT ON book_assets
+BEGIN
+  SELECT CASE WHEN NEW.role <> 'source'
+    AND (NEW.content_sha256 IS NULL OR NEW.byte_size IS NULL OR NEW.source_sha256 IS NULL)
+    THEN RAISE(ABORT, 'derived asset metadata incomplete') END;
+END;
 ```
 
 要点（均采纳评审稿 §14，裁剪见 §0.3.5）：
 
 - 现有 `source_format/render_format/source_file_path/source_sha256` 保留为兼容桥梁，本版本不删。
-- `role=source` 迁移：资产 ID 由 `book_id` 确定性派生（UUIDv5），防两台离线设备各自迁移出不同 source asset；第一阶段不移动物理文件。
-- 派生文件路径：`books/{book_id}.ocr-pdf.v1.{source_hash_prefix}.{profile}.pdf`，平铺不建子目录。
+- `role=source` 迁移：资产 ID 由 `book_id` 确定性派生（UUIDv5），防两台离线设备各自迁移出不同 source asset；当前 legacy 行的 hash/size 可为空，物化后再补齐。UUIDv5 回填由 Rust 幂等 post-migration/lazy backfill 完成，不能假设 SQL migration 能计算 UUID。
+- 派生文件路径必须包含唯一 `asset_id`，例如 `books/{book_id}.ocr-pdf.v1.{source_hash_prefix}.{profile}.{asset_id}.pdf`；同配置重做或两台设备并发生成不能覆盖旧资产。
+- `book_asset_local_state` 将远端资产元数据与本机可用性分开；应用重启后不能仅凭文件存在或 preferred 指针激活资产。
 - resolver 优先级：本机明确且有效的选择 → 同步 `preferred_asset_id` → 最新受支持 searchable PDF → source。本机可用性区分 `remote_only/downloading/available_verified/corrupt/missing`，不复用 `Book.available`。
-- 删除整书的显式 cascade 与「防漏表」测试扩展到 `book_assets`、`ocr_jobs`。
+- 删除整书的显式 cascade 与「防漏表」测试扩展到 `book_assets`、`book_asset_local_state`、`ocr_jobs`；测试必须先 seed 每张表再断言删除，避免假绿。
 
 ## 6. 后端实现（Phase D 本地管线，feature flag 内）
 
@@ -186,10 +225,12 @@ src-tauri/src/commands/ocr/
   package.rs    # OcrPackageManager: manifest 拉取、下载、校验、原子安装/卸载
   backend.rs    # OcrBackend trait + ocrmypdf(/vision) 实现、进度 JSONL 解析
   jobs.rs       # OcrJobManager: 全局单书队列、guarded update、崩溃恢复
-  publish.rs    # BookAssetPublisher: 输出验证、哈希、原子发布 + 同一事务写 outbox
+ publish.rs    # BookAssetPublisher: 输出验证、哈希、原子发布 + 同一事务写 outbox
 ```
 
 复用 `convert_prepare.rs` 的既有模式：源快照 + guarded update、临时文件原子 rename、启动恢复。不复用其 `Converter` trait（EPUB-only destination）与 `preparation_state`（会阻止开书，OCR 必须允许继续读原件）。
+
+Phase D 的安全边界：migration、asset repository、resolver、fake backend 和本地 job 状态可以先落地；`package.rs` 属于 Phase E，不应成为数据模型切片的硬依赖；真实 publish 在 Phase G 前不得写同步 outbox。当前仓库没有现成 Cargo feature 约定，若引入 `ocr-pipeline` feature，默认 release 必须 fail closed（不启动 worker、不恢复任务、不写文件），并同时测试默认与 feature 构建。
 
 ### 6.2 `OcrBackend` trait
 
@@ -205,7 +246,7 @@ src-tauri/src/commands/ocr/
 
 - 长 OCR 阶段**不持有** sync transition lock；完成后才取 guard 并重读当前 `data_dir`。
 - 验证 = 页数一致 + 首/中/末页 PDFium 渲染抽样 + 预期扫描页有文字层；页数不一致视为失败，不切换。
-- 同一 SQLite 事务内（`SyncWriter.with_tx()`）插入资产、设偏好、写 outbox。
+- Phase D 本地管线不得向现有 v6 outbox 写资产 body，也不得把 v7 body 包装成 v6 envelope。真正的资产 publish/preferred 写入、`SyncWriter.with_tx()` outbox 事务和 `data_dir/books/` 同步发布必须与 Phase G 的 schema v7、snapshot 和 peer gating 同批落地；Phase D 只允许写本地 staging、任务和验证结果。
 - 禁止「先事件后文件」。
 - 结果报告记录 `recognized/skipped/timed_out/failed` 页数；有失败页时完成文案如实说明。
 - 数字签名 PDF：v1 直接拒绝自动 OCR 并说明原因。
@@ -213,6 +254,8 @@ src-tauri/src/commands/ocr/
 ### 6.5 AI grounding 衔接
 
 资产 ready 后触发对活动资产重建索引；`PDF_TEXT_LAYER_UNAVAILABLE`（`extract.rs:220`）状态必须可自愈。grounding 的整书候选信号（`page_count > 5 && total_chars < 500`）可复用为「疑似扫描」缓存，但产品判断以当前页检测为准（评审稿 §12.2 的漏判/误判分析成立）。
+
+grounding 必须调用与 Reader 相同的 active-asset resolver，并把 resolved asset 的 content hash 纳入索引 key；否则 OCR 完成后仍会固定读取 legacy `books.source_file_path`，重新索引扫描原件并再次得到 `PDF_TEXT_LAYER_UNAVAILABLE`。
 
 ## 7. 同步协议（Phase G，事件 schema v7）
 
