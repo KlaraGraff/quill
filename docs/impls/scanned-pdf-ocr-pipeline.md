@@ -1,6 +1,6 @@
 # 扫描 PDF OCR 与可同步派生资产 — 实施方案
 
-> 状态：已完成独立评审，待排期
+> 状态：执行中；Phase A、Phase B 已完成，Phase C PoC 进行中
 >
 > 日期：2026-07-18
 >
@@ -95,13 +95,15 @@
 - `replay.rs`：原生 + 文本导入形态的 peer 日志端到端应用（此前整份被拒的场景），后续进度事件不丢。
 - `snapshot/tests.rs`：含两种形态书籍的 snapshot `apply_peer` 成功；`source_file_path` 逃逸的 snapshot 拒绝。
 
-## 3. Phase B — 同步能力通告（早发布，小改动）
+## 3. Phase B — 同步能力通告（已实施，commit `1faf519`）
 
-**交付物：peer manifest 增加 `max_event_schema` 字段，随任意近期版本发布。**
+**状态：已实施并合入 `main`（2026-07-18），待随任意近期版本发布。**
 
 - 本设备 manifest 写入当前支持的最大事件 schema 版本（现为 6，Phase G 后为 7）。
 - 读取侧：缺失该字段的 manifest 视为 v6。
 - 此版本不含任何行为变化，纯通告——目的是让「已升级设备集合」尽早可观测，缩短 Phase G 的 gating 等待期。
+- Rust `PeerInfo` 与前端同步状态 DTO 同时透出该字段，供 Phase G 列出阻塞升级的设备。
+- 已验证：peer 测试 21 项、replay heartbeat manifest 测试、Clippy、前端类型检查及相关文件格式检查通过。
 
 ## 4. Phase C — PoC（go/no-go 门）
 
@@ -234,6 +236,8 @@ v1 不加 `book.asset_position.set`（§0.3.5）。validation 为新事件扩展
 - 发送端规则：仅当**全部活跃 peer** 的 manifest 通告 `max_event_schema >= 7` 时才发送资产事件；否则 OCR 功能本机可用，但资产不发布到日志（UI 在设置中列出阻塞的设备名）。
 - 活跃判定：manifest `last_seen` 超过 30 天的 peer 不计入（阈值可调）；提供手动忽略入口。
 - 一旦开始发送 v7 事件即单向棘轮，不回退。
+- 能力判定必须 fail-closed，不能直接对 `list_peers()` 的返回值调用 `all()`：当前列表会跳过损坏、不可读和 `.icloud` placeholder manifest，暂时不可见的旧设备不能因此被当作不存在。Phase G 需要保守的能力发现 API，处理 placeholder 与已知历史设备；未知能力默认阻塞，除非已经过期或被用户显式忽略。
+- 「手动忽略」是本机 gating 决策，不等同于当前会删除对端 manifest/log/snapshot 的破坏性「移除设备」。单向棘轮状态和忽略记录都必须持久化。
 
 ### 7.4 删除与去重
 
