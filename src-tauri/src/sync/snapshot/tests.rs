@@ -835,6 +835,57 @@ fn apply_peer_parent_tombstones_suppress_snapshot_children() {
 }
 
 #[test]
+fn apply_peer_accepts_native_and_text_import_book_paths() {
+    // Native imports keep source_file_path under books/, text imports keep
+    // file_path itself under sources/. Snapshot validation used to allow
+    // neither, so one such book made a peer's whole snapshot unappliable.
+    let EventBody::BookImport(mut native) = import("b1") else {
+        unreachable!()
+    };
+    native.source_file_path = Some(native.file_path.clone());
+    let EventBody::BookImport(mut text) = import("b2") else {
+        unreachable!()
+    };
+    text.file_path = "sources/b2.txt".into();
+    text.source_file_path = Some("sources/b2.txt".into());
+    let events = vec![
+        ev(1000, "dev-A", EventBody::BookImport(native)),
+        ev(1100, "dev-A", EventBody::BookImport(text)),
+    ];
+    let snap = Snapshot::from_events("dev-A", &events).unwrap();
+
+    let mut local = open_db();
+    let tx = local.transaction().unwrap();
+    assert_eq!(snap.apply_peer(&tx, "dev-A").unwrap(), ApplyOutcome::Applied);
+    tx.commit().unwrap();
+
+    let n_books: i64 = local
+        .query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n_books, 2);
+}
+
+#[test]
+fn apply_peer_rejects_escaping_source_file_path() {
+    let mut state = SnapshotState::default();
+    let mut row = text_book_row(10, "hash");
+    row.source_file_path = Some("sources/../secrets.txt".into());
+    state.books.insert("b1".into(), row);
+    let snapshot = Snapshot {
+        v: SNAPSHOT_SCHEMA_VERSION,
+        device: "dev-A".into(),
+        id: "01HYZX0000000000000000B001".into(),
+        generated_at: 1_714_770_000_000,
+        truncated_before: None,
+        state,
+    };
+    let mut local = open_db();
+    let tx = local.transaction().unwrap();
+    assert!(snapshot.apply_peer(&tx, "dev-A").is_err());
+    tx.rollback().unwrap();
+}
+
+#[test]
 fn apply_peer_rejects_invalid_tombstone_metadata() {
     let invalid_cases = [
         ("unknown", "b1", 1000),

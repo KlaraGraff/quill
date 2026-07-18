@@ -1251,6 +1251,48 @@ mod tests {
     }
 
     #[test]
+    fn import_shapes_with_source_rooted_paths_do_not_reject_peer_log() {
+        // Native imports set source_file_path under books/, text imports set
+        // file_path itself under sources/ (commands/books/import.rs). Both
+        // shapes used to fail validate_event, which rejects the entire peer
+        // log — every later event from that device was lost until the next
+        // snapshot. The realistic shapes must replay end to end.
+        let env = setup("self");
+        let EventBody::BookImport(mut native) = import("b1") else {
+            unreachable!()
+        };
+        native.source_file_path = Some(native.file_path.clone());
+        let EventBody::BookImport(mut text) = import("b2") else {
+            unreachable!()
+        };
+        text.file_path = "sources/b2.txt".into();
+        text.source_file_path = Some("sources/b2.txt".into());
+        let events = [
+            ev(1000, "peer-A", EventBody::BookImport(native)),
+            ev(2000, "peer-A", EventBody::BookImport(text)),
+            ev(
+                3000,
+                "peer-A",
+                EventBody::BookProgressSet {
+                    book: "b1".into(),
+                    progress: 50,
+                    cfi: Some("c50".into()),
+                },
+            ),
+        ];
+        write_peer_log(&env.shared, "peer-A", &events);
+
+        let report = env.engine.tick(&env.db).unwrap();
+        assert_eq!(report.events_applied, 3);
+
+        let n_books: i64 = env
+            .conn()
+            .query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_books, 2);
+    }
+
+    #[test]
     fn malformed_event_is_skipped_and_good_events_still_apply() {
         let env = setup("self");
         let events = [

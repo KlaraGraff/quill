@@ -286,19 +286,19 @@ pub fn validate_event(event: &Event, expected_device: &str) -> AppResult<()> {
     match &event.body {
         EventBody::BookImport(payload) => {
             validate_entity_id(&payload.id)?;
-            validate_book_path(&payload.file_path)?;
+            validate_book_file_path(&payload.file_path)?;
             if let Some(path) = payload.cover_path.as_deref() {
                 validate_cover_path(path)?;
             }
             if let Some(path) = payload.source_file_path.as_deref() {
-                validate_source_path(path)?;
+                validate_book_file_path(path)?;
             }
         }
         EventBody::BookDelete { id } => validate_entity_id(id)?,
         EventBody::BookMetadataSet { book, field, value } => {
             validate_entity_id(book)?;
             if field == "file_path" {
-                validate_book_path(
+                validate_book_file_path(
                     value
                         .as_str()
                         .ok_or_else(|| AppError::Other("SYNC_BLOB_PATH_INVALID".to_string()))?,
@@ -476,6 +476,19 @@ pub fn validate_source_path(path: &str) -> AppResult<()> {
     validate_relative_blob_path(path, "sources", BOOK_EXTENSIONS)
 }
 
+/// `file_path` and `source_file_path` name a book's blobs by role, not by
+/// location: native imports keep one file under `books/` for both roles,
+/// while text/converted imports keep the canonical upload under `sources/`
+/// (`do_import_text` even points `file_path` there). Either root is valid
+/// for either field.
+pub fn validate_book_file_path(path: &str) -> AppResult<()> {
+    if path.starts_with("sources/") {
+        validate_source_path(path)
+    } else {
+        validate_book_path(path)
+    }
+}
+
 pub fn resolve_book_path(data_dir: &Path, path: &str) -> AppResult<PathBuf> {
     validate_book_path(path)?;
     Ok(data_dir.join(path))
@@ -505,6 +518,7 @@ pub fn resolve_blob_path(data_dir: &Path, path: &str) -> AppResult<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::events::{BookImportPayload, EVENT_SCHEMA_VERSION};
     use serde_json::Map;
 
     #[test]
@@ -518,6 +532,81 @@ mod tests {
         for path in ["/tmp/book.epub", "books/../../tmp/a.epub", "other/a.epub"] {
             assert!(validate_book_path(path).is_err(), "accepted {path}");
         }
+    }
+
+    #[test]
+    fn book_file_paths_accept_both_books_and_sources_roots() {
+        assert!(validate_book_file_path("books/example.epub").is_ok());
+        assert!(validate_book_file_path("books/example.pdf").is_ok());
+        assert!(validate_book_file_path("sources/example.txt").is_ok());
+        assert!(validate_book_file_path("sources/example.mobi").is_ok());
+        for path in [
+            "/tmp/book.epub",
+            "books/../../tmp/a.epub",
+            "sources/../books/a.epub",
+            "covers/a.img",
+            "other/a.epub",
+        ] {
+            assert!(validate_book_file_path(path).is_err(), "accepted {path}");
+        }
+    }
+
+    #[test]
+    fn book_import_events_accept_native_and_text_import_shapes() {
+        // Native EPUB/PDF imports reuse the render file for both roles
+        // (import.rs `do_import_epub`/`do_import_pdf`); text imports point
+        // both fields at `sources/` (`do_import_text`). Both shapes must
+        // validate — regression for the contract mismatch that made replay
+        // reject whole peer logs.
+        let native = Event {
+            id: "01HYZX0000000000000000EVT3".into(),
+            ts: 1_714_770_000_000,
+            device: "dev-A".into(),
+            v: EVENT_SCHEMA_VERSION,
+            body: EventBody::BookImport(BookImportPayload {
+                id: "b1".into(),
+                title: "Native".into(),
+                author: "Author".into(),
+                description: None,
+                cover_path: None,
+                file_path: "books/b1.epub".into(),
+                format: "epub".into(),
+                source_format: Some("epub".into()),
+                render_format: Some("epub".into()),
+                source_file_path: Some("books/b1.epub".into()),
+                source_sha256: Some("ab".repeat(32)),
+                conversion_version: 0,
+                genre: None,
+                pages: Some(100),
+            }),
+            extra: Map::new(),
+        };
+        assert!(validate_event(&native, "dev-A").is_ok());
+
+        let EventBody::BookImport(native_payload) = &native.body else {
+            unreachable!()
+        };
+        let text = Event {
+            body: EventBody::BookImport(BookImportPayload {
+                file_path: "sources/b1.txt".into(),
+                format: "text".into(),
+                source_format: Some("txt".into()),
+                render_format: Some("text".into()),
+                source_file_path: Some("sources/b1.txt".into()),
+                ..native_payload.clone()
+            }),
+            ..native.clone()
+        };
+        assert!(validate_event(&text, "dev-A").is_ok());
+
+        let escape = Event {
+            body: EventBody::BookImport(BookImportPayload {
+                source_file_path: Some("sources/../secrets.pdf".into()),
+                ..native_payload.clone()
+            }),
+            ..native.clone()
+        };
+        assert!(validate_event(&escape, "dev-A").is_err());
     }
 
     #[test]

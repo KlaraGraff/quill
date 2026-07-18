@@ -148,9 +148,12 @@ impl Snapshot {
         )?;
         for (id, book) in &self.state.books {
             validation::validate_entity_id(id)?;
-            validation::validate_book_path(&book.file_path)?;
+            validation::validate_book_file_path(&book.file_path)?;
             if let Some(path) = book.cover_path.as_deref() {
                 validation::validate_cover_path(path)?;
+            }
+            if let Some(path) = book.source_file_path.as_deref() {
+                validation::validate_book_file_path(path)?;
             }
         }
         for (id, note) in &self.state.notes {
