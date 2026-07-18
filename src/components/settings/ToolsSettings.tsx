@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { Highlighter, LayoutPanelTop, MousePointer2, MousePointerClick, PanelRightOpen } from "lucide-react";
+import { Highlighter, LayoutPanelTop, MousePointer2, MousePointerClick, PanelRightOpen, ScanText } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
   LEARNING_CARD_CONFIG_SETTING_KEY,
@@ -19,6 +19,7 @@ import SelectionMenuSettings from "./SelectionMenuSettings";
 import MarkerStyleSettings from "./MarkerStyleSettings";
 import ReaderBindingsSettings from "./ReaderBindingsSettings";
 import ConfirmDialog from "./ConfirmDialog";
+import OcrSettings from "./OcrSettings";
 import type { SettingsProps } from "./types";
 import {
   MARKER_STYLE_SETTING_KEY,
@@ -30,7 +31,7 @@ import {
 import { notifyReadingAssistanceSettingsChanged } from "../reading-assistance-events";
 import { parseReaderBindings, READER_BINDINGS_SETTING_KEY, type ReaderActionBinding } from "../reader-bindings";
 
-type ToolsView = "interaction" | "cards" | "menu" | "markers";
+type ToolsView = "interaction" | "cards" | "menu" | "markers" | "ocr";
 
 export interface ToolsPreviewState {
   kind: LearningCardKind;
@@ -50,6 +51,7 @@ export interface ToolsPreviewState {
 interface ToolsSettingsProps extends SettingsProps {
   onPreviewChange?: (preview: ToolsPreviewState | null) => void;
   onNavigationGuardChange?: (guard: ((action: () => void) => void) | null) => void;
+  initialView?: "ocr";
 }
 
 function SettingsRow({ title, subtitle, children }: { title: string; subtitle: string; children: ReactNode }) {
@@ -119,9 +121,10 @@ export default function ToolsSettings({
   showSavedToast,
   onPreviewChange,
   onNavigationGuardChange,
+  initialView,
 }: ToolsSettingsProps) {
   const { t } = useTranslation();
-  const [view, setView] = useState<ToolsView>("interaction");
+  const [view, setView] = useState<ToolsView>(initialView ?? "interaction");
   const [previewOpen, setPreviewOpen] = useState(false);
   const [cardKind, setCardKind] = useState<LearningCardKind>("word");
   const [menuKind, setMenuKind] = useState<SelectionMenuKind>("word");
@@ -171,6 +174,13 @@ export default function ToolsSettings({
     onNavigationGuardChange?.(requestNavigation);
     return () => onNavigationGuardChange?.(null);
   }, [onNavigationGuardChange, requestNavigation]);
+
+  useEffect(() => {
+    if (initialView === "ocr") {
+      setView("ocr");
+      setPreviewOpen(false);
+    }
+  }, [initialView]);
 
   useEffect(() => {
     if (loading || hydratedRef.current) return;
@@ -314,6 +324,7 @@ export default function ToolsSettings({
       icon: Highlighter,
       label: t("settings.tools.views.markers", { defaultValue: "正文标记" }),
     },
+    { id: "ocr", icon: ScanText, label: t("ocr.settings.tab") },
   ];
 
   return (
@@ -375,6 +386,8 @@ export default function ToolsSettings({
           />
         </div>
       )}
+
+      {view === "ocr" && <OcrSettings />}
 
       {view === "cards" && (
         <div>

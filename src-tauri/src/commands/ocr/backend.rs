@@ -1,8 +1,11 @@
 use std::fs::{self, File};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -123,6 +126,328 @@ pub(crate) trait OcrBackend: Send + Sync {
         progress: &mut dyn FnMut(OcrProgress),
         cancel: &CancellationToken,
     ) -> AppResult<OcrOutput>;
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OcrmypdfBackend {
+    pub runtime_root: PathBuf,
+    pub version: String,
+}
+
+impl OcrmypdfBackend {
+    pub(crate) fn from_runtime(runtime: &super::package::RuntimeInfo) -> Self {
+        Self {
+            runtime_root: runtime.root.clone(),
+            version: runtime.version.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum JsonlEvent {
+    Phase {
+        phase: String,
+    },
+    Progress {
+        phase: String,
+        completed: i32,
+        total: i32,
+    },
+    Warning {
+        code: String,
+        page: Option<i32>,
+    },
+    Complete {
+        pages: i32,
+        ocr_pages: i32,
+        skipped_pages: i32,
+        #[serde(default)]
+        timed_out_pages: i32,
+        #[serde(default)]
+        failed_pages: i32,
+    },
+}
+
+impl OcrBackend for OcrmypdfBackend {
+    fn probe(&self) -> AppResult<BackendCapabilities> {
+        let executable = runtime_executable(&self.runtime_root)?;
+        let output = Command::new(executable)
+            .arg("--version")
+            .env_clear()
+            .env("PATH", runtime_path(&self.runtime_root))
+            .env("TESSDATA_PREFIX", tessdata_dir(&self.runtime_root))
+            .output()
+            .map_err(|_| ocr_error("OCR_RUNTIME_EXEC_FAILED"))?;
+        if !output.status.success() {
+            return Err(ocr_error("OCR_RUNTIME_SELF_TEST_FAILED"));
+        }
+        Ok(BackendCapabilities {
+            id: "ocrmypdf".to_string(),
+            version: self.version.clone(),
+            languages: vec!["chi_sim+eng".to_string()],
+            quality_profiles: vec!["fast".to_string()],
+        })
+    }
+
+    fn recognize_pdf_in_staging(
+        &self,
+        request: &ValidatedRecognitionRequest,
+        progress: &mut dyn FnMut(OcrProgress),
+        cancel: &CancellationToken,
+    ) -> AppResult<OcrOutput> {
+        cancel.check()?;
+        if request.language_profile() != "chi_sim+eng" || request.quality_profile() != "fast" {
+            return Err(ocr_error("OCR_BACKEND_REQUEST_INVALID"));
+        }
+        let executable = runtime_executable(&self.runtime_root)?;
+        let mut command = Command::new(executable);
+        command
+            .args([
+                "--mode",
+                "skip",
+                "--output-type",
+                "pdf",
+                "--rasterizer",
+                "pypdfium",
+                "--optimize",
+                "0",
+                "--fast-web-view",
+                "999999",
+                "--jobs",
+                &request.jobs().to_string(),
+                "-l",
+                "chi_sim+eng",
+                "--",
+            ])
+            .arg(request.source())
+            .arg(request.destination())
+            .current_dir(request.staging_root())
+            .env_clear()
+            .env("PATH", runtime_path(&self.runtime_root))
+            .env("TESSDATA_PREFIX", tessdata_dir(&self.runtime_root))
+            .env("OMP_THREAD_LIMIT", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_process_group(&mut command);
+        let mut child = command
+            .spawn()
+            .map_err(|_| ocr_error("OCR_RUNTIME_EXEC_FAILED"))?;
+        let process_id = child.id();
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ocr_error("OCR_RUNTIME_OUTPUT_INVALID"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ocr_error("OCR_RUNTIME_OUTPUT_INVALID"))?;
+        let stderr_tail = Arc::new(Mutex::new(Vec::new()));
+        let stderr_reader = spawn_stderr_reader(stderr, Arc::clone(&stderr_tail));
+
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let stdout_reader = thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if let Ok(event) = serde_json::from_str::<JsonlEvent>(&line) {
+                    if event_tx.send(event).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let mut complete = None;
+        let status = loop {
+            while let Ok(event) = event_rx.try_recv() {
+                match event {
+                    JsonlEvent::Phase { phase } => progress(OcrProgress {
+                        phase,
+                        pages_done: None,
+                        pages_total: None,
+                    }),
+                    JsonlEvent::Progress {
+                        phase,
+                        completed,
+                        total,
+                    } if completed >= 0 && total >= completed => progress(OcrProgress {
+                        phase,
+                        pages_done: Some(completed),
+                        pages_total: Some(total),
+                    }),
+                    JsonlEvent::Warning { code, page } => {
+                        let _ = (code, page);
+                    }
+                    JsonlEvent::Complete {
+                        pages,
+                        ocr_pages,
+                        skipped_pages,
+                        timed_out_pages,
+                        failed_pages,
+                    } => {
+                        complete = Some((
+                            pages,
+                            ocr_pages,
+                            skipped_pages,
+                            timed_out_pages,
+                            failed_pages,
+                        ))
+                    }
+                    JsonlEvent::Progress { .. } => {}
+                }
+            }
+            if cancel.is_cancelled() {
+                terminate_process_tree(process_id, &mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(ocr_error("OCR_JOB_CANCELLED"));
+            }
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|_| ocr_error("OCR_RUNTIME_EXEC_FAILED"))?
+            {
+                break status;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
+        while let Ok(event) = event_rx.try_recv() {
+            if let JsonlEvent::Complete {
+                pages,
+                ocr_pages,
+                skipped_pages,
+                timed_out_pages,
+                failed_pages,
+            } = event
+            {
+                complete = Some((
+                    pages,
+                    ocr_pages,
+                    skipped_pages,
+                    timed_out_pages,
+                    failed_pages,
+                ));
+            }
+        }
+        if !status.success() {
+            let detail = stderr_tail
+                .lock()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
+            log::warn!("OCRmyPDF failed: {detail}");
+            return Err(ocr_error("OCR_RUNTIME_FAILED"));
+        }
+        let (pages, recognized_pages, skipped_pages, timed_out_pages, failed_pages) =
+            complete.ok_or_else(|| ocr_error("OCR_RUNTIME_OUTPUT_INVALID"))?;
+        Ok(OcrOutput {
+            output_path: request.destination().to_path_buf(),
+            page_count: pages,
+            recognized_pages,
+            skipped_pages,
+            timed_out_pages,
+            failed_pages,
+        })
+    }
+}
+
+fn runtime_executable(root: &Path) -> AppResult<PathBuf> {
+    let candidates: &[&str] = if cfg!(windows) {
+        &[
+            "lantern-ocr.cmd",
+            "bin/ocrmypdf.exe",
+            "Scripts/ocrmypdf.exe",
+            "ocrmypdf.exe",
+        ]
+    } else {
+        &["bin/lantern-ocr", "bin/ocrmypdf", "ocrmypdf"]
+    };
+    candidates
+        .iter()
+        .map(|candidate| root.join(candidate))
+        .find(|path| path.is_file())
+        .ok_or_else(|| ocr_error("OCR_RUNTIME_NOT_INSTALLED"))
+}
+
+fn tessdata_dir(root: &Path) -> PathBuf {
+    let standard = root.join("share/tessdata");
+    if standard.is_dir() {
+        standard
+    } else {
+        root.join("Library/share/tessdata")
+    }
+}
+
+fn runtime_path(root: &Path) -> std::ffi::OsString {
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    std::env::join_paths([root.join("bin"), root.to_path_buf()])
+        .unwrap_or_else(|_| std::ffi::OsString::from(separator))
+}
+
+fn spawn_stderr_reader(
+    stderr: impl Read + Send + 'static,
+    tail: Arc<Mutex<Vec<u8>>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        const LIMIT: usize = 64 * 1024;
+        let mut reader = BufReader::new(stderr);
+        let mut buffer = [0_u8; 8 * 1024];
+        while let Ok(read) = reader.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            if let Ok(mut bytes) = tail.lock() {
+                bytes.extend_from_slice(&buffer[..read]);
+                if bytes.len() > LIMIT {
+                    let excess = bytes.len() - LIMIT;
+                    bytes.drain(..excess);
+                }
+            }
+        }
+    })
+}
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(windows)]
+fn configure_process_group(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(0x0000_0200);
+}
+
+#[cfg(unix)]
+fn terminate_process_tree(process_id: u32, child: &mut std::process::Child) {
+    unsafe {
+        libc::kill(-(process_id as i32), libc::SIGTERM);
+    }
+    for _ in 0..20 {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    unsafe {
+        libc::kill(-(process_id as i32), libc::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
+#[cfg(windows)]
+fn terminate_process_tree(_process_id: u32, child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 pub(crate) fn recognize_pdf(

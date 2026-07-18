@@ -1225,6 +1225,61 @@ fn resolve_paths_does_not_redirect_before_ready() {
     assert!(book.file_path.ends_with("cv2.azw3"));
 }
 
+#[test]
+fn resolve_paths_redirects_pdf_to_latest_verified_ocr_asset() {
+    let (dir, db) = setup();
+    insert_book(&db, "pdf-ocr", "pdf");
+    let source = dir.path().join("books/pdf-ocr.pdf");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, b"source").unwrap();
+    {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE books SET source_format = 'pdf', source_file_path = file_path,
+                 source_sha256 = 'source-hash' WHERE id = 'pdf-ocr'",
+            [],
+        )
+        .unwrap();
+        let relative =
+            crate::commands::ocr::assets::expected_relative_path("pdf-ocr", "asset-1");
+        crate::commands::ocr::assets::insert_asset(
+            &conn,
+            crate::commands::ocr::assets::NewBookAsset {
+                id: "asset-1",
+                book_id: "pdf-ocr",
+                relative_path: &relative,
+                content_sha256: "asset-hash",
+                byte_size: 4,
+                source_sha256: "source-hash",
+                pipeline_version: Some("test"),
+                language_profile: "chi_sim+eng",
+                quality_profile: "fast",
+                page_count: 1,
+                supersedes_asset_id: None,
+                created_at: 2,
+                updated_at: 2,
+                updated_by_device: "dev-a",
+            },
+        )
+        .unwrap();
+        crate::commands::ocr::assets::set_local_state(
+            &conn,
+            "asset-1",
+            "available_verified",
+            Some(3),
+            None,
+            3,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(&relative), b"data").unwrap();
+    }
+
+    let mut book = super::query::query_book(&db, "pdf-ocr").unwrap();
+    super::query::resolve_book_paths(&mut book, &db, None).unwrap();
+    assert!(book.file_path.ends_with("pdf-ocr.ocr.asset-1.pdf"));
+    assert!(book.available);
+}
+
 // -----------------------------------------------------------------------
 // Pagination
 // -----------------------------------------------------------------------

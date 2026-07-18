@@ -167,14 +167,34 @@ pub fn ensure_index(db: &Db, book_id: &str) -> AppResult<IndexStatus> {
         )?;
         return Ok(IndexStatus::Unsupported);
     }
-    let source_path = db.resolve_path(
-        source
-            .source_file_path
-            .as_deref()
-            .unwrap_or(&source.file_path),
-    )?;
-    let actual_sha256 = source_sha256(&source_path)
-        .unwrap_or_else(|_| source.stored_sha256.clone().unwrap_or_default());
+    let (source_path, resolved_sha256) = if format == "pdf" {
+        let data_dir = db
+            .data_dir
+            .lock()
+            .map_err(|error| AppError::Other(error.to_string()))?
+            .clone();
+        let resolved = {
+            let conn = db.reader();
+            crate::commands::ocr::resolver::resolve_active_asset(&conn, &data_dir, book_id)?
+        };
+        (resolved.absolute_path, resolved.content_sha256)
+    } else {
+        (
+            db.resolve_path(
+                source
+                    .source_file_path
+                    .as_deref()
+                    .unwrap_or(&source.file_path),
+            )?,
+            source.stored_sha256.clone(),
+        )
+    };
+    let actual_sha256 = resolved_sha256
+        .filter(|hash| !hash.is_empty())
+        .unwrap_or_else(|| {
+            source_sha256(&source_path)
+                .unwrap_or_else(|_| source.stored_sha256.clone().unwrap_or_default())
+        });
 
     {
         let conn = db
@@ -187,7 +207,10 @@ pub fn ensure_index(db: &Db, book_id: &str) -> AppResult<IndexStatus> {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).optional()?;
         if let Some((hash, version, status)) = state {
-            if status == "building" {
+            if status == "building"
+                && hash.as_deref() == Some(actual_sha256.as_str())
+                && version == INDEX_VERSION
+            {
                 return Ok(IndexStatus::Building);
             }
             if status == "ready"

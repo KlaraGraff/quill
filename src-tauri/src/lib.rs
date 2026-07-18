@@ -620,12 +620,17 @@ pub fn run() {
             let app_handle = app.handle().clone();
             mcp::notify::spawn_watcher(mcp_notify_path, app_handle);
 
+            let ocr_manager = commands::ocr::manager::OcrJobManager::default();
+            if let Err(error) = ocr_manager.recover_interrupted(&db) {
+                log::warn!("ocr: failed to recover interrupted jobs: {error}");
+            }
             app.manage(LocalDir(local_dir.clone()));
             app.manage(db);
             app.manage(secrets);
             app.manage(device);
             app.manage(sync_writer);
             app.manage(SyncState::new(None, None));
+            app.manage(ocr_manager);
 
             // TXT, Markdown, and HTML books keep their source files in the
             // library, while their reader documents are local derived caches.
@@ -705,6 +710,17 @@ pub fn run() {
             commands::books::retry_text_book_preparation,
             commands::books::get_converted_book_path,
             commands::books::retry_book_conversion,
+            // Optional local scanned-PDF OCR runtime and job pipeline
+            commands::ocr::package::ocr_package_status,
+            commands::ocr::package::ocr_package_download,
+            commands::ocr::package::ocr_package_cancel,
+            commands::ocr::package::ocr_package_uninstall,
+            commands::ocr::manager::ocr_start,
+            commands::ocr::manager::ocr_cancel,
+            commands::ocr::manager::ocr_retry,
+            commands::ocr::manager::ocr_job_status,
+            commands::ocr::manager::ocr_assets_overview,
+            commands::ocr::manager::ocr_asset_delete,
             commands::ai::ai_reindex_book,
             commands::ai::ai_update_book_index,
             commands::ai::ai_index_details,

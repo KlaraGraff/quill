@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import {
   ArrowLeft,
   BookOpen,
@@ -26,6 +27,7 @@ import {
   getReaderCapabilities,
 } from "../components/reader-settings";
 import ReaderContextMenu, { type ReaderMenuAction } from "../components/ReaderContextMenu";
+import OcrReaderHud from "../components/OcrReaderHud";
 import DictionaryPanel from "../components/DictionaryPanel";
 import TranslationPopover from "../components/TranslationPopover";
 import ExplainPopover from "../components/ExplainPopover";
@@ -83,6 +85,8 @@ import { ReadingProgressWriter } from "./reader/reading-progress-writer";
 import { useBookAvailability } from "./reader/useBookAvailability";
 import { usePageTurnInput } from "./reader/usePageTurnInput";
 import { useReaderInteractions } from "./reader/useReaderInteractions";
+import { useOcrPackage } from "../hooks/useOcrPackage";
+import { useOcrJob } from "../hooks/useOcrJob";
 import {
   mergeStoredReaderSettings,
   useReaderSettingsSync,
@@ -178,7 +182,13 @@ export default function Reader() {
   const [canGoBack, setCanGoBack] = useState(false);
   const [readerError, setReaderError] = useState<ReaderOpenError | null>(null);
   const [readerRetry, setReaderRetry] = useState(0);
-  const [pdfTextLayerNotice, setPdfTextLayerNotice] = useState(false);
+  const [ocrHudOpen, setOcrHudOpen] = useState(false);
+  const ocrIntentKeyRef = useRef("");
+  const ocrIntentShownAtRef = useRef(0);
+  const locallyRequestedOcrRef = useRef(false);
+  const pendingOcrReloadRef = useRef<{ page: number; total: number; sourcePath: string } | null>(null);
+  const ocrPackage = useOcrPackage(book?.format === "pdf");
+  const ocrJob = useOcrJob(bookId, book?.format === "pdf");
   const [textInitialLocation, setTextInitialLocation] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<ReaderInteraction | null>(null);
   const [contextSelectionFullyMarked, setContextSelectionFullyMarked] = useState(false);
@@ -312,7 +322,6 @@ export default function Reader() {
   const pendingSelectionMenuRef = useRef<number | null>(null);
   const readerInteractionGenerationRef = useRef(0);
   const forceClickSuppressedUntilRef = useRef(0);
-  const pdfTextLayerNoticeTimerRef = useRef<number | null>(null);
   const annotationClickDocumentRef = useRef<Document | null>(null);
   const contextMenuRequestRef = useRef(0);
 
@@ -373,9 +382,86 @@ export default function Reader() {
 
   useEffect(() => {
     if (!readerToast) return;
-    const timer = window.setTimeout(() => setReaderToast(null), 2500);
+    const timer = window.setTimeout(() => setReaderToast(null), 3500);
     return () => window.clearTimeout(timer);
   }, [readerToast]);
+
+  const onMissingPdfTextIntent = useCallback((pageIndex: number) => {
+    if (!book || book.format !== "pdf") return;
+    const sourceHash = book.source_sha256 ?? book.file_path;
+    const key = `${book.id}:${pageIndex}:${sourceHash}`;
+    const now = Date.now();
+    if (ocrIntentKeyRef.current === key && now - ocrIntentShownAtRef.current < 1_000) return;
+    ocrIntentKeyRef.current = key;
+    ocrIntentShownAtRef.current = now;
+    setBindingHud(null);
+    setOcrHudOpen(true);
+  }, [book]);
+
+  const openOcrSettings = useCallback(async () => {
+    try {
+      await invoke("open_settings_on_main", { section: "tools", view: "ocr" });
+    } catch {
+      await invoke("open_settings_on_main", { section: "tools" }).catch(() => {});
+    }
+    const main = await WebviewWindow.getByLabel("main").catch(() => null);
+    await main?.show().catch(() => {});
+    await main?.setFocus().catch(() => {});
+  }, []);
+
+  const startOcr = useCallback(() => {
+    locallyRequestedOcrRef.current = true;
+    void ocrJob.start().catch(() => {});
+  }, [ocrJob]);
+
+  const retryOcr = useCallback(() => {
+    locallyRequestedOcrRef.current = true;
+    void ocrJob.retry().catch(() => {});
+  }, [ocrJob]);
+
+  useEffect(() => {
+    if (!bookId || book?.format !== "pdf") return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen("book-assets-changed", async () => {
+      await ocrJob.refresh();
+      if (disposed || !locallyRequestedOcrRef.current || !book || !pageInfo) return;
+      const updated = await getBook(bookId).catch(() => null);
+      if (disposed || !updated || updated.file_path === book.file_path) return;
+      if (updated.pages && pageInfo.total && updated.pages !== pageInfo.total) {
+        setOcrHudOpen(true);
+        return;
+      }
+      pendingOcrReloadRef.current = {
+        page: Math.max(0, pageInfo.current - 1),
+        total: pageInfo.total,
+        sourcePath: book.file_path,
+      };
+      currentCfiRef.current = `epubcfi(/6/${Math.max(2, pageInfo.current * 2)})`;
+      setBook(updated);
+      setOcrHudOpen(false);
+    }).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [book, bookId, ocrJob, pageInfo]);
+
+  useEffect(() => {
+    const pending = pendingOcrReloadRef.current;
+    if (!pending || !bookReady || !book || book.file_path === pending.sourcePath) return;
+    const contents = viewRef.current?.renderer?.getContents?.() ?? [];
+    const target = contents.find((content: { index?: number; doc?: Document }) => content.index === pending.page)
+      ?? contents[0];
+    const textLayer = target?.doc?.querySelector?.(".textLayer") as HTMLElement | null;
+    if (!textLayer?.querySelector(".endOfContent") || !textLayer.textContent?.trim()) return;
+    pendingOcrReloadRef.current = null;
+    locallyRequestedOcrRef.current = false;
+    setReaderToast(t("ocr.reader.completedToast"));
+  }, [book, bookReady, pageInfo, t]);
 
   const openLearningCard = useCallback((interaction: ReaderInteraction) => {
     const hasEnabledModule = learningCardConfig.cards[interaction.kind].modules
@@ -882,12 +968,11 @@ export default function Reader() {
     forceClickSuppressedUntilRef,
     annotationClickDocumentRef,
     doubleClickQuickLookupRef,
-    pdfTextLayerNoticeTimerRef,
     cancelPendingSelectionMenu,
     cancelPendingWordClick,
     openLearningInteraction,
     setContextMenu,
-    setPdfTextLayerNotice,
+    onMissingPdfTextIntent,
     handleZoom,
     handlePageTurnKeyDown,
     handlePageTurnMouseDown,
@@ -911,7 +996,6 @@ export default function Reader() {
     chaptersRef,
     readerInteractionGenerationRef,
     pendingWordClickRef,
-    pdfTextLayerNoticeTimerRef,
     annotationClickDocumentRef,
     contextMenuRequestRef,
     zoomRef,
@@ -929,7 +1013,6 @@ export default function Reader() {
     openLearningInteraction,
     setBookReady,
     setReaderError,
-    setPdfTextLayerNotice,
     setCanGoBack,
     setChapters,
     setCurrentChapterIndex,
@@ -1378,22 +1461,31 @@ export default function Reader() {
                 />
               ));
             })()}
-            {book.format === "pdf" && pdfTextLayerNotice && (
-              <div
-                role="status"
-                className="pointer-events-none absolute bottom-5 left-1/2 z-30 max-w-[min(420px,calc(100%_-_24px))] -translate-x-1/2 rounded-md border border-border bg-bg-surface px-3 py-2 text-center text-[12px] leading-5 text-text-secondary shadow-popover"
-              >
-                {t("reader.pdfNoTextLayer")}
+            {(book.format === "pdf" && ocrHudOpen) || bindingHud ? (
+              <div className="pointer-events-none absolute bottom-5 left-1/2 z-40 flex w-full -translate-x-1/2 justify-center px-3">
+                {book.format === "pdf" && ocrHudOpen ? (
+                  <OcrReaderHud
+                    packageStatus={ocrPackage.status}
+                    packageError={ocrPackage.errorCode}
+                    job={ocrJob.job}
+                    jobError={ocrJob.errorCode}
+                    busyAction={ocrJob.action}
+                    onOpenSettings={() => void openOcrSettings()}
+                    onStart={startOcr}
+                    onCancel={() => void ocrJob.cancel().catch(() => {})}
+                    onRetry={retryOcr}
+                    onDismiss={() => setOcrHudOpen(false)}
+                  />
+                ) : (
+                  <div
+                    role="status"
+                    className="max-w-[min(520px,calc(100%_-_24px))] rounded-md bg-[#18181B]/90 px-3 py-2 text-center text-[12px] leading-5 text-white shadow-popover"
+                  >
+                    {bindingHud}
+                  </div>
+                )}
               </div>
-            )}
-            {bindingHud && (
-              <div
-                role="status"
-                className="pointer-events-none absolute bottom-5 left-1/2 z-40 max-w-[min(520px,calc(100%_-_24px))] -translate-x-1/2 rounded-md bg-[#18181B]/90 px-3 py-2 text-center text-[12px] leading-5 text-white shadow-popover"
-              >
-                {bindingHud}
-              </div>
-            )}
+            ) : null}
             {!bookReady && (
               <div className="absolute inset-0 z-20 bg-bg-surface flex items-center justify-center">
                 <div className="flex flex-col items-center gap-3">

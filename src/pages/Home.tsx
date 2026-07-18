@@ -10,7 +10,13 @@ import BookList from "../components/BookList";
 import DictionaryContent from "../components/DictionaryContent";
 import ChatsContent from "../components/ChatsContent";
 import NotesContent from "../components/NotesContent";
-import SettingsModal, { type SettingsSection } from "../components/SettingsModal";
+import SettingsModal from "../components/SettingsModal";
+import {
+  normalizeSettingsDestination,
+  settingsDestinationSection,
+  settingsDestinationView,
+  type SettingsDestination,
+} from "../components/settings-destination";
 import Button from "../components/ui/Button";
 import Input from "../components/ui/Input";
 import { useBooks, importBookDialog } from "../hooks/useBooks";
@@ -38,7 +44,7 @@ export default function Home() {
   const [importError, setImportError] = useState<string | null>(null);
   const [syncProgress, setSyncProgress] = useState<{ applied: number; total: number } | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
+  const [settingsDestination, setSettingsDestination] = useState<SettingsDestination>("general");
   const [userName, setUserName] = useState("");
   const collections = useCollections();
 
@@ -49,33 +55,17 @@ export default function Home() {
       .catch(() => {});
   }, []);
 
-  const normalizeSettingsSection = useCallback((section: unknown): SettingsSection => {
-    if (section === "lookup" || section === "translation" || section === "tools") return "tools";
-    if (
-      section === "general" ||
-      section === "appearance" ||
-      section === "reading" ||
-      section === "ai" ||
-      section === "librarySync" ||
-      section === "mcp" ||
-      section === "about"
-    ) {
-      return section;
-    }
-    return "general";
-  }, []);
-
   // Listen for open-settings events (DOM from same window, storage from reader windows)
   useEffect(() => {
     const handler = (e: Event) => {
-      setSettingsSection(normalizeSettingsSection((e as CustomEvent).detail));
+      setSettingsDestination(normalizeSettingsDestination((e as CustomEvent).detail));
       setSettingsOpen(true);
     };
     window.addEventListener("open-settings", handler);
 
     // Cross-window: reader uses emitTo("main", ...) — must use webview-specific listener
-    const unlisten = getCurrentWebview().listen<string>("open-settings", (event) => {
-      setSettingsSection(normalizeSettingsSection(event.payload));
+    const unlisten = getCurrentWebview().listen<unknown>("open-settings", (event) => {
+      setSettingsDestination(normalizeSettingsDestination(event.payload));
       setSettingsOpen(true);
     });
 
@@ -83,7 +73,7 @@ export default function Home() {
       window.removeEventListener("open-settings", handler);
       unlisten.then((fn) => fn());
     };
-  }, [normalizeSettingsSection]);
+  }, []);
 
   useEffect(() => {
     const unlisten = getCurrentWebview().listen<string>("open-library-filter", (event) => {
@@ -432,13 +422,14 @@ export default function Home() {
         open={settingsOpen}
         onClose={() => {
           setSettingsOpen(false);
-          setSettingsSection("general");
+          setSettingsDestination("general");
           // Reload user name in case it changed
           invoke<Record<string, string>>("get_all_settings")
             .then((s) => setUserName(s.user_name ?? ""))
             .catch(() => {});
         }}
-        initialSection={settingsSection}
+        initialSection={settingsDestinationSection(settingsDestination)}
+        initialView={settingsDestinationView(settingsDestination)}
       />
     </div>
   );

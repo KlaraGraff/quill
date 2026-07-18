@@ -28,7 +28,18 @@ pub(crate) fn resolve_active_asset(
 ) -> AppResult<ResolvedAsset> {
     crate::sync::validation::validate_entity_id(book_id)?;
 
+    let source = conn
+        .query_row(
+            "SELECT file_path, source_sha256 FROM books WHERE id = ?1",
+            params![book_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| resolver_error("BOOK_NOT_FOUND"))?;
     for asset in list_book_assets(conn, book_id)? {
+        if Some(asset.source_sha256.as_str()) != source.1.as_deref() {
+            continue;
+        }
         let Some(state) = get_local_state(conn, &asset.id)? else {
             continue;
         };
@@ -43,14 +54,6 @@ pub(crate) fn resolve_active_asset(
         }
     }
 
-    let source = conn
-        .query_row(
-            "SELECT file_path, source_sha256 FROM books WHERE id = ?1",
-            params![book_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-        )
-        .optional()?
-        .ok_or_else(|| resolver_error("BOOK_NOT_FOUND"))?;
     crate::sync::validation::validate_book_file_path(&source.0)?;
     Ok(ResolvedAsset {
         asset: None,
@@ -142,5 +145,28 @@ mod tests {
         assert_eq!(resolved.selection_reason, "source");
         assert_eq!(resolved.absolute_path, dir.path().join("books/source.pdf"));
         assert_eq!(resolved.content_sha256.as_deref(), Some("source-hash"));
+    }
+
+    #[test]
+    fn asset_from_replaced_source_is_not_activated() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("books")).unwrap();
+        let conn = open_db();
+        let asset = add_asset(&conn, "asset-old-source", 3);
+        fs::write(dir.path().join(&asset.relative_path), b"data").unwrap();
+        set_local_state(&conn, &asset.id, "available_verified", Some(4), None, 4).unwrap();
+        conn.execute(
+            "UPDATE books SET source_sha256 = 'replacement-hash' WHERE id = 'book-1'",
+            [],
+        )
+        .unwrap();
+
+        let resolved = resolve_active_asset(&conn, dir.path(), "book-1").unwrap();
+        assert!(resolved.asset.is_none());
+        assert_eq!(resolved.selection_reason, "source");
+        assert_eq!(
+            resolved.content_sha256.as_deref(),
+            Some("replacement-hash")
+        );
     }
 }

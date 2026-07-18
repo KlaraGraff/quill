@@ -12,8 +12,9 @@ import McpSettings from "./settings/McpSettings";
 import AboutSettings from "./settings/AboutSettings";
 import Toast from "./ui/Toast";
 import { useSettings } from "../hooks/useSettings";
+import type { SettingsSection, SettingsView } from "./settings-destination";
 
-export type SettingsSection = "general" | "appearance" | "reading" | "ai" | "tools" | "librarySync" | "mcp" | "about";
+export type { SettingsSection } from "./settings-destination";
 
 const XL_PREVIEW_QUERY = "(min-width: 1280px)";
 const FOCUSABLE_SELECTOR = [
@@ -29,9 +30,10 @@ interface SettingsModalProps {
   open: boolean;
   onClose: () => void;
   initialSection?: SettingsSection;
+  initialView?: SettingsView;
 }
 
-export default function SettingsModal({ open, onClose, initialSection = "general" }: SettingsModalProps) {
+export default function SettingsModal({ open, onClose, initialSection = "general", initialView }: SettingsModalProps) {
   const { t } = useTranslation();
   const [activeSection, setActiveSection] = useState<SettingsSection>(initialSection);
   const [toolsPreview, setToolsPreview] = useState<ToolsPreviewState | null>(null);
@@ -195,6 +197,7 @@ export default function SettingsModal({ open, onClose, initialSection = "general
           {...settingsProps}
           onPreviewChange={setToolsPreview}
           onNavigationGuardChange={setToolsNavigationGuard}
+          initialView={initialView === "ocr" ? "ocr" : undefined}
         />
       );
       case "librarySync": return <LibrarySyncSettings {...settingsProps} />;

@@ -9,7 +9,11 @@
 pub(crate) mod assets;
 pub(crate) mod backend;
 pub(crate) mod jobs;
+pub(crate) mod manager;
+pub(crate) mod package;
+pub(crate) mod publish;
 pub(crate) mod resolver;
+pub(crate) mod validate;
 
 /// The production worker must remain disabled in default builds until the
 /// Phase C release gates and the Phase G sync protocol land.

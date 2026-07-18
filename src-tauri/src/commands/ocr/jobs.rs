@@ -222,6 +222,16 @@ pub(crate) fn get_active_job(conn: &Connection, book_id: &str) -> AppResult<Opti
         .map_err(Into::into)
 }
 
+pub(crate) fn get_latest_job(conn: &Connection, book_id: &str) -> AppResult<Option<OcrJob>> {
+    let sql = format!(
+        "SELECT {JOB_COLUMNS} FROM ocr_jobs
+         WHERE book_id = ?1 ORDER BY updated_at DESC, id DESC LIMIT 1"
+    );
+    conn.query_row(&sql, params![book_id], row_to_job)
+        .optional()
+        .map_err(Into::into)
+}
+
 pub(crate) fn update_state_guarded(
     conn: &Connection,
     id: &str,
@@ -295,6 +305,88 @@ pub(crate) fn mark_interrupted_jobs_failed(conn: &Connection, updated_at: i64) -
         params![updated_at],
     )
     .map_err(Into::into)
+}
+
+pub(crate) fn finish_job(
+    conn: &Connection,
+    id: &str,
+    expected_source_sha256: &str,
+    asset_id: &str,
+    output: &super::validate::VerifiedOutput,
+    updated_at: i64,
+) -> AppResult<OcrJob> {
+    crate::sync::validation::validate_entity_id(asset_id)?;
+    let current = get_job(conn, id)?.ok_or_else(|| job_error("OCR_JOB_NOT_FOUND"))?;
+    if current.state != "publishing" || current.source_sha256 != expected_source_sha256 {
+        return Err(job_error("OCR_JOB_TRANSITION_INVALID"));
+    }
+    let changed = conn.execute(
+        "UPDATE ocr_jobs
+         SET state = 'ready', phase = NULL, pages_done = ?1, pages_total = ?1,
+             result_asset_id = ?2, recognized_pages = ?3, skipped_pages = ?4,
+             timed_out_pages = ?5, failed_pages = ?6, temporary_path = NULL,
+             error_code = NULL, error_detail = NULL, updated_at = ?7
+         WHERE id = ?8 AND source_sha256 = ?9 AND state = 'publishing'
+           AND EXISTS (
+             SELECT 1 FROM books
+             WHERE books.id = ocr_jobs.book_id
+               AND COALESCE(books.source_format, books.format) = 'pdf'
+               AND books.source_sha256 = ?9
+           )",
+        params![
+            output.page_count,
+            asset_id,
+            output.recognized_pages,
+            output.skipped_pages,
+            output.timed_out_pages,
+            output.failed_pages,
+            updated_at,
+            id,
+            expected_source_sha256,
+        ],
+    )?;
+    if changed == 0 {
+        return Err(job_error("OCR_JOB_SOURCE_UNAVAILABLE"));
+    }
+    get_job(conn, id)?.ok_or_else(|| job_error("OCR_JOB_NOT_FOUND"))
+}
+
+pub(crate) fn fail_or_cancel_job(
+    conn: &Connection,
+    id: &str,
+    expected_source_sha256: &str,
+    cancelled: bool,
+    error_code: Option<&str>,
+    error_detail: Option<&str>,
+    updated_at: i64,
+) -> AppResult<OcrJob> {
+    let state = if cancelled { "cancelled" } else { "failed" };
+    let changed = conn.execute(
+        "UPDATE ocr_jobs
+         SET state = ?1, phase = NULL, error_code = ?2, error_detail = ?3,
+             temporary_path = NULL, updated_at = MAX(updated_at, ?4)
+         WHERE id = ?5 AND source_sha256 = ?6
+           AND state IN (
+             'queued', 'waiting_source', 'preparing', 'recognizing',
+             'validating', 'publishing'
+           )",
+        params![
+            state,
+            error_code,
+            error_detail,
+            updated_at,
+            id,
+            expected_source_sha256,
+        ],
+    )?;
+    if changed == 0 {
+        let current = get_job(conn, id)?.ok_or_else(|| job_error("OCR_JOB_NOT_FOUND"))?;
+        if current.state == state {
+            return Ok(current);
+        }
+        return Err(job_error("OCR_JOB_STALE"));
+    }
+    get_job(conn, id)?.ok_or_else(|| job_error("OCR_JOB_NOT_FOUND"))
 }
 
 #[cfg(test)]

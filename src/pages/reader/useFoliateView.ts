@@ -94,7 +94,6 @@ interface UseFoliateViewOptions {
   chaptersRef: MutableRefObject<TocChapter[]>;
   readerInteractionGenerationRef: MutableRefObject<number>;
   pendingWordClickRef: MutableRefObject<number | null>;
-  pdfTextLayerNoticeTimerRef: MutableRefObject<number | null>;
   annotationClickDocumentRef: MutableRefObject<Document | null>;
   contextMenuRequestRef: MutableRefObject<number>;
   zoomRef: MutableRefObject<number | "fit">;
@@ -112,7 +111,6 @@ interface UseFoliateViewOptions {
   openLearningInteraction(interaction: ReaderInteraction): void;
   setBookReady: Dispatch<SetStateAction<boolean>>;
   setReaderError: Dispatch<SetStateAction<ReaderOpenError | null>>;
-  setPdfTextLayerNotice: Dispatch<SetStateAction<boolean>>;
   setCanGoBack: Dispatch<SetStateAction<boolean>>;
   setChapters: Dispatch<SetStateAction<TocChapter[]>>;
   setCurrentChapterIndex: Dispatch<SetStateAction<number>>;
@@ -169,7 +167,6 @@ export function useFoliateView({
   chaptersRef,
   readerInteractionGenerationRef,
   pendingWordClickRef,
-  pdfTextLayerNoticeTimerRef,
   annotationClickDocumentRef,
   contextMenuRequestRef,
   zoomRef,
@@ -187,7 +184,6 @@ export function useFoliateView({
   openLearningInteraction,
   setBookReady,
   setReaderError,
-  setPdfTextLayerNotice,
   setCanGoBack,
   setChapters,
   setCurrentChapterIndex,
@@ -554,11 +550,6 @@ export function useFoliateView({
       readerInteractionGenerationRef.current += 1;
       cancelPendingWordClick();
       cancelPendingSelectionMenu();
-      if (pdfTextLayerNoticeTimerRef.current !== null) {
-        window.clearTimeout(pdfTextLayerNoticeTimerRef.current);
-        pdfTextLayerNoticeTimerRef.current = null;
-      }
-      setPdfTextLayerNotice(false);
       annotationClickDocumentRef.current = null;
       if (backButtonTimerRef.current !== null) {
         window.clearTimeout(backButtonTimerRef.current);

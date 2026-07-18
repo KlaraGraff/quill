@@ -1,8 +1,6 @@
 import {
   useCallback,
-  type Dispatch,
   type MutableRefObject,
-  type SetStateAction,
 } from "react";
 import {
   classifySelection,
@@ -49,18 +47,40 @@ interface ReaderInteractionsOptions {
   forceClickSuppressedUntilRef: MutableRefObject<number>;
   annotationClickDocumentRef: MutableRefObject<Document | null>;
   doubleClickQuickLookupRef: MutableRefObject<boolean>;
-  pdfTextLayerNoticeTimerRef: MutableRefObject<number | null>;
   cancelPendingSelectionMenu(): void;
   cancelPendingWordClick(): void;
   openLearningInteraction(interaction: ReaderInteraction): void;
-  setContextMenu: Dispatch<SetStateAction<ReaderInteraction | null>>;
-  setPdfTextLayerNotice: Dispatch<SetStateAction<boolean>>;
+  setContextMenu(value: ReaderInteraction | null): void;
+  onMissingPdfTextIntent(pageIndex: number): void;
   handleZoom(delta: number): void;
   handlePageTurnKeyDown(event: KeyboardEvent): void;
   handlePageTurnMouseDown(event: MouseEvent): void;
   handlePageTurnContextMenu(event: MouseEvent): void;
   handlePageTurnWheel(event: WheelEvent): void;
   handleReaderBinding(trigger: string, interaction: ReaderInteraction | null): boolean;
+}
+
+function canvasHasVisibleContent(canvas: HTMLCanvasElement): boolean {
+  try {
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    if (!context) return true;
+    const stepX = Math.max(1, Math.floor(canvas.width / 32));
+    const stepY = Math.max(1, Math.floor(canvas.height / 32));
+    let visibleSamples = 0;
+    for (let y = Math.floor(stepY / 2); y < canvas.height; y += stepY) {
+      for (let x = Math.floor(stepX / 2); x < canvas.width; x += stepX) {
+        const [red, green, blue, alpha] = context.getImageData(x, y, 1, 1).data;
+        if (alpha > 16 && (red < 246 || green < 246 || blue < 246)) {
+          visibleSamples += 1;
+          if (visibleSamples >= 3) return true;
+        }
+      }
+    }
+    return false;
+  } catch {
+    // A rendered page whose pixels cannot be sampled is still a valid text-intent target.
+    return true;
+  }
 }
 
 export function useReaderInteractions({
@@ -71,12 +91,11 @@ export function useReaderInteractions({
   forceClickSuppressedUntilRef,
   annotationClickDocumentRef,
   doubleClickQuickLookupRef,
-  pdfTextLayerNoticeTimerRef,
   cancelPendingSelectionMenu,
   cancelPendingWordClick,
   openLearningInteraction,
   setContextMenu,
-  setPdfTextLayerNotice,
+  onMissingPdfTextIntent,
   handleZoom,
   handlePageTurnKeyDown,
   handlePageTurnMouseDown,
@@ -91,31 +110,24 @@ export function useReaderInteractions({
     bookFormat,
     interactionGeneration,
   }: InstallDocumentInteractionsOptions) => {
-    if (bookFormat === "pdf") {
-      const showMissingPdfTextLayerNotice = () => {
-        const canvas = doc.querySelector("#canvas > canvas") as HTMLCanvasElement | null;
-        const textLayer = doc.querySelector(".textLayer") as HTMLElement | null;
-        const textLayerRendered = textLayer?.querySelector(".endOfContent");
-        if (
-          !canvas
-          || canvas.width <= 0
-          || canvas.height <= 0
-          || !textLayer
-          || !textLayerRendered
-          || textLayer.textContent?.trim()
-        ) return;
-        setPdfTextLayerNotice(true);
-        if (pdfTextLayerNoticeTimerRef.current !== null) {
-          window.clearTimeout(pdfTextLayerNoticeTimerRef.current);
-        }
-        pdfTextLayerNoticeTimerRef.current = window.setTimeout(() => {
-          pdfTextLayerNoticeTimerRef.current = null;
-          setPdfTextLayerNotice(false);
-        }, 5000);
-      };
-      doc.addEventListener("click", showMissingPdfTextLayerNotice);
-      doc.addEventListener("contextmenu", showMissingPdfTextLayerNotice);
-    }
+    const missingPdfTextLayer = () => {
+      if (bookFormat !== "pdf") return false;
+      const canvas = doc.querySelector("#canvas > canvas") as HTMLCanvasElement | null;
+      const textLayer = doc.querySelector(".textLayer") as HTMLElement | null;
+      return Boolean(
+        canvas
+        && canvas.width > 0
+        && canvas.height > 0
+        && textLayer?.querySelector(".endOfContent")
+        && !textLayer.textContent?.trim()
+        && canvasHasVisibleContent(canvas),
+      );
+    };
+    const showMissingPdfTextIntent = () => {
+      if (!missingPdfTextLayer()) return false;
+      onMissingPdfTextIntent(index);
+      return true;
+    };
 
     const interactionForSelection = (
       trigger: ReaderInteraction["trigger"],
@@ -144,6 +156,8 @@ export function useReaderInteractions({
     let activePointerId: number | null = null;
     let selectionSnapshot: ReaderSelectionSnapshot | null = null;
     let pointerCaptureTarget: Element | null = null;
+    let pointerStart: { x: number; y: number } | null = null;
+    let pointerMoved = false;
     let selectionNormalizationUntil = 0;
     const scheduleSelectionMenu = (delay = 150, includeWord = false) => {
       cancelPendingSelectionMenu();
@@ -174,6 +188,9 @@ export function useReaderInteractions({
       activePointerId = null;
       const captureTarget = pointerCaptureTarget;
       pointerCaptureTarget = null;
+      const completedDrag = pointerMoved;
+      pointerStart = null;
+      pointerMoved = false;
       try {
         if (captureTarget?.hasPointerCapture(completedPointerId)) {
           captureTarget.releasePointerCapture(completedPointerId);
@@ -195,19 +212,30 @@ export function useReaderInteractions({
         selectionSnapshot = snapshotSelectionRange(expanded);
       }
       if (expanded) scheduleSelectionMenu(30, true);
-      else cancelPendingSelectionMenu();
+      else {
+        cancelPendingSelectionMenu();
+        if (completedDrag) showMissingPdfTextIntent();
+      }
     };
 
     doc.addEventListener("pointerdown", (event: PointerEvent) => {
       if (event.button !== 0) return;
       activePointerId = event.pointerId;
       pointerCaptureTarget = event.target as Element | null;
+      pointerStart = { x: event.clientX, y: event.clientY };
+      pointerMoved = false;
       try {
         pointerCaptureTarget?.setPointerCapture(event.pointerId);
       } catch {
         // Some iframe surfaces reject capture; document/window listeners remain active.
       }
       cancelPendingSelectionMenu();
+    });
+    doc.addEventListener("pointermove", (event: PointerEvent) => {
+      if (event.pointerId !== activePointerId || !pointerStart) return;
+      if (Math.hypot(event.clientX - pointerStart.x, event.clientY - pointerStart.y) >= 5) {
+        pointerMoved = true;
+      }
     });
     doc.addEventListener("pointerup", (event: PointerEvent) => {
       finalizePointerSelection(event.pointerId);
@@ -249,7 +277,13 @@ export function useReaderInteractions({
       cancelPendingWordClick();
       cancelPendingSelectionMenu();
       const interaction = interactionForSelection("selection-menu");
-      if (!interaction) return;
+      if (!interaction) {
+        if (showMissingPdfTextIntent()) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        return;
+      }
       event.preventDefault();
       openLearningInteraction(interaction);
     });
@@ -268,10 +302,18 @@ export function useReaderInteractions({
         return;
       }
       const trigger = bindingFromKeyboardEvent(event);
-      if (trigger && handleReaderBinding(trigger, interactionForSelection("selection-menu"))) {
-        event.preventDefault();
-        event.stopPropagation();
-        return;
+      if (trigger) {
+        const interaction = interactionForSelection("selection-menu");
+        if (!interaction && showMissingPdfTextIntent()) {
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
+        if (handleReaderBinding(trigger, interaction)) {
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
       }
       if ((event.metaKey || event.ctrlKey) && event.key === "[") {
         event.preventDefault();
@@ -311,6 +353,7 @@ export function useReaderInteractions({
       if (isInteractiveReaderTarget(event.target)) return;
       const selection = doc.getSelection?.();
       if (selection && !selection.isCollapsed) return;
+      if (showMissingPdfTextIntent()) return;
       const selectionRange = rangeFromSelectionSnapshotAtPoint(
         selectionSnapshot,
         event.clientX,
@@ -355,6 +398,10 @@ export function useReaderInteractions({
       cancelPendingWordClick();
       cancelPendingSelectionMenu();
       if (!supportsSelection || isInteractiveReaderTarget(event.target)) return;
+      if (showMissingPdfTextIntent()) {
+        event.preventDefault();
+        return;
+      }
       const range = rangeFromSelectionSnapshotAtPoint(
         selectionSnapshot,
         event.clientX,
@@ -413,12 +460,11 @@ export function useReaderInteractions({
     handlePageTurnWheel,
     handleZoom,
     openLearningInteraction,
-    pdfTextLayerNoticeTimerRef,
     pendingSelectionMenuRef,
     pendingWordClickRef,
     readerInteractionGenerationRef,
     setContextMenu,
-    setPdfTextLayerNotice,
+    onMissingPdfTextIntent,
     supportsSelection,
   ]);
 

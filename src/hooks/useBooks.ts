@@ -12,6 +12,7 @@ export interface Book {
   // formats retain their source extension for Foliate's parser selection.
   format: "epub" | "pdf" | "text" | "mobi" | "azw" | "azw3" | "fb2" | "fbz" | "cbz";
   source_format: string | null;
+  source_sha256?: string | null;
   render_format: string | null;
   preparation_state: "pending" | "preparing" | "ready" | "failed";
   preparation_error: string | null;

@@ -578,9 +578,28 @@ mod tests {
 
 /// Emit an open-settings event to the main window from any window.
 #[tauri::command]
-pub fn open_settings_on_main(section: String, app: AppHandle) -> AppResult<()> {
-    app.emit_to("main", "open-settings", &section)
+pub fn open_settings_on_main(
+    section: String,
+    view: Option<String>,
+    app: AppHandle,
+) -> AppResult<()> {
+    let payload = match view.as_deref() {
+        Some("ocr") if section == "tools" => {
+            serde_json::json!({ "section": "tools", "view": "ocr" })
+        }
+        Some(_) => return Err(AppError::Other("SETTINGS_DESTINATION_INVALID".to_string())),
+        None => serde_json::Value::String(section),
+    };
+    app.emit_to("main", "open-settings", payload)
         .map_err(|e| AppError::Other(e.to_string()))?;
+    if let Some(window) = app.get_webview_window("main") {
+        window
+            .show()
+            .map_err(|error| AppError::Other(error.to_string()))?;
+        window
+            .set_focus()
+            .map_err(|error| AppError::Other(error.to_string()))?;
+    }
     Ok(())
 }
 

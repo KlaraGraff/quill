@@ -22,7 +22,11 @@ pub(super) fn cover_blob_to_data_uri(bytes: &[u8]) -> String {
 /// `app` powers self-healing for converted books (re-scheduling a conversion
 /// whose artifact vanished); pass `None` where no `AppHandle` exists and the
 /// repair will wait for the next startup resume instead.
-pub(super) fn resolve_book_paths(book: &mut Book, db: &Db, app: Option<&AppHandle>) -> AppResult<()> {
+pub(super) fn resolve_book_paths(
+    book: &mut Book,
+    db: &Db,
+    app: Option<&AppHandle>,
+) -> AppResult<()> {
     // A converted book (EPUB render format from a non-EPUB source) reads from
     // the local, non-synced converted artifact once preparation is `ready`.
     // The synced `file_path` still points at the source blob and is used by
@@ -57,6 +61,30 @@ pub(super) fn resolve_book_paths(book: &mut Book, db: &Db, app: Option<&AppHandl
         }
         book.preparation_state = "pending".to_string();
         book.preparation_error = None;
+    }
+    if book
+        .source_format
+        .as_deref()
+        .unwrap_or(&book.format)
+        .eq_ignore_ascii_case("pdf")
+    {
+        let data_dir = db
+            .data_dir
+            .lock()
+            .map_err(|error| AppError::Other(error.to_string()))?
+            .clone();
+        let resolved = {
+            let conn = db.reader();
+            crate::commands::ocr::resolver::resolve_active_asset(&conn, &data_dir, &book.id)?
+        };
+        book.file_path = resolved.absolute_path.to_string_lossy().to_string();
+        if let Some(ref cover) = book.cover_path {
+            if cover != "none" {
+                book.cover_path = Some(db.resolve_path(cover)?.to_string_lossy().to_string());
+            }
+        }
+        book.available = icloud::is_file_downloaded(std::path::Path::new(&book.file_path));
+        return Ok(());
     }
     book.file_path = db
         .resolve_path(&book.file_path)?
