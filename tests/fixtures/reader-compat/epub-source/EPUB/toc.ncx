@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <head>
+    <meta name="dtb:uid" content="urn:uuid:lantern-reader-compat"/>
+  </head>
+  <docTitle><text>Lantern Reader Compatibility Fixture</text></docTitle>
+  <navMap>
+    <navPoint id="chapter" playOrder="1">
+      <navLabel><text>Compatibility chapter</text></navLabel>
+      <content src="chapter.xhtml"/>
+    </navPoint>
+  </navMap>
+</ncx>

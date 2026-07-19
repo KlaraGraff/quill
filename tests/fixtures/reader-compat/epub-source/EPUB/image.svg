@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="80" height="80" viewBox="0 0 80 80" role="img" aria-labelledby="title">
+  <title id="title">Lantern compatibility tile</title>
+  <rect width="80" height="80" fill="#167a5b"/>
+  <path d="M28 22h24l-3 17 7 19H24l7-19z" fill="#fff"/>
+</svg>
