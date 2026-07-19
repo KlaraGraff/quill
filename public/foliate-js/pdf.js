@@ -1,7 +1,7 @@
+import { loadPdfJs } from './pdf-compat.js'
+
 const pdfjsPath = path => new URL(`vendor/pdfjs/${path}`, import.meta.url).toString()
 
-import './vendor/pdfjs/pdf.mjs'
-const pdfjsLib = globalThis.pdfjsLib
 // Workers are constructed per-document in makePDF() and passed via
 // `workerPort`. We deliberately don't set `workerSrc`: under custom
 // schemes (tauri://, asset://) pdf.js treats the page origin as opaque
@@ -18,7 +18,7 @@ const textLayerBuilderCSS = await fetchText(pdfjsPath('text_layer_builder.css'))
 // https://raw.githubusercontent.com/mozilla/pdf.js/refs/tags/v5.5.207/web/annotation_layer_builder.css
 const annotationLayerBuilderCSS = await fetchText(pdfjsPath('annotation_layer_builder.css'))
 
-const render = async (page, doc, zoom) => {
+const render = async (page, doc, zoom, pdfjsLib) => {
     const scale = zoom * devicePixelRatio
     doc.documentElement.style.transform = `scale(${1 / devicePixelRatio})`
     doc.documentElement.style.transformOrigin = 'top left'
@@ -181,7 +181,7 @@ const render = async (page, doc, zoom) => {
         .render({ annotations: await page.getAnnotations() })
 }
 
-const renderPage = async (page, getImageBlob) => {
+const renderPage = async (page, getImageBlob, pdfjsLib) => {
     const viewport = page.getViewport({ scale: 1 })
     if (getImageBlob) {
         const canvas = document.createElement('canvas')
@@ -249,7 +249,7 @@ const renderPage = async (page, getImageBlob) => {
     const onZoom = ({ doc, scale }) => new Promise(resolve => {
         clearTimeout(zoomTimeout)
         zoomTimeout = setTimeout(async () => {
-            await render(page, doc, scale)
+            await render(page, doc, scale, pdfjsLib)
             resolve()
         }, 200)
     })
@@ -263,6 +263,7 @@ const makeTOCItem = item => ({
 })
 
 export const makePDF = async file => {
+    const { pdfjsLib, workerUrl } = await loadPdfJs()
     const transport = new pdfjsLib.PDFDataRangeTransport(file.size, [])
     transport.requestDataRange = (begin, end) => {
         file.slice(begin, end).arrayBuffer().then(chunk => {
@@ -272,8 +273,7 @@ export const makePDF = async file => {
     // See the top-of-file note for why this isn't `workerSrc`. We own the
     // Worker's lifecycle because pdf.js doesn't terminate ports it didn't
     // construct itself (pdf.mjs `PDFWorker.destroy`).
-    const worker = new Worker(pdfjsPath('pdf.worker.mjs'), { type: 'module' })
-    pdfjsLib.GlobalWorkerOptions.workerPort = worker
+    const worker = new Worker(workerUrl, { type: 'module' })
 
     // Until `return book`, no caller has a handle to terminate the Worker:
     // `view.open()` doesn't assign `this.book = book` until `makePDF()`
@@ -282,6 +282,7 @@ export const makePDF = async file => {
     // path: tear down pdf if it exists, then terminate the Worker.
     let pdf
     try {
+        pdfjsLib.GlobalWorkerOptions.workerPort = worker
         pdf = await pdfjsLib.getDocument({
             range: transport,
             cMapUrl: pdfjsPath('cmaps/'),
@@ -315,7 +316,8 @@ export const makePDF = async file => {
             load: async () => {
                 const cached = cache.get(i)
                 if (cached) return cached
-                const url = await renderPage(await pdf.getPage(i + 1))
+                const url = await renderPage(
+                    await pdf.getPage(i + 1), false, pdfjsLib)
                 cache.set(i, url)
                 return url
             },
@@ -357,7 +359,8 @@ export const makePDF = async file => {
             return [resolved.index, null]
         }
         book.getTOCFragment = doc => doc.documentElement
-        book.getCover = async () => renderPage(await pdf.getPage(1), true)
+        book.getCover = async () => renderPage(
+            await pdf.getPage(1), true, pdfjsLib)
         book.destroy = () => {
             // Same shape as the setup catch path above: pdf.destroy() can
             // stall on a wedged worker, so don't await — fire-and-forget
