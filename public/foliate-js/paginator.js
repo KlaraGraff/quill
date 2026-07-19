@@ -1148,7 +1148,8 @@ export class Paginator extends HTMLElement {
         return this.goTo({ index })
     }
     lastSection() {
-        const index = this.sections.findLastIndex(section => section.linear !== 'no')
+        let index = this.sections.length - 1
+        while (index >= 0 && this.sections[index].linear === 'no') index--
         return this.goTo({ index })
     }
     getContents() {

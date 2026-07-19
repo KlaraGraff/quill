@@ -1,6 +1,7 @@
 import { CircleHelp, Plus } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { createUuid } from "../../utils/randomUuid";
 import Select from "../ui/Select";
 import SortableList from "../ui/SortableList";
 import {
@@ -272,7 +273,7 @@ export default function CardDesignSettings({
           <button
             type="button"
             onClick={() => {
-              const id = `custom_${crypto.randomUUID().replace(/-/g, "")}` as CustomLearningId;
+              const id = `custom_${createUuid().replace(/-/g, "")}` as CustomLearningId;
               const now = Date.now();
               requestNavigation(() => {
                 setNewModule({

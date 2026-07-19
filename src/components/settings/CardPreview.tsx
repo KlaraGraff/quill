@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Bookmark, Copy, Highlighter, Languages, Loader2, MessageSquareMore, RotateCcw, WandSparkles } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { createUuid } from "../../utils/randomUuid";
 import {
   getLearningCardFixture,
   LearningCardView,
@@ -339,7 +340,7 @@ export default function CardPreview({
   const result = realResult ?? localResult;
 
   const generateRealPreview = async (sourceText = localResult.sourceText) => {
-    const requestId = crypto.randomUUID();
+    const requestId = createUuid();
     if (previewRequestRef.current) {
       await invoke("ai_cancel", { requestId: previewRequestRef.current }).catch(() => {});
     }
@@ -392,7 +393,7 @@ export default function CardPreview({
     if (!customActionTest) return;
     let active = true;
     let unlisten: UnlistenFn | undefined;
-    const requestId = crypto.randomUUID();
+    const requestId = createUuid();
     setCustomActionResult("");
     setCustomActionLoading(true);
     const run = async () => {

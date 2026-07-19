@@ -1,3 +1,44 @@
+
+/* Lantern Safari 15 runtime compatibility for the PDF.js legacy pair. */
+(() => {
+    const define = (target, name, value) => Object.defineProperty(target, name, {
+        configurable: true,
+        writable: true,
+        value,
+    })
+    const arrayPrototype = Array.prototype
+    if (typeof arrayPrototype.at !== 'function') define(arrayPrototype, 'at', function (index) {
+        if (this == null) throw new TypeError('Array.prototype.at called on null or undefined')
+        const object = Object(this)
+        const length = object.length >>> 0
+        let relative = Number(index) || 0
+        relative = relative < 0 ? Math.ceil(relative) : Math.floor(relative)
+        const position = relative < 0 ? length + relative : relative
+        return position < 0 || position >= length ? undefined : object[position]
+    })
+    if (typeof arrayPrototype.findLast !== 'function') define(arrayPrototype, 'findLast', function (callback, thisArg) {
+        if (this == null) throw new TypeError('Array.prototype.findLast called on null or undefined')
+        if (typeof callback !== 'function') throw new TypeError('callback must be a function')
+        const object = Object(this)
+        for (let index = (object.length >>> 0) - 1; index >= 0; index--) {
+            if (callback.call(thisArg, object[index], index, object)) return object[index]
+        }
+        return undefined
+    })
+    if (typeof arrayPrototype.findLastIndex !== 'function') define(arrayPrototype, 'findLastIndex', function (callback, thisArg) {
+        if (this == null) throw new TypeError('Array.prototype.findLastIndex called on null or undefined')
+        if (typeof callback !== 'function') throw new TypeError('callback must be a function')
+        const object = Object(this)
+        for (let index = (object.length >>> 0) - 1; index >= 0; index--) {
+            if (callback.call(thisArg, object[index], index, object)) return index
+        }
+        return -1
+    })
+    if (typeof Object.hasOwn !== 'function') define(Object, 'hasOwn', function (object, key) {
+        if (object == null) throw new TypeError('Object.hasOwn called on null or undefined')
+        return Object.prototype.hasOwnProperty.call(Object(object), key)
+    })
+})()
 /**
  * @licstart The following is the entire license notice for the
  * JavaScript code in this page

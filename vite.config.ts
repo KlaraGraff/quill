@@ -1,13 +1,27 @@
 import { defineConfig } from "vite";
+import type { Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+
+const lowerReactMarkdownObjectHasOwn = (): Plugin => ({
+  name: "lower-react-markdown-object-has-own",
+  enforce: "pre",
+  transform(code, id) {
+    if (!id.includes("/node_modules/react-markdown/")) return null;
+    const transformed = code.replaceAll(
+      "Object.hasOwn(",
+      "Object.prototype.hasOwnProperty.call(",
+    );
+    return transformed === code ? null : { code: transformed, map: null };
+  },
+});
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
-  plugins: [react(), tailwindcss()],
+  plugins: [lowerReactMarkdownObjectHasOwn(), react(), tailwindcss()],
 
   build: {
     target: "safari15",

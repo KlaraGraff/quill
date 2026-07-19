@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { aiErrorMessageKey, getAiErrorCode, isAiSettingsError, type AiErrorCode } from "../utils/aiError";
+import { createUuid } from "../utils/randomUuid";
 
 interface TranslationPopoverProps {
   x: number;
@@ -85,7 +86,7 @@ function useStreamingTranslation(
     }).catch(() => {});
 
     const run = async () => {
-      const requestId = crypto.randomUUID();
+      const requestId = createUuid();
       requestIdRef.current = requestId;
 
       unlistenRef.current = await listen<AiStreamChunk>(

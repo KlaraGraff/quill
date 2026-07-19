@@ -1,5 +1,6 @@
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { emitTo, listen } from "@tauri-apps/api/event";
+import { createUuid } from "./randomUuid";
 
 interface ReaderWindowOptions {
   openVocab?: boolean;
@@ -39,7 +40,7 @@ export async function openReaderWindow(
   // Focus existing window if already open
   const existing = await WebviewWindow.getByLabel(label);
   if (existing) {
-    const navigationId = crypto.randomUUID();
+    const navigationId = createUuid();
     let acknowledge: () => void = () => {};
     const acknowledged = new Promise<void>((resolve) => { acknowledge = resolve; });
     const unlisten = await listen<{ navigationId: string }>("reader:navigate:ack", (event) => {

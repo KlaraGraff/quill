@@ -1,6 +1,6 @@
 # macOS 12 Reader 兼容性真机 QA
 
-> 状态：**任务书已就绪，自动化 fixture 已通过；真实 Monterey 与集成后的 packaged `.app` 证据待执行。**
+> 状态：**v2.0.2 已收到真实 Monterey 的 Preparing 卡死反馈；v2.0.3 修复候选待同机复验。**
 >
 > 实施方案：[`docs/impls/macos-12-reader-webkit-compatibility.md`](../impls/macos-12-reader-webkit-compatibility.md)
 
@@ -96,6 +96,11 @@ spctl -a -vv /Applications/Lantern.app
     uint8ArrayToBase64: typeof Uint8Array.prototype.toBase64,
     uint8ArrayToHex: typeof Uint8Array.prototype.toHex,
     setIntersection: typeof Set.prototype.intersection,
+    arrayAt: typeof Array.prototype.at,
+    arrayFindLast: typeof Array.prototype.findLast,
+    arrayFindLastIndex: typeof Array.prototype.findLastIndex,
+    objectHasOwn: typeof Object.hasOwn,
+    randomUUID: typeof crypto.randomUUID,
   }
 })()
 ```
@@ -123,6 +128,7 @@ npm run package
 W4 集成测试证明：
 
 - synthetic EPUB 在 `CompressionStream` / `DecompressionStream` 被移除后，所有 method 8 条目仍可逐项读取；
+- 删除 `Array.at`、`findLast`、`findLastIndex` 和 `Object.hasOwn` 后，EPUB fallback 与 PDF legacy 仍可运行；
 - PDF selector 覆盖三个 capability 缺口；
 - modern 和 legacy main 各自配对对应 Worker，并能从同一 fixture 读取同一页文本；
 - compatibility module/runtime 错误保持 generic Reader error，不误报为 PDF 损坏。
@@ -199,10 +205,11 @@ modern,,pdf,hayek,warm,1,,,,,,
    `vendor/pdfjs/legacy/pdf.mjs` + `vendor/pdfjs/legacy/pdf.worker.mjs`；不得请求或解析 modern 两件套。
 6. 打开 PDF 时记录 Worker=1；关闭 Reader 后记录 Worker=0。重复 5 次并记录 RSS，不得累积。
 7. 执行 searchable OCR、Library/Settings、Console 和其他格式边界检查。
-8. 任一步超过 45 秒 Reader timeout、持续卡住 UI 或出现兼容错误均为 FAIL。
+8. 任一步超过 45 秒 Reader timeout、持续显示 `Preparing book...`、正文空白或出现兼容错误均为 FAIL。
 
 旧系统 ZIP fallback 的证据组合必须同时包含：能力快照 `deflateRaw: false`、synthetic method 8 EPUB 成功、
-《谈美》成功、Console 无构造器错误，以及自动化 fallback 测试通过。单独“书打开了”证据不足。
+《谈美》成功且 Preparing 消失、Console 无构造器/数组方法错误，以及自动化 fallback 测试通过。单独“窗口
+打开了”或只看到书名都不算成功。
 
 ## 8. 手工功能矩阵
 

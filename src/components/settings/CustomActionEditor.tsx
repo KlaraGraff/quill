@@ -22,6 +22,7 @@ import {
 import Button from "../ui/Button";
 import Select from "../ui/Select";
 import Toggle from "../ui/Toggle";
+import { createUuid } from "../../utils/randomUuid";
 import ConfirmDialog from "./ConfirmDialog";
 
 export interface CustomImportSource {
@@ -146,7 +147,7 @@ export default function CustomActionEditor({
       return;
     }
     if (!draft.name.trim() || !draft.prompt.trim()) return;
-    const requestId = crypto.randomUUID();
+    const requestId = createUuid();
     requestRef.current = requestId;
     setOptimizing(true);
     setOptimizeError(null);

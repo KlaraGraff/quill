@@ -7,6 +7,7 @@ import { useTranslation } from "react-i18next";
 import Markdown from "react-markdown";
 import { LOOKUP_PROSE } from "./lookup-prose";
 import { aiErrorMessageKey, getAiErrorCode, isAiSettingsError, type AiErrorCode } from "../utils/aiError";
+import { createUuid } from "../utils/randomUuid";
 
 interface ExplainPopoverProps {
   x: number;
@@ -53,7 +54,7 @@ function useExplainStream(
     setStreamError(false);
 
     const run = async () => {
-      const requestId = crypto.randomUUID();
+      const requestId = createUuid();
       requestIdRef.current = requestId;
 
       unlistenRef.current = await listen<AiStreamChunk>(

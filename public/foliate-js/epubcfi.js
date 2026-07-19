@@ -332,7 +332,7 @@ export const toElement = (doc, parts) =>
 // turn indices into standard CFIs when you don't have an actual package document
 export const fake = {
     fromIndex: index => wrap(`/6/${(index + 1) * 2}`),
-    toIndex: parts => parts?.at(-1).index / 2 - 1,
+    toIndex: parts => parts?.[parts.length - 1].index / 2 - 1,
 }
 
 // get CFI from Calibre bookmarks

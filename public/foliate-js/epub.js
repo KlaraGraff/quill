@@ -446,7 +446,7 @@ class MediaOverlay extends EventTarget {
             const src = resolve($audio.getAttribute('src'))
             const begin = parseClock($audio.getAttribute('clipBegin'))
             const end = parseClock($audio.getAttribute('clipEnd'))
-            const last = arr.at(-1)
+            const last = arr[arr.length - 1]
             if (last?.src === src) last.items.push({ text, begin, end })
             else arr.push({ src, items: [{ text, begin, end }] })
             return arr
@@ -718,7 +718,7 @@ class Resources {
         // mainly because Epub.js used to generate wrong ID assertions
         // https://github.com/futurepress/epub.js/issues/1236
         if ($itemref && $itemref.nodeName !== 'idref') {
-            top.at(-1).id = null
+            top[top.length - 1].id = null
             $itemref = CFI.toElement(this.opf, top)
         }
         const idref = $itemref?.getAttribute('idref')
@@ -796,7 +796,7 @@ class Loader {
         const allow = await event.detail.allow
         if (!allow) return null
 
-        const parent = parents.at(-1)
+        const parent = parents[parents.length - 1]
         if (this.#cache.has(href)) return this.ref(href, parent)
 
         const shouldReplace =
@@ -817,7 +817,7 @@ class Loader {
     }
     async loadReplaced(item, parents = []) {
         const { href, mediaType } = item
-        const parent = parents.at(-1)
+        const parent = parents[parents.length - 1]
         let str = ''
         try {
             str = await this.loadText(href)

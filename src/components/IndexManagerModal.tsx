@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Database, Loader2, RefreshCw, Save, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import Button from "./ui/Button";
+import { createUuid } from "../utils/randomUuid";
 
 interface IndexSummary {
   sectionIndex?: number | null;
@@ -101,7 +102,7 @@ export default function IndexManagerModal({ bookId, onClose }: { bookId: string;
         <footer className="flex flex-wrap justify-end gap-2 border-t border-border px-5 py-3">
           <Button variant="secondary" size="sm" disabled={busy != null} onClick={() => void run("update", () => invoke("ai_update_book_index", { bookId }))}>{busy === "update" ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}{t("indexManager.update")}</Button>
           <Button variant="secondary" size="sm" disabled={busy != null} onClick={() => void run("rebuild", () => invoke("ai_reindex_book", { bookId }))}>{t("indexManager.rebuild")}</Button>
-          <Button variant="primary" size="sm" disabled={busy != null} onClick={() => void run("summaries", () => invoke("ai_regenerate_book_summaries", { bookId, requestId: crypto.randomUUID(), overwriteEdited: false }))}>{t("indexManager.regenerate")}</Button>
+          <Button variant="primary" size="sm" disabled={busy != null} onClick={() => void run("summaries", () => invoke("ai_regenerate_book_summaries", { bookId, requestId: createUuid(), overwriteEdited: false }))}>{t("indexManager.regenerate")}</Button>
           {hasEditedSummary && (
             <Button
               variant="secondary"
@@ -111,7 +112,7 @@ export default function IndexManagerModal({ bookId, onClose }: { bookId: string;
                 if (!window.confirm(t("indexManager.overwriteConfirm"))) return;
                 void run("overwrite", () => invoke("ai_regenerate_book_summaries", {
                   bookId,
-                  requestId: crypto.randomUUID(),
+                  requestId: createUuid(),
                   overwriteEdited: true,
                 }));
               }}

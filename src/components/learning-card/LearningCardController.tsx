@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { createUuid } from "../../utils/randomUuid";
 import type { ReaderInteraction, SerializableRect } from "../reader-interaction";
 import { getResponsiveLearningCardWidth } from "./config";
 import type {
@@ -182,7 +183,7 @@ export default function LearningCardController({
     setResult({ version: 1, kind: interaction.kind, sourceText: interaction.text, modules: {} });
     setLoading(true);
     setError(null);
-    const requestId = crypto.randomUUID();
+    const requestId = createUuid();
     const allowedModuleIds = new Set(
       config.cards[interaction.kind].modules
         .filter((module) => module.enabled)

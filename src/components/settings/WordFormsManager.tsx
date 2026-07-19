@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Loader2, RefreshCw, Search, Sparkles, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { createUuid } from "../../utils/randomUuid";
 
 export interface WordFormsEntry {
   normalized_word: string;
@@ -47,7 +48,7 @@ export default function WordFormsManager() {
   };
 
   const requestForms = async (words: string[]) => {
-    const requestId = crypto.randomUUID();
+    const requestId = createUuid();
     requestsRef.current.add(requestId);
     try {
       return await invoke<Record<string, string[]>>("ai_word_forms", { words, requestId });

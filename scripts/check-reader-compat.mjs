@@ -30,6 +30,9 @@ export const PDF_ASSETS = Object.freeze({
   legacyWorker: "foliate-js/vendor/pdfjs/legacy/pdf.worker.mjs",
 });
 
+export const LEGACY_PDF_RUNTIME_MARKER =
+  "Lantern Safari 15 runtime compatibility for the PDF.js legacy pair";
+
 const PDF_IMPORTS = Object.freeze({
   modernMain: "./vendor/pdfjs/pdf.mjs",
   modernWorker: "./vendor/pdfjs/pdf.worker.mjs",
@@ -38,16 +41,29 @@ const PDF_IMPORTS = Object.freeze({
 });
 
 const BLOCKED_CALLS = new Set([
+  "Array.fromAsync",
   "Object.groupBy",
+  "Object.hasOwn",
   "Map.groupBy",
   "Promise.withResolvers",
   "Promise.try",
+  "URL.canParse",
   "URL.parse",
   "AbortSignal.any",
   "Uint8Array.fromBase64",
 ]);
 
-const BLOCKED_METHOD_CALLS = new Set(["toBase64", "toHex", "intersection"]);
+const BLOCKED_METHOD_CALLS = new Set([
+  "at",
+  "findLast",
+  "findLastIndex",
+  "intersection",
+  "toBase64",
+  "toHex",
+  "toReversed",
+  "toSorted",
+  "toSpliced",
+]);
 
 export const REQUIRED_PDF_CAPABILITIES = Object.freeze([
   "Promise.withResolvers",
@@ -61,7 +77,7 @@ export const REQUIRED_PDF_CAPABILITIES = Object.freeze([
   "Set.prototype.intersection",
 ]);
 
-const GUARDED_GLOBAL_CALLS = new Set(["structuredClone"]);
+const GUARDED_GLOBAL_CALLS = new Set(["crypto.randomUUID", "structuredClone"]);
 const GUARDED_CONSTRUCTORS = new Set([
   "CompressionStream",
   "DecompressionStream",
@@ -208,7 +224,7 @@ const scanJavaScriptCompatibility = (
         && BLOCKED_METHOD_CALLS.has(node.expression.name.text)
       ) {
         errors.push(
-          `${nodeLocation(sourceFile, node)} directly calls modern method `
+          `${nodeLocation(sourceFile, node)} directly calls Safari 15-incompatible method `
           + `${node.expression.name.text}()`,
         );
       }
@@ -449,6 +465,9 @@ export const checkPdfAssets = async (distDir) => {
 
     if (name.startsWith("legacy") && source.includes("sourceMappingURL=")) {
       fail(`Legacy PDF.js source map reference must be removed: ${path}`);
+    }
+    if (name.startsWith("legacy") && !source.includes(LEGACY_PDF_RUNTIME_MARKER)) {
+      fail(`Legacy PDF.js is missing the Safari 15 runtime prelude: ${path}`);
     }
   }
 

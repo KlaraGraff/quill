@@ -9,6 +9,7 @@ import {
   makeCssCompatibleWithSafari15,
 } from "../scripts/build-reader-assets.mjs";
 import {
+  LEGACY_PDF_RUNTIME_MARKER,
   REQUIRED_PDF_CAPABILITIES,
   SIZE_REPORT_FILE,
   checkReaderCompatibility,
@@ -20,6 +21,7 @@ const PDF_HEADER = `/**
  */
 export const version = "5.5.207";
 `;
+const LEGACY_PDF_HEADER = `/* ${LEGACY_PDF_RUNTIME_MARKER} */\n${PDF_HEADER}`;
 
 const capabilitySource = ({ includeUrlParse = true } = {}) => `
 const modernWorkerUrl = new URL(
@@ -117,7 +119,11 @@ const createDistFixture = async (options = {}) => {
     "foliate-js/vendor/pdfjs/legacy/pdf.mjs",
     "foliate-js/vendor/pdfjs/legacy/pdf.worker.mjs",
   ]) {
-    await writeFixtureFile(root, path, PDF_HEADER);
+    await writeFixtureFile(
+      root,
+      path,
+      path.includes("/legacy/") ? LEGACY_PDF_HEADER : PDF_HEADER,
+    );
   }
   await writeFixtureFile(
     root,
@@ -179,5 +185,31 @@ test("W3 gate rejects an incomplete modern PDF.js capability selector", async ()
   await assert.rejects(
     checkReaderCompatibility({ distDir }),
     /snapshotPdfCapabilities does not probe: URL\.parse/u,
+  );
+});
+
+test("W3 gate rejects Safari 15.4-only runtime methods", async () => {
+  const readerFixture = await createDistFixture();
+  await writeFixtureFile(
+    readerFixture,
+    "foliate-js/lazy.js",
+    "export const last = [1].at(-1);\n",
+  );
+  await buildReaderAssets({ distDir: readerFixture });
+  await assert.rejects(
+    checkReaderCompatibility({ distDir: readerFixture }),
+    /Safari 15-incompatible method at\(\)/u,
+  );
+
+  const appFixture = await createDistFixture();
+  await writeFixtureFile(
+    appFixture,
+    "assets/app.js",
+    "export const requestId = crypto.randomUUID();\n",
+  );
+  await buildReaderAssets({ distDir: appFixture });
+  await assert.rejects(
+    checkReaderCompatibility({ distDir: appFixture }),
+    /crypto\.randomUUID outside a guarded probe/u,
   );
 });

@@ -2,6 +2,7 @@ import { useState, useCallback, useRef, useEffect, useLayoutEffect } from "react
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getAiErrorCode } from "../utils/aiError";
+import { createUuid } from "../utils/randomUuid";
 import { useSettings } from "./useSettings";
 
 export interface ChatMessage {
@@ -204,7 +205,7 @@ function deriveTitle(userMsg: string): string {
 async function generateAiTitle(
   userMsg: string,
 ): Promise<string | null> {
-  const requestId = `title-${crypto.randomUUID()}`;
+  const requestId = `title-${createUuid()}`;
   const eventName = `ai-title-chunk-${requestId}`;
   let title = "";
   let finished = false;
@@ -384,7 +385,7 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
     if (!bookId || summaryRequestIdRef.current) return;
     const state = await refreshBookAiState();
     if (!state || state.indexStatus !== "ready" || (state.hasSummaries && !state.summariesStale)) return;
-    const requestId = `summary-${crypto.randomUUID()}`;
+    const requestId = `summary-${createUuid()}`;
     summaryRequestIdRef.current = requestId;
     setSummaryProgress({ done: 0, total: 0, phase: "sections" });
     try {
@@ -521,7 +522,7 @@ export function useAiChat(bookId?: string, bookContext?: BookContext) {
       setGroundingStatus(null);
       if (settings.ai_summaries_auto !== "false") void prepareBookOverview();
 
-      const requestId = crypto.randomUUID();
+      const requestId = createUuid();
       const requestGeneration = streamGenerationRef.current + 1;
       streamGenerationRef.current = requestGeneration;
       activeRequestIdRef.current = requestId;

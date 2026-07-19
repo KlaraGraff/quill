@@ -235,6 +235,18 @@ const probePdfVariant = async (requestedVariant: "modern" | "legacy") => {
         writable: true,
         value: undefined,
       });
+      for (const name of ['at', 'findLast', 'findLastIndex']) {
+        Object.defineProperty(Array.prototype, name, {
+          configurable: true,
+          writable: true,
+          value: undefined,
+        });
+      }
+      Object.defineProperty(Object, 'hasOwn', {
+        configurable: true,
+        writable: true,
+        value: undefined,
+      });
     }
 
     const { loadPdfJs } = await import(${JSON.stringify(pdfCompatUrl)});

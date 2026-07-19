@@ -1,6 +1,7 @@
 import { ArrowDown, ArrowUp, ChevronDown, ChevronRight, GripVertical, Plus } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { createUuid } from "../../utils/randomUuid";
 import Toggle from "../ui/Toggle";
 import SortableList from "../ui/SortableList";
 import {
@@ -209,7 +210,7 @@ export default function SelectionMenuSettings({
         <button
           type="button"
           onClick={() => {
-            const id = `custom_${crypto.randomUUID().replace(/-/g, "")}` as CustomLearningId;
+            const id = `custom_${createUuid().replace(/-/g, "")}` as CustomLearningId;
             const timestamp = Date.now();
             requestNavigation(() => {
               setNewAction({
