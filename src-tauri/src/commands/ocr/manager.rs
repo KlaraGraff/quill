@@ -29,6 +29,9 @@ use super::validate::{reject_signed_pdf, validate_output};
 
 const CONVERSION_VERSION: i32 = 1;
 const EVENT_INTERVAL: Duration = Duration::from_millis(250);
+const SYSTEM_MEMORY_RESERVE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+const OCR_PARENT_MEMORY_RESERVE_BYTES: u64 = 768 * 1024 * 1024;
+const OCR_WORKER_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -411,14 +414,54 @@ fn automatic_jobs() -> i32 {
     #[cfg(target_os = "macos")]
     {
         let physical = sysctl_u64("hw.physicalcpu");
-        let memory = sysctl_u64("hw.memsize");
-        if let (Some(physical), Some(memory)) = (physical, memory) {
-            let cores = physical.saturating_sub(1).max(1);
-            let memory_slots = (memory / (2 * 1024 * 1024 * 1024)).max(1);
-            return cores.min(memory_slots).clamp(1, 4) as i32;
+        let available_memory = available_memory_bytes();
+        if let (Some(physical), Some(available_memory)) = (physical, available_memory) {
+            return jobs_for_resources(physical, available_memory);
         }
     }
     1
+}
+
+fn jobs_for_resources(physical_cores: u64, available_memory_bytes: u64) -> i32 {
+    let cpu_slots = physical_cores.saturating_sub(1).max(1);
+    let memory_slots = available_memory_bytes
+        .saturating_sub(SYSTEM_MEMORY_RESERVE_BYTES)
+        .saturating_sub(OCR_PARENT_MEMORY_RESERVE_BYTES)
+        .checked_div(OCR_WORKER_MEMORY_BYTES)
+        .unwrap_or(0)
+        .max(1);
+    cpu_slots.min(memory_slots).min(i32::MAX as u64) as i32
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn available_memory_bytes() -> Option<u64> {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+
+    let mut stats = unsafe { std::mem::zeroed::<libc::vm_statistics64>() };
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    let result = unsafe {
+        libc::host_statistics64(
+            libc::mach_host_self(),
+            libc::HOST_VM_INFO64,
+            &mut stats as *mut libc::vm_statistics64 as *mut libc::integer_t,
+            &mut count,
+        )
+    };
+    if result != libc::KERN_SUCCESS {
+        return None;
+    }
+
+    Some(
+        u64::from(stats.free_count)
+            .saturating_add(u64::from(stats.inactive_count))
+            .saturating_add(u64::from(stats.purgeable_count))
+            .saturating_sub(u64::from(stats.compressor_page_count))
+            .saturating_mul(page_size as u64),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -706,8 +749,38 @@ mod tests {
     }
 
     #[test]
-    fn automatic_jobs_stays_in_v1_bounds() {
-        assert!((1..=4).contains(&automatic_jobs()));
+    fn automatic_jobs_is_always_positive() {
+        assert!(automatic_jobs() >= 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_available_memory_is_reported() {
+        assert!(available_memory_bytes().is_some());
+    }
+
+    #[test]
+    fn jobs_use_all_safe_physical_cores_when_memory_allows() {
+        assert_eq!(jobs_for_resources(18, 64 * 1024 * 1024 * 1024), 17);
+    }
+
+    #[test]
+    fn jobs_shrink_when_available_memory_is_low() {
+        let gib = 1024 * 1024 * 1024;
+
+        assert_eq!(jobs_for_resources(18, 6 * gib), 4);
+        assert_eq!(jobs_for_resources(18, 4 * gib), 1);
+    }
+
+    #[test]
+    fn jobs_have_no_fixed_numeric_ceiling() {
+        assert_eq!(jobs_for_resources(65, 64 * 1024 * 1024 * 1024), 64);
+    }
+
+    #[test]
+    fn jobs_keep_one_worker_when_resource_values_are_minimal() {
+        assert_eq!(jobs_for_resources(0, 0), 1);
+        assert_eq!(jobs_for_resources(1, u64::MAX), 1);
     }
 
     #[test]

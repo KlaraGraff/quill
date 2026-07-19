@@ -19,7 +19,7 @@
 | 4 | 数据：**不做 source 资产桥接/回填** | `book_assets` 只存派生资产；派生行用 `book_id + source_sha256` 关联源文件（`books` 表已有）。删除工作区原型中全部桥接钩子 |
 | 5 | 同步：**直接 bump schema v7，无 gating** | 不做能力协商、ratchet、stale-peer 规则、阻塞设备 UI、local-only 晋升协议。所有设备升级新版即可；v6 旧设备收不到新日志是内测阶段可接受的 |
 | 6 | 不做 preferred_asset_id | v1 每本书最多一份有效 OCR 资产，resolver 规则全设备一致（最新已验证 OCR PDF → 否则原文件），无需同步偏好指针 |
-| 7 | 保留的旧决定 | searchable PDF 为唯一产物；原 PDF 永不覆盖；OCRmyPDF+Tesseract 唯一后端（Vision 后置）；不做 OSD/EPUB/`book_asset_positions`/Tesseract.js 覆盖层；并发自动、上限 4、`OMP_THREAD_LIMIT=1`；数字签名 PDF 拒绝 OCR |
+| 7 | 保留的旧决定 | searchable PDF 为唯一产物；原 PDF 永不覆盖；OCRmyPDF+Tesseract 唯一后端（Vision 后置）；不做 OSD/EPUB/`book_asset_positions`/Tesseract.js 覆盖层；并发自动、无固定数值上限、`OMP_THREAD_LIMIT=1`；数字签名 PDF 拒绝 OCR |
 
 打包签名：v1 扩展包用 **HTTPS + SHA-256 校验 + 安装后 self-test**，不建签名/密钥体系（主程序本身还是 ad-hoc 签名，扩展不应超过主程序的安全等级；签名随既有 Gatekeeper 项目后补）。
 
@@ -102,7 +102,7 @@ CREATE TABLE book_asset_local_state (   -- 本机可用性，永不同步
 任务（M0 之后）：
 
 1. **OcrJobManager**：全局单书队列（内存队列 + `ocr_jobs` 持久化）；启动恢复（`recognizing/validating` → 可重试）；
-   自动并发 `jobs = clamp(min(physical_cores-1, memory_slots), 1, 4)`，取不到内存信息时 `jobs=1`。
+   自动并发 `jobs = max(1, min(physical_cores-1, memory_slots))`，无固定数值上限；`memory_slots` 使用当前可用内存扣除 3 GiB 系统预留和 768 MiB OCR 主进程预留后，按 512 MiB/worker 计算。取不到资源信息时 `jobs=1`。
 2. **OcrmypdfBackend**：调用已安装 runtime（路径由 W2 的 PackageManager 提供，接口见 §5.4）；
    参数固定 `--mode skip --output-type pdf --rasterizer pypdfium --optimize 0 --fast-web-view 999999
    --jobs N -l chi_sim+eng`，外加 `OMP_THREAD_LIMIT=1`、清理后的 PATH、独立 process group（Windows: Job Object）；
