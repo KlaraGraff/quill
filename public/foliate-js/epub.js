@@ -56,6 +56,31 @@ const ONIX5 = {
     '34': 'issn',
 }
 
+export const groupByObject = (items, keyFn) => {
+    const groups = Object.create(null)
+    let index = 0
+    for (const item of items) {
+        const key = keyFn(item, index++)
+        const propertyKey = typeof key === 'symbol' ? key : String(key)
+        if (Object.prototype.hasOwnProperty.call(groups, propertyKey))
+            groups[propertyKey].push(item)
+        else groups[propertyKey] = [item]
+    }
+    return groups
+}
+
+export const groupByMap = (items, keyFn) => {
+    const groups = new Map()
+    let index = 0
+    for (const item of items) {
+        const key = keyFn(item, index++)
+        const group = groups.get(key)
+        if (group) group.push(item)
+        else groups.set(key, [item])
+    }
+    return groups
+}
+
 // convert to camel case
 const camel = x => x.toLowerCase().replace(/[-:](.)/g, (_, g) => g.toUpperCase())
 
@@ -175,7 +200,7 @@ const getMetadata = opf => {
     const $metadata = $(opf.documentElement, 'metadata')
 
     // first pass: convert to JS objects
-    const els = Object.groupBy($metadata.children, el =>
+    const els = groupByObject($metadata.children, el =>
         el.namespaceURI === NS.DC ? 'dc'
         : el.namespaceURI === NS.OPF && el.localName === 'meta' ?
             (el.hasAttribute('name') ? 'legacyMeta' : 'meta') : '')
@@ -197,13 +222,13 @@ const getMetadata = opf => {
                 .map(attr => [attr.localName, attr.value])),
         }
     }
-    const refines = Map.groupBy(els.meta ?? [], el => el.getAttribute('refines'))
+    const refines = groupByMap(els.meta ?? [], el => el.getAttribute('refines'))
     const getProperties = el => {
         const els = refines.get(el ? '#' + el.getAttribute('id') : null)
         if (!els) return null
-        return Object.groupBy(els.map(parse), x => x.property)
+        return groupByObject(els.map(parse), x => x.property)
     }
-    const dc = Object.fromEntries(Object.entries(Object.groupBy(els.dc, el => el.localName))
+    const dc = Object.fromEntries(Object.entries(groupByObject(els.dc, el => el.localName))
         .map(([name, els]) => [name, els.map(parse)]))
     const properties = getProperties() ?? {}
     const legacyMeta = Object.fromEntries(els.legacyMeta?.map(el =>
@@ -255,7 +280,7 @@ const getMetadata = opf => {
         }
         return value
     }
-    const belongsTo = Object.groupBy(properties['belongs-to-collection'] ?? [],
+    const belongsTo = groupByObject(properties['belongs-to-collection'] ?? [],
         x => prop(x, 'collection-type') === 'series' ? 'series' : 'collection')
     const mainTitle = dc.title?.find(x => prop(x, 'title-type') === 'main') ?? dc.title?.[0]
     const metadata = {
