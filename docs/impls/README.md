@@ -14,3 +14,4 @@ Detailed implementation plans for features and bug fixes. Numbers match the corr
 - [263 — Tools Settings + Ephemeral Translate](263-reading-tools-consolidation.md)
 - [286 — Explicit Lookup Language](286-explicit-lookup-language.md)
 - [Reader layout upgrades, settings UI fixes, and credential P1](reader-layout-upgrades-and-settings-ui-fixes.md)
+- [macOS 12 Reader WebKit compatibility](macos-12-reader-webkit-compatibility.md)
